@@ -1,0 +1,192 @@
+# templates/project_bank.yaml
+# EXAMPLE project bank — replace with YOUR real projects. The agent pulls ONLY from this bank.
+# See SETUP.md Step 9 for instructions on filling this out.
+
+projects:
+  - id: "proj_001"
+    name: "Marketing Automation Platform Migration"
+    lane: ["mops", "pmm"]
+    company: "Acme Corp"
+    date_range: "2024–Present"
+    summary: >
+      Led end-to-end planning, migration, and launch of a new marketing
+      automation platform integrated with the company's CRM, designing
+      a custom sync model that preserved sales-cycle integrity and drove
+      measurable pipeline creation.
+    bullets:
+      - "Led planning, testing, and launch of marketing automation platform within a complex pre-existing CRM ecosystem"
+      - "Designed a custom integration strategy to bridge major differences between the two platforms' data models and business logic"
+      - "Architected a hybrid data model to support multiple inquiry types rolling up into unified sales cycles"
+      - "Built workflow logic to create new records per inquiry, manage active status, and preserve historical data"
+      - "Implemented merge-path logic so reinquiries updated the correct open record instead of spawning duplicates"
+      - "Configured ETL insert/update logic to branch between creating new records and updating existing open records"
+      - "Mapped field-level data flow across Contacts, Leads, Opportunities, Deals, and Accounts"
+      - "Migrated 100,000+ customer records with duplicate handling and record matching"
+      - "Supported downstream BI reporting by structuring data for funnel, attribution, engagement, and system-health analysis"
+    metrics:
+      - "Generated $1M+ in pipeline through the new platform to date"
+      - "Migrated 100,000+ customer records"
+      - "Integrated marketing automation with CRM across inquiries, contacts, leads, opportunities, and deals"
+      - "Reduced duplicate lead risk by enforcing a one-open-lead-per-person model"
+    tools_used:
+      - "Marketing Automation Platform"
+      - "CRM"
+      - "ETL / Integration Tool"
+      - "BI Dashboard"
+      - "Project Management Tool"
+    tags:
+      - "marketing automation"
+      - "CRM integration"
+      - "marketing operations"
+      - "RevOps"
+      - "data migration"
+      - "workflow automation"
+      - "sales lifecycle"
+      - "data quality"
+      - "pipeline generation"
+
+  - id: "proj_002"
+    name: "Marketing Attribution Infrastructure Implementation"
+    lane: ["mops", "pmm"]
+    company: "Acme Corp"
+    date_range: "2024–2025"
+    summary: >
+      Led planning, scoping, testing, launch, and training for a marketing
+      attribution infrastructure upgrade in the CRM, creating a framework
+      to connect pipeline and revenue to marketing touchpoints across
+      first-touch, campaign, category, and referral data.
+    bullets:
+      - "Led end-to-end implementation of CRM attribution updates connecting marketing activity to pipeline creation and revenue outcomes"
+      - "Designed an attribution framework separating first-touch discovery, qualification-stage touchpoints, campaign attribution, category classification, referral tracking, and brand-awareness inputs"
+      - "Implemented discovery channel and platform fields on lead records to capture how prospects reached the company"
+      - "Mapped attribution fields from Lead to Opportunity upon qualification to preserve continuity deeper into the funnel"
+      - "Corrected campaign governance by redefining source campaign as true campaign attribution"
+      - "Added referrer company and referred lead fields across Lead, Opportunity, and Project records to improve referral attribution"
+      - "Created a detailed QA and test plan covering digital inbound, referral traffic, direct traffic, paid social, and manual lead creation scenarios"
+      - "Trained end users on updated form experience, required inputs, and expectations for manual vs automated attribution entry"
+    metrics:
+      - "Launched attribution updates across 2 business lines"
+      - "Added 5 new lead-data fields and updated existing field logic in CRM"
+      - "Extended attribution and referral continuity across Lead, Opportunity, and Project records"
+      - "Enabled reporting by channel, platform, campaign, category, referral status, and funnel stage"
+    tools_used:
+      - "CRM"
+      - "Marketing Automation Platform"
+      - "BI Dashboard"
+      - "Spreadsheet Tool"
+      - "Project Management Tool"
+    tags:
+      - "marketing attribution"
+      - "CRM"
+      - "RevOps"
+      - "marketing operations"
+      - "pipeline reporting"
+      - "data quality"
+
+  - id: "proj_003"
+    name: "Savings Calculator Lead Generation Campaign"
+    lane: ["content", "pmm"]
+    company: "Acme Corp"
+    date_range: "Q1 2025"
+    summary: >
+      Ideated, built, and launched a gated top-of-funnel lead generation
+      campaign centered on a personalized savings calculator that exchanged
+      a cost-and-savings report for prospect contact info.
+    bullets:
+      - "Concepted and launched a top-of-funnel campaign generating early-stage leads via a personalized savings calculator"
+      - "Built calculator logic estimating system sizing, project cost, incentives, savings, and long-term return based on user inputs"
+      - "Created region-specific rate formulas for accurate local estimates"
+      - "Expanded experience to include optional add-on economics using additional user inputs"
+      - "Built the full campaign asset ecosystem: 2 landing pages, 2 forms, 5 emails, 5 workflows, and 2 CTAs"
+      - "Created a reusable campaign framework supporting future optimization of messaging, nurture, and calculator assumptions"
+    metrics:
+      - "Campaign landing page converting at 15.72%"
+      - "Campaign asset mix: 2 landing pages, 2 forms, 5 emails, 5 workflows, 2 CTAs"
+    tools_used:
+      - "Marketing Automation Platform"
+      - "Landing Page Builder"
+      - "Form Builder"
+      - "Workflow Automation"
+      - "Campaign Manager"
+    tags:
+      - "lead generation"
+      - "growth marketing"
+      - "calculator"
+      - "landing pages"
+      - "conversion optimization"
+      - "email nurture"
+      - "top-of-funnel"
+      - "campaign launch"
+
+  - id: "proj_004"
+    name: "CRO Testing Program + Prioritization App"
+    lane: ["content", "mops"]
+    company: "Acme Corp"
+    date_range: "Q3 2024–Present"
+    summary: >
+      Researched, designed, and launched a repeatable CRO testing program,
+      building the operating process, hypothesis framework, prioritization
+      model, and internal scoring app used to identify, launch, monitor,
+      and learn from A/B tests across key lead generation pages.
+    bullets:
+      - "Built the end-to-end CRO operating model spanning research, analysis, prioritization, testing, and learning"
+      - "Combined quantitative and behavioral data from analytics and heatmap tools to diagnose conversion bottlenecks"
+      - "Developed a PIE framework (Priority, Impact, Ease) prioritization methodology with custom scoring model"
+      - "Built an internal CRO prioritization tool consolidating page audit inputs, PIE scoring, test tracking, and ROI modeling"
+      - "Created experiment variants for landing pages and managed A/B tests using testing tools alongside analytics"
+      - "Built a learning loop documenting variant vs control outcomes, secondary metrics, and next iterations"
+      - "Translated experimentation outputs into business language for leadership including lift, significance, and revenue implications"
+    metrics:
+      - "Trust-signal tests improved conversion rates by 151%"
+      - "FAQ additions improved conversion rates by 26%"
+      - "Above-fold form placement improved conversion rates by 17%"
+      - "Form simplification tests improved conversion rates by 298% and 214% (90% confidence)"
+    tools_used:
+      - "Heatmap / Session Recording Tool"
+      - "Google Analytics 4"
+      - "Marketing Automation Platform"
+      - "Spreadsheet Tool"
+      - "CMS"
+    tags:
+      - "CRO"
+      - "A/B testing"
+      - "analytics"
+      - "experimentation"
+      - "website optimization"
+      - "lead generation"
+      - "prioritization framework"
+      - "internal tools"
+
+  - id: "proj_005"
+    name: "Regional Marketing Strategy Sprint"
+    lane: ["pmm", "content"]
+    company: "Acme Corp"
+    date_range: "2025"
+    summary: >
+      Led a market-specific strategy sprint to define and implement a new
+      marketing strategy for a target region, spanning product marketing
+      research, audience and ecosystem analysis, positioning, goal-setting,
+      campaign ideation, and initiative prioritization.
+    bullets:
+      - "Led regional marketing strategy development from early-stage market understanding through campaign planning and prioritization"
+      - "Built strategic foundation in three layers: Foundations (Product Marketing), Engine (Growth Marketing), Fuel (Content Marketing)"
+      - "Directed product marketing research to clarify target audience, ecosystem, and product/service fit"
+      - "Mapped the surrounding ecosystem to identify partner co-marketing, referral programs, channel partnerships, and community-based marketing opportunities"
+      - "Developed positioning strategy including audience segmentation, category framing, and awareness-level messaging logic"
+      - "Built a framework for evaluating growth channels based on fit, targeting, creative quality, measurement, and diminishing returns"
+      - "Led initiative prioritization identifying the campaigns most likely to change business trajectory in the region"
+      - "Created a reusable strategic planning model applicable to future market launches and regional planning"
+    metrics: []
+    tools_used:
+      - "Whiteboard Tool"
+      - "Spreadsheet Tool"
+      - "Document Editor"
+    tags:
+      - "product marketing"
+      - "go-to-market strategy"
+      - "regional strategy"
+      - "campaign planning"
+      - "audience research"
+      - "positioning"
+      - "messaging strategy"
+      - "market expansion"

@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(git:*)",
+      "Bash(brew list)",
+      "Bash(open:*)",
+      "Bash(crontab:*)",
+      "Bash(printf:*)",
+      "Bash(cat:*)",
+      "Bash(claude:*)",
+      "Bash(PYTHONPATH=src .venv/bin/python:*)",
+      "Bash(.venv/bin/pip list:*)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(ls:*)",
+      "Bash(.venv/bin/pip show:*)",
+      "WebSearch",
+      "Bash(python:*)",
+      "WebFetch(domain:dismashomenh.org)",
+      "Bash(../.venv/bin/python:*)"
+    ]
+  }
+}

@@ -1,0 +1,105 @@
+# config/settings.yaml
+
+# ─── Gmail Filter ───────────────────────────────────────────
+gmail:
+  alert_sender: "ali@hiring.cafe"        # direct alerts (kept for reference)
+  alert_subject_contains: "HiringCafe"   # matches both direct and forwarded emails
+  processed_label: "hiring-agent-processed"
+  digest_subject_template: "Hiring.cafe Applications — {date}"
+
+# ─── Job Processing ────────────────────────────────────────
+jobs:
+  max_per_run: 5
+  sort_by: "newest"
+
+# ─── JD Fetching ───────────────────────────────────────────
+scraper:
+  timeout_seconds: 15
+  min_jd_length: 200          # chars — skip if JD is shorter
+  require_section_headers: true  # must have Responsibilities/Requirements/etc
+  use_playwright_fallback: true  # try headless browser if requests fails
+  blocked_domains:             # domains that always require login
+    - "lever.co/apply"
+    - "myworkdayjobs.com"
+
+# ─── Lane Classification ──────────────────────────────────
+lanes:
+  - name: "pmm"
+    label: "Product Marketing (PMM)"
+    template: "templates/resumes/base_resume.docx"
+    signals:
+      - "product marketing"
+      - "positioning"
+      - "go-to-market"
+      - "GTM"
+      - "competitive intelligence"
+      - "product launch"
+      - "sales enablement"
+      - "analyst relations"
+
+  - name: "content"
+    label: "Content Marketing"
+    template: "templates/resumes/base_resume.docx"
+    signals:
+      - "content marketing"
+      - "content strategy"
+      - "editorial"
+      - "SEO"
+      - "blog"
+      - "thought leadership"
+      - "brand voice"
+      - "copywriting"
+
+  - name: "mops"
+    label: "Marketing Operations (MOps)"
+    template: "templates/resumes/base_resume.docx"
+    signals:
+      - "marketing operations"
+      - "marketing automation"
+      - "Marketo"
+      - "HubSpot"
+      - "Salesforce"
+      - "lead scoring"
+      - "attribution"
+      - "data pipeline"
+      - "campaign operations"
+
+# ─── Resume Tailoring ─────────────────────────────────────
+resume:
+  max_roles_to_edit: 3        # only touch first N roles
+  max_skills_count: 12
+  target_format: "docx"       # intermediate format before PDF
+  min_confidence_score: 30    # skip jobs where tailor scores fit below this (0–100)
+
+# ─── Cover Letter ─────────────────────────────────────────
+cover_letter:
+  max_paragraphs: 4
+  max_projects_referenced: 2
+  tone: "neutral"             # neutral | warm | assertive
+  template: "templates/cover_letter.docx"
+
+# ─── QA ───────────────────────────────────────────────────
+qa:
+  max_retries: 2
+  checks:
+    - "no_fabricated_claims"
+    - "one_page_max"
+    - "skills_count_within_limit"
+    - "edits_within_allowed_roles"
+    - "no_robot_language"
+    - "jd_keyword_coverage"
+
+# ─── Hiring Manager Lookup ────────────────────────────────
+contacts:
+  enabled: true
+  model: "claude-haiku-4-5-20251001"
+  max_web_searches: 3
+  timeout_seconds: 60
+  generate_outreach_note: true
+  outreach_note_max_words: 60
+
+# ─── PDF Generation ───────────────────────────────────────
+pdf:
+  # Uses LibreOffice for DOCX→PDF conversion
+  libreoffice_path: "libreoffice"  # or full path if needed
+  filename_template: "{date}_{company}_{title}_{type}.pdf"

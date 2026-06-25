@@ -1,0 +1,24 @@
+# Secrets
+.env
+config/credentials/
+token.json
+
+# Personal resume templates (user-created, not shipped with repo)
+templates/resumes/*.docx
+templates/cover_letter.docx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Output
+output/
+test_data/output/
+logs/
+
+# OS
+.DS_Store
+.personal-backup/
+# Sample email files (contain personal email headers)
+test_data/*.eml
