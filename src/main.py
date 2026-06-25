@@ -331,12 +331,22 @@ def main() -> None:
                 "(for last-minute edits in Word/Google Docs) are attached.\n\n"
             )
             body = attachment_note + compose_digest(processed=processed, skipped=skipped)
+            # Dedup attachments: when LibreOffice/docx2pdf is unavailable, the
+            # renderers fall back to returning (docx_path, docx_path) — the same
+            # path twice. Without dedup, the email would attach the DOCX twice
+            # under one filename while the body claims a PDF + DOCX pair.
             attachments = []
+            seen = set()
             for p in processed:
-                attachments.append(p["resume_pdf"])
-                attachments.append(p["resume_docx"])
-                attachments.append(p["cover_letter_pdf"])
-                attachments.append(p["cover_letter_docx"])
+                for path in (
+                    p["resume_pdf"],
+                    p["resume_docx"],
+                    p["cover_letter_pdf"],
+                    p["cover_letter_docx"],
+                ):
+                    if path not in seen:
+                        seen.add(path)
+                        attachments.append(path)
             try:
                 gmail.send_digest(
                     to=recipient,

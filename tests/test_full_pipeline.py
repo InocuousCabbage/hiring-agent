@@ -68,13 +68,21 @@ def _processed_fixture():
 
 
 def _build_attachments(processed: list[dict]) -> list[Path]:
-    """Replicates the attachment-list construction in main.main()."""
+    """Replicates the attachment-list construction in main.main(), including
+    the dedup that handles the renderer fallback where PDF conversion fails
+    and (docx_path, docx_path) is returned."""
     attachments: list[Path] = []
+    seen: set = set()
     for p in processed:
-        attachments.append(p["resume_pdf"])
-        attachments.append(p["resume_docx"])
-        attachments.append(p["cover_letter_pdf"])
-        attachments.append(p["cover_letter_docx"])
+        for path in (
+            p["resume_pdf"],
+            p["resume_docx"],
+            p["cover_letter_pdf"],
+            p["cover_letter_docx"],
+        ):
+            if path not in seen:
+                seen.add(path)
+                attachments.append(path)
     return attachments
 
 
@@ -124,10 +132,64 @@ def test_send_digest_called_with_pdf_and_docx_attachments():
 
 
 def test_attachment_list_scales_with_processed_jobs():
-    """N processed jobs → 4N attachments."""
-    processed = _processed_fixture() * 3  # 3 jobs
+    """N processed jobs (each with distinct file paths) → 4N attachments."""
+    processed = []
+    for i in range(3):
+        processed.append({
+            "title": f"Engineer {i}",
+            "company": f"Acme{i}",
+            "url": "https://example.com",
+            "lane": "pmm",
+            "resume_pdf":         Path(f"/tmp/acme{i}_resume.pdf"),
+            "resume_docx":        Path(f"/tmp/acme{i}_resume.docx"),
+            "cover_letter_pdf":   Path(f"/tmp/acme{i}_cl.pdf"),
+            "cover_letter_docx":  Path(f"/tmp/acme{i}_cl.docx"),
+            "hiring_manager": None,
+        })
     attachments = _build_attachments(processed)
     assert len(attachments) == 12
+
+
+def test_attachments_dedup_when_pdf_conversion_fails():
+    """When the PDF renderer falls back (no LibreOffice/docx2pdf available),
+    render_resume_pdf / render_cover_letter_pdf return (docx_path, docx_path).
+    Each docx path must appear in the attachment list EXACTLY ONCE — otherwise
+    Gmail would attach the same DOCX twice under a single filename while the
+    body still claims a PDF + DOCX pair is present."""
+    resume_docx = Path("/tmp/acme_resume.docx")
+    cl_docx = Path("/tmp/acme_cl.docx")
+
+    # Simulate degraded mode: PDF tuple element points at the SAME docx path.
+    processed = [
+        {
+            "title": "Engineer",
+            "company": "Acme",
+            "url": "https://example.com",
+            "lane": "pmm",
+            "resume_pdf":         resume_docx,  # fallback: same as docx
+            "resume_docx":        resume_docx,
+            "cover_letter_pdf":   cl_docx,      # fallback: same as docx
+            "cover_letter_docx":  cl_docx,
+            "hiring_manager": None,
+        }
+    ]
+
+    attachments = _build_attachments(processed)
+
+    # Each unique docx path appears exactly once.
+    assert attachments.count(resume_docx) == 1, (
+        f"resume docx should appear exactly once, got "
+        f"{attachments.count(resume_docx)}: {attachments}"
+    )
+    assert attachments.count(cl_docx) == 1, (
+        f"cover letter docx should appear exactly once, got "
+        f"{attachments.count(cl_docx)}: {attachments}"
+    )
+    # Total is 2 (one resume + one cover letter), NOT 4.
+    assert len(attachments) == 2, (
+        f"Expected 2 unique attachments in degraded mode, got "
+        f"{len(attachments)}: {attachments}"
+    )
 
 
 if __name__ == "__main__":
