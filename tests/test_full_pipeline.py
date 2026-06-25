@@ -147,11 +147,14 @@ def test_attachment_list_scales_with_processed_jobs():
 
 
 def test_attachments_dedup_when_pdf_conversion_fails():
-    """When the PDF renderer falls back (no LibreOffice/docx2pdf available),
-    render_resume_pdf / render_cover_letter_pdf return (docx_path, docx_path).
-    Each docx path must appear in the attachment list EXACTLY ONCE — otherwise
-    Gmail would attach the same DOCX twice under a single filename while the
-    body still claims a PDF + DOCX pair is present."""
+    """Legacy-shape robustness for the dedup helper.
+
+    The current renderer contract (post-1658bd6) is (Optional[Path], Path) —
+    PDF is None on fallback, filtered upstream by _build_attachments. This
+    test exercises the dedup helper against the LEGACY (docx, docx) shape
+    that older callers might produce: each unique docx path must appear
+    exactly once. Guards against silent regression if the renderer contract
+    ever shifts back to returning a path in both slots."""
     resume_docx = Path("/tmp/acme_resume.docx")
     cl_docx = Path("/tmp/acme_cl.docx")
 
