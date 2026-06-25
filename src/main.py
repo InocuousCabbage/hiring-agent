@@ -48,6 +48,30 @@ def load_project_bank() -> list[dict]:
     return data.get("projects", [])
 
 
+def _build_attachments(processed: list[dict]) -> list[Path]:
+    """Flatten per-job (resume_pdf, resume_docx, cover_letter_pdf,
+    cover_letter_docx) into a single deduped attachment list.
+
+    Dedup matters because when LibreOffice/docx2pdf is unavailable, the
+    renderers fall back to returning (docx_path, docx_path) — the same path
+    twice. Without dedup the email would attach the DOCX twice under one
+    filename while the body claims a PDF + DOCX pair.
+    """
+    attachments: list[Path] = []
+    seen: set = set()
+    for p in processed:
+        for path in (
+            p["resume_pdf"],
+            p["resume_docx"],
+            p["cover_letter_pdf"],
+            p["cover_letter_docx"],
+        ):
+            if path not in seen:
+                seen.add(path)
+                attachments.append(path)
+    return attachments
+
+
 def run_pipeline(
     jobs: list[dict],
     config: dict,
@@ -326,27 +350,12 @@ def main() -> None:
             log.error("step.send_digest", status="aborted", reason="MY_EMAIL not set")
         else:
             subject = config["gmail"]["digest_subject_template"].format(date=today)
-            attachment_note = (
-                "Both PDF (for direct submission) and editable DOCX "
-                "(for last-minute edits in Word/Google Docs) are attached.\n\n"
+            attachments = _build_attachments(processed)
+            body = compose_digest(
+                processed=processed,
+                skipped=skipped,
+                attachments=attachments,
             )
-            body = attachment_note + compose_digest(processed=processed, skipped=skipped)
-            # Dedup attachments: when LibreOffice/docx2pdf is unavailable, the
-            # renderers fall back to returning (docx_path, docx_path) — the same
-            # path twice. Without dedup, the email would attach the DOCX twice
-            # under one filename while the body claims a PDF + DOCX pair.
-            attachments = []
-            seen = set()
-            for p in processed:
-                for path in (
-                    p["resume_pdf"],
-                    p["resume_docx"],
-                    p["cover_letter_pdf"],
-                    p["cover_letter_docx"],
-                ):
-                    if path not in seen:
-                        seen.add(path)
-                        attachments.append(path)
             try:
                 gmail.send_digest(
                     to=recipient,

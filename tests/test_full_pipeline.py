@@ -67,23 +67,19 @@ def _processed_fixture():
     ]
 
 
-def _build_attachments(processed: list[dict]) -> list[Path]:
-    """Replicates the attachment-list construction in main.main(), including
-    the dedup that handles the renderer fallback where PDF conversion fails
-    and (docx_path, docx_path) is returned."""
-    attachments: list[Path] = []
-    seen: set = set()
-    for p in processed:
-        for path in (
-            p["resume_pdf"],
-            p["resume_docx"],
-            p["cover_letter_pdf"],
-            p["cover_letter_docx"],
-        ):
-            if path not in seen:
-                seen.add(path)
-                attachments.append(path)
-    return attachments
+def test_build_attachments_is_shared_helper():
+    """tests must IMPORT _build_attachments from src.main, not redefine it.
+
+    Finding 2 of the code review: if main.py drifts, a redefined copy in
+    the test silently stays green. Force the test to consume the production
+    helper so drift surfaces immediately.
+    """
+    from main import _build_attachments as main_helper
+    assert callable(main_helper)
+
+
+# Import the production helper for all other tests below.
+from main import _build_attachments
 
 
 def test_attachment_list_has_four_files_per_processed_job():
@@ -189,6 +185,60 @@ def test_attachments_dedup_when_pdf_conversion_fails():
     assert len(attachments) == 2, (
         f"Expected 2 unique attachments in degraded mode, got "
         f"{len(attachments)}: {attachments}"
+    )
+
+
+def _processed_for_digest():
+    """Minimal processed list suitable for compose_digest body assertions."""
+    return [{
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com",
+        "lane": "pmm",
+    }]
+
+
+def test_compose_digest_includes_docx_note_when_docx_present():
+    """compose_digest should add the editable-DOCX note when any .docx file
+    is in attachments. Owner: compose_digest, NOT the call site in main.py."""
+    from gmail.digest import compose_digest
+
+    body = compose_digest(
+        processed=_processed_for_digest(),
+        skipped=[],
+        attachments=[Path("/tmp/acme_resume.docx"), Path("/tmp/acme_resume.pdf")],
+    )
+    assert "editable DOCX" in body
+    assert "for last-minute edits" in body
+
+
+def test_compose_digest_omits_docx_note_when_no_docx():
+    """If no .docx files in attachments, don't claim DOCX is attached."""
+    from gmail.digest import compose_digest
+
+    body = compose_digest(
+        processed=_processed_for_digest(),
+        skipped=[],
+        attachments=[Path("/tmp/acme_resume.pdf")],
+    )
+    assert "editable DOCX" not in body
+
+
+def test_compose_digest_omits_docx_note_when_attachments_none():
+    """Backwards-compat: callers that omit `attachments` get NO docx note
+    (preserves the pre-dual-output digest shape for the test suite)."""
+    from gmail.digest import compose_digest
+
+    body = compose_digest(processed=_processed_for_digest(), skipped=[])
+    assert "editable DOCX" not in body
+
+
+def test_main_call_site_no_longer_prepends_attachment_note():
+    """Finding 3: the body-text line lives in compose_digest, not main.py.
+    The hardcoded `attachment_note` prepend should be gone from main.main()."""
+    main_source = (ROOT / "src" / "main.py").read_text()
+    assert "attachment_note" not in main_source, (
+        "main.py still prepends attachment_note — should live in compose_digest"
     )
 
 
