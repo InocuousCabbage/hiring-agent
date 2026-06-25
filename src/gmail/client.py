@@ -259,9 +259,13 @@ class GmailClient:
                 part = MIMEBase(maintype, subtype)
                 part.set_payload(f.read())
                 encoders.encode_base64(part)
+                # Quote the filename so spaces and special characters survive
+                # MIME parsing. Without quotes, "Acme Corp_Resume.docx" would
+                # be truncated at the first space by RFC 2183 parsers and
+                # arrive as "Acme" on the recipient side.
                 part.add_header(
                     "Content-Disposition",
-                    f"attachment; filename={filepath.name}",
+                    f'attachment; filename="{filepath.name}"',
                 )
                 msg.attach(part)
 

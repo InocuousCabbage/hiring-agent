@@ -2,6 +2,8 @@
 gmail/digest.py — Compose and send the summary digest email.
 """
 
+from pathlib import Path
+
 
 def compose_digest(
     processed: list[dict],
@@ -10,19 +12,36 @@ def compose_digest(
 ) -> str:
     """Build the plain-text digest email body.
 
-    If `attachments` contains any .docx file, prepend a note explaining the
-    PDF + editable-DOCX pairing. This way future callers benefit and the
-    note is conditioned on actual DOCX presence (no false claim of an
-    editable DOCX when the renderer fell back to PDF-only).
+    Adds an attachment-format note conditioned on what is ACTUALLY in
+    `attachments` — checked via Path(p).suffix (canonical), not str.endswith():
+
+      - PDFs and DOCX both present  → "Both PDF + editable DOCX attached"
+      - DOCX present, no PDFs       → "Editable DOCX attached (no PDF
+                                       converter installed on the box)"
+      - No DOCX                     → no note (preserves pre-dual-output
+                                       digest shape for callers that omit
+                                       attachments entirely)
     """
     lines = []
 
-    if attachments and any(str(p).lower().endswith(".docx") for p in attachments):
-        lines.append(
-            "Both PDF (for direct submission) and editable DOCX "
-            "(for last-minute edits in Word/Google Docs) are attached."
-        )
-        lines.append("")
+    if attachments:
+        suffixes = {Path(p).suffix.lower() for p in attachments}
+        has_pdf = ".pdf" in suffixes
+        has_docx = ".docx" in suffixes
+        if has_pdf and has_docx:
+            lines.append(
+                "Both PDF (for direct submission) and editable DOCX "
+                "(for last-minute edits in Word/Google Docs) are attached."
+            )
+            lines.append("")
+        elif has_docx and not has_pdf:
+            lines.append(
+                "Editable DOCX attached (for last-minute edits in "
+                "Word/Google Docs) — no PDF converter is installed, so the "
+                "PDF is missing. Install LibreOffice on the agent box to "
+                "restore the PDF + DOCX pair."
+            )
+            lines.append("")
 
     lines.append(f"Processed ({len(processed)})")
     lines.append("=" * 40)

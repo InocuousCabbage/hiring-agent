@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from pdf_gen.renderer import render_resume_pdf, render_cover_letter_pdf
+from pdf_gen.renderer import render_resume, render_cover_letter
 
 ROOT       = Path(__file__).parent.parent
 OUTPUT_DIR = ROOT / "test_data" / "output"
@@ -176,38 +176,45 @@ def main() -> None:
 
     # ── Resume ───────────────────────────────────────────────────────────────
     print("\n[1/2] Rendering resume DOCX → PDF...")
-    resume_pdf, resume_docx = render_resume_pdf(
+    resume_pdf, resume_docx = render_resume(
         tailored_resume=SAMPLE_TAILORED_RESUME,
         lane=SAMPLE_LANE,
         job=job,
         date_str=today,
         output_dir=output_dir,
     )
-    resume_type = "PDF" if str(resume_pdf).endswith(".pdf") else "DOCX (no PDF converter)"
-    print(f"      PDF  : {resume_type}: {resume_pdf}")
+    if resume_pdf is None:
+        print(f"      PDF  : (no PDF converter installed)")
+    else:
+        print(f"      PDF  : {resume_pdf}")
     print(f"      DOCX : {resume_docx}")
 
     # ── Cover letter ─────────────────────────────────────────────────────────
     print("\n[2/2] Rendering cover letter DOCX → PDF...")
-    cl_pdf, cl_docx = render_cover_letter_pdf(
+    cl_pdf, cl_docx = render_cover_letter(
         cover_letter=SAMPLE_COVER_LETTER,
         job=job,
         date_str=today,
         output_dir=output_dir,
     )
-    cl_type = "PDF" if str(cl_pdf).endswith(".pdf") else "DOCX (no PDF converter)"
-    print(f"      PDF  : {cl_type}: {cl_pdf}")
+    if cl_pdf is None:
+        print(f"      PDF  : (no PDF converter installed)")
+    else:
+        print(f"      PDF  : {cl_pdf}")
     print(f"      DOCX : {cl_docx}")
 
     # ── Verify files exist and have content ──────────────────────────────────
     print("\n── File check ──")
     ok = True
-    for label, path in [
-        ("Resume PDF",   resume_pdf),
+    file_checks = [
         ("Resume DOCX",  resume_docx),
-        ("Cover PDF",    cl_pdf),
         ("Cover DOCX",   cl_docx),
-    ]:
+    ]
+    if resume_pdf is not None:
+        file_checks.insert(0, ("Resume PDF", resume_pdf))
+    if cl_pdf is not None:
+        file_checks.insert(-1, ("Cover PDF", cl_pdf))
+    for label, path in file_checks:
         if path.exists():
             size = path.stat().st_size
             status = "✓ OK" if size > 1000 else "⚠ suspiciously small"
@@ -218,8 +225,10 @@ def main() -> None:
 
     if ok:
         print("\nOpen to inspect:")
-        print(f"  open '{resume_pdf}'")
-        print(f"  open '{cl_pdf}'")
+        if resume_pdf is not None:
+            print(f"  open '{resume_pdf}'")
+        if cl_pdf is not None:
+            print(f"  open '{cl_pdf}'")
     else:
         print("\n⚠ One or more files missing — check logs above.")
 
@@ -236,8 +245,8 @@ _TEMPLATE_SKIP_REASON = (
 
 @pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
 def test_render_resume_returns_pdf_and_docx_tuple(tmp_path):
-    """render_resume_pdf returns (pdf_path, docx_path); DOCX is a valid OOXML file."""
-    pdf_path, docx_path = render_resume_pdf(
+    """render_resume returns (Optional[pdf_path], docx_path); DOCX is a valid OOXML file."""
+    pdf_path, docx_path = render_resume(
         tailored_resume=SAMPLE_TAILORED_RESUME,
         lane=SAMPLE_LANE,
         job=SAMPLE_JOB,
@@ -256,18 +265,20 @@ def test_render_resume_returns_pdf_and_docx_tuple(tmp_path):
         f"Expected >20 paragraphs in tailored resume DOCX, got {len(doc.paragraphs)}"
     )
 
-    # PDF is only produced if a converter (LibreOffice/docx2pdf) is available.
-    # When unavailable, renderer falls back to returning the DOCX as the first slot.
-    assert pdf_path.exists(), f"Renderer must return an extant path, got {pdf_path}"
+    # PDF is Optional: an extant Path when LibreOffice/docx2pdf is available,
+    # None when the renderer fell back to DOCX-only.
+    assert pdf_path is None or pdf_path.exists(), (
+        f"PDF slot must be None or an extant Path, got {pdf_path}"
+    )
 
 
 def test_render_cover_letter_returns_pdf_and_docx_tuple(tmp_path):
-    """render_cover_letter_pdf returns (pdf_path, docx_path); DOCX is valid.
+    """render_cover_letter returns (Optional[pdf_path], docx_path); DOCX is valid.
 
     Cover letters are built from scratch — no resume template required, so this
     test does not need the skip guard that the resume test has.
     """
-    pdf_path, docx_path = render_cover_letter_pdf(
+    pdf_path, docx_path = render_cover_letter(
         cover_letter=SAMPLE_COVER_LETTER,
         job=SAMPLE_JOB,
         date_str=date.today().isoformat(),
@@ -282,7 +293,61 @@ def test_render_cover_letter_returns_pdf_and_docx_tuple(tmp_path):
     # Cover letter has applicant name + contact + N paragraphs from SAMPLE_COVER_LETTER
     assert len(doc.paragraphs) >= len(SAMPLE_COVER_LETTER["paragraphs"]) + 2
 
-    assert pdf_path.exists()
+    assert pdf_path is None or pdf_path.exists()
+
+
+def test_render_resume_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
+    """HIGH-3 (structural fix): When no PDF converter is available, render_resume
+    must return (None, docx_path) — NOT (docx_path, docx_path).
+
+    Returning the same Path twice loses the ops signal that PDF conversion failed.
+    None in the PDF slot lets callers detect fallback unambiguously.
+    """
+    if _TEMPLATE_MISSING:
+        pytest.skip(_TEMPLATE_SKIP_REASON)
+
+    # Force the no-converter path by stubbing both LibreOffice + docx2pdf.
+    import pdf_gen.renderer as renderer_mod
+    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
+    # Block docx2pdf via sys.platform — non-darwin skips it; force darwin path to ImportError
+    import sys
+    monkeypatch.setattr(sys, "platform", "linux")  # skips the docx2pdf branch entirely
+
+    pdf_path, docx_path = render_resume(
+        tailored_resume=SAMPLE_TAILORED_RESUME,
+        lane=SAMPLE_LANE,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+
+    assert pdf_path is None, (
+        f"Expected pdf_path = None on fallback (no converter), got {pdf_path}. "
+        "Returning the same path twice loses the ops signal."
+    )
+    assert docx_path is not None and docx_path.exists()
+    assert docx_path.suffix == ".docx"
+
+
+def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
+    """HIGH-3: cover letter renderer must return (None, docx_path) on fallback."""
+    import pdf_gen.renderer as renderer_mod
+    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
+    import sys
+    monkeypatch.setattr(sys, "platform", "linux")  # skip docx2pdf branch
+
+    pdf_path, docx_path = render_cover_letter(
+        cover_letter=SAMPLE_COVER_LETTER,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+
+    assert pdf_path is None, (
+        f"Expected pdf_path = None on fallback, got {pdf_path}"
+    )
+    assert docx_path is not None and docx_path.exists()
+    assert docx_path.suffix == ".docx"
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ from classifier.lane_selector import classify_lane
 from tailor.resume_tailor import tailor_resume
 from tailor.cover_letter import write_cover_letter
 from qa.checker import run_qa, auto_fix
-from pdf_gen.renderer import render_resume_pdf, render_cover_letter_pdf
+from pdf_gen.renderer import render_resume, render_cover_letter
 from gmail.digest import compose_digest
 from contacts.hm_finder import find_hiring_manager
 
@@ -52,20 +52,29 @@ def _build_attachments(processed: list[dict]) -> list[Path]:
     """Flatten per-job (resume_pdf, resume_docx, cover_letter_pdf,
     cover_letter_docx) into a single deduped attachment list.
 
-    Dedup matters because when LibreOffice/docx2pdf is unavailable, the
-    renderers fall back to returning (docx_path, docx_path) — the same path
-    twice. Without dedup the email would attach the DOCX twice under one
-    filename while the body claims a PDF + DOCX pair.
+    Resilient to:
+      - PDF fallback: renderer returns None in the pdf slot when no
+        LibreOffice/docx2pdf is installed — those Nones are filtered out, so
+        only real files are attached and the digest body can honestly say
+        "DOCX only" instead of falsely claiming a PDF + DOCX pair exists.
+      - Partial-rollout dicts: missing keys (e.g. 'resume_docx' from a stale
+        producer) are tolerated via .get() instead of raising KeyError.
+      - Duplicate paths (e.g. older callers that returned the same docx in
+        both pdf and docx slots) are deduped so attachments don't double up.
     """
+    keys = (
+        "resume_pdf",
+        "resume_docx",
+        "cover_letter_pdf",
+        "cover_letter_docx",
+    )
     attachments: list[Path] = []
     seen: set = set()
     for p in processed:
-        for path in (
-            p["resume_pdf"],
-            p["resume_docx"],
-            p["cover_letter_pdf"],
-            p["cover_letter_docx"],
-        ):
+        for key in keys:
+            path = p.get(key)
+            if path is None:
+                continue
             if path not in seen:
                 seen.add(path)
                 attachments.append(path)
@@ -177,26 +186,29 @@ def run_pipeline(
                 skipped.append({**job, "reason": "QA failed after retries"})
                 continue
 
-            # ── Render PDFs + DOCX ────────────────────────────────────────────
+            # ── Render DOCX + PDF ─────────────────────────────────────────────
+            # DOCX is always produced; PDF is Optional (None when no
+            # LibreOffice/docx2pdf is installed). Downstream code (digest body
+            # + attachments) handles the None case explicitly.
             output_dir.mkdir(parents=True, exist_ok=True)
-            resume_pdf, resume_docx = render_resume_pdf(
+            resume_pdf, resume_docx = render_resume(
                 tailored_resume=tailored_resume,
                 lane=lane,
                 job=job,
                 date_str=today,
                 output_dir=output_dir,
             )
-            cl_pdf, cl_docx = render_cover_letter_pdf(
+            cl_pdf, cl_docx = render_cover_letter(
                 cover_letter=cover_letter,
                 job=job,
                 date_str=today,
                 output_dir=output_dir,
             )
             job_log.info(
-                "step.render_pdf",
-                resume_pdf=str(resume_pdf),
+                "step.render_documents",
+                resume_pdf=str(resume_pdf) if resume_pdf else None,
                 resume_docx=str(resume_docx),
-                cover_letter_pdf=str(cl_pdf),
+                cover_letter_pdf=str(cl_pdf) if cl_pdf else None,
                 cover_letter_docx=str(cl_docx),
             )
 
@@ -283,13 +295,21 @@ def main() -> None:
         print(f"{'='*60}")
         print(f"Processed : {len(processed)}")
         for p in processed:
-            r_type = "PDF" if str(p["resume_pdf"]).endswith(".pdf") else "DOCX"
-            cl_type = "PDF" if str(p["cover_letter_pdf"]).endswith(".pdf") else "DOCX"
             print(f"\n  • {p['title']} @ {p['company']}  [{p['lane']}]")
-            print(f"    Resume ({r_type})       : {p['resume_pdf']}")
-            print(f"    Resume (DOCX)          : {p['resume_docx']}")
-            print(f"    Cover Letter ({cl_type}) : {p['cover_letter_pdf']}")
-            print(f"    Cover Letter (DOCX)    : {p['cover_letter_docx']}")
+
+            # Resume: PDF is Optional. None → fallback mode (no PDF converter)
+            if p["resume_pdf"] is None:
+                print(f"    Resume (DOCX, no PDF converter) : {p['resume_docx']}")
+            else:
+                print(f"    Resume PDF                       : {p['resume_pdf']}")
+                print(f"    Resume DOCX                      : {p['resume_docx']}")
+
+            # Cover letter: same Optional-pdf handling
+            if p["cover_letter_pdf"] is None:
+                print(f"    Cover Letter (DOCX, no PDF converter) : {p['cover_letter_docx']}")
+            else:
+                print(f"    Cover Letter PDF                       : {p['cover_letter_pdf']}")
+                print(f"    Cover Letter DOCX                      : {p['cover_letter_docx']}")
             hm = p.get("hiring_manager")
             if hm:
                 print(f"    Hiring Manager       : {hm['name']} — {hm.get('title', 'N/A')} ({hm['confidence']})")

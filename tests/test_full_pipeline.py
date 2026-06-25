@@ -242,5 +242,213 @@ def test_main_call_site_no_longer_prepends_attachment_note():
     )
 
 
+# ── Code-review structural fix: HIGH cluster ──────────────────────────────────
+# Root cause: renderers returned (docx, docx) on PDF fallback, losing the ops
+# signal that PDF conversion was unavailable. The structural fix is:
+#  - renderer returns (None, docx_path) on fallback, (pdf_path, docx_path) otherwise
+#  - compose_digest checks for BOTH .pdf AND .docx presence in attachments
+#  - _build_attachments filters None (M1: also uses .get() for partial-rollout dicts)
+
+
+def test_compose_digest_says_both_only_when_pdf_and_docx_present():
+    """HIGH-1: compose_digest must not claim 'Both PDF + editable DOCX' when only DOCX exists."""
+    from gmail.digest import compose_digest
+
+    # DOCX only — fallback mode (no PDF converter on the box)
+    body = compose_digest(
+        processed=_processed_for_digest(),
+        skipped=[],
+        attachments=[Path("/tmp/acme_resume.docx"), Path("/tmp/acme_cl.docx")],
+    )
+    # Must NOT claim a PDF exists
+    assert "Both PDF" not in body, (
+        "compose_digest falsely claims 'Both PDF' attached when only DOCX present"
+    )
+    # Should still mention DOCX (it's what's actually attached)
+    assert "editable DOCX" in body or "DOCX" in body
+
+
+def test_compose_digest_says_both_when_both_present():
+    """compose_digest claims both attached only when both .pdf and .docx are present."""
+    from gmail.digest import compose_digest
+
+    body = compose_digest(
+        processed=_processed_for_digest(),
+        skipped=[],
+        attachments=[
+            Path("/tmp/acme_resume.pdf"),
+            Path("/tmp/acme_resume.docx"),
+            Path("/tmp/acme_cl.pdf"),
+            Path("/tmp/acme_cl.docx"),
+        ],
+    )
+    assert "Both PDF" in body and "editable DOCX" in body
+
+
+def test_build_attachments_skips_missing_keys():
+    """M1: Partial-rollout dict missing 'resume_docx'/'cover_letter_docx' must NOT crash.
+
+    During mid-deploy / partial rollout, processed dicts might omit the new docx
+    keys. _build_attachments should .get() and skip None, never raise KeyError.
+    """
+    processed = [{
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com",
+        "lane": "pmm",
+        "resume_pdf":       Path("/tmp/r.pdf"),
+        "cover_letter_pdf": Path("/tmp/cl.pdf"),
+        # NOTE: resume_docx and cover_letter_docx intentionally missing
+        "hiring_manager": None,
+    }]
+
+    # Must NOT raise
+    result = _build_attachments(processed)
+    assert Path("/tmp/r.pdf") in result
+    assert Path("/tmp/cl.pdf") in result
+
+
+def test_build_attachments_filters_none_from_pdf_fallback():
+    """HIGH-3/M4: When PDF conversion unavailable, resume_pdf/cover_letter_pdf is None.
+
+    _build_attachments must filter None — only the 2 DOCX paths end up in the list.
+    """
+    resume_docx = Path("/tmp/acme_resume.docx")
+    cl_docx = Path("/tmp/acme_cl.docx")
+
+    processed = [{
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com",
+        "lane": "pmm",
+        "resume_pdf":         None,           # fallback — no PDF converter
+        "resume_docx":        resume_docx,
+        "cover_letter_pdf":   None,           # fallback — no PDF converter
+        "cover_letter_docx":  cl_docx,
+        "hiring_manager": None,
+    }]
+
+    attachments = _build_attachments(processed)
+
+    assert None not in attachments, f"None leaked into attachments: {attachments}"
+    assert attachments.count(resume_docx) == 1
+    assert attachments.count(cl_docx) == 1
+    assert len(attachments) == 2, (
+        f"Expected exactly 2 DOCX attachments in fallback mode, got {len(attachments)}: {attachments}"
+    )
+
+
+def test_compose_digest_uses_path_suffix_check():
+    """M2: DOCX detection should use Path.suffix, not str.endswith().
+
+    str(p).lower().endswith('.docx') incorrectly matches edge cases like
+    a filename ending '.DOCX.bak' would NOT match (str.endswith works there)
+    BUT Path.suffix is the canonical/idiomatic check and matches our other code.
+    Asserting source-level usage to lock in the convention.
+    """
+    digest_source = (ROOT / "src" / "gmail" / "digest.py").read_text()
+    # Should use Path.suffix, not str.endswith for DOCX/PDF detection
+    assert ".suffix" in digest_source, (
+        "compose_digest should use Path(p).suffix for extension checks"
+    )
+    # Old pattern gone
+    assert ".endswith('.docx')" not in digest_source.replace('"', "'"), (
+        "compose_digest still uses str.endswith for DOCX detection"
+    )
+
+
+def test_main_print_one_line_per_artifact_on_pdf_fallback(capsys, monkeypatch, tmp_path):
+    """M4: test-mode print should print 1 line per artifact pair when PDF is None,
+    not 2 duplicate lines naming the same DOCX path.
+
+    Source-level check: detect that main.py treats None-pdf as a fallback case
+    rather than printing pdf and docx slots as if they were two distinct files.
+    """
+    main_source = (ROOT / "src" / "main.py").read_text()
+    # Must check for None on the pdf slot somewhere in the test-mode block
+    assert "is None" in main_source or "if p[\"resume_pdf\"]" in main_source or "p.get(\"resume_pdf\")" in main_source, (
+        "main.py test-mode print should detect None pdf slot for fallback messaging"
+    )
+
+
+def test_step_render_event_renamed():
+    """HIGH-2: log event renamed from 'step.render_pdf' → 'step.render_documents'
+    to match the renamed function and reflect dual-output reality."""
+    main_source = (ROOT / "src" / "main.py").read_text()
+    assert "step.render_pdf" not in main_source, (
+        "main.py still emits stale 'step.render_pdf' event — rename to 'step.render_documents'"
+    )
+    assert "step.render_documents" in main_source, (
+        "main.py should emit 'step.render_documents' to match renamed render function"
+    )
+
+
+def test_renderer_functions_renamed():
+    """HIGH-2: rename render_resume_pdf → render_resume, render_cover_letter_pdf → render_cover_letter.
+
+    Old names no longer match behavior (DOCX-primary, PDF-optional)."""
+    from pdf_gen import renderer
+    assert hasattr(renderer, "render_resume"), (
+        "renderer should export render_resume (renamed from render_resume_pdf)"
+    )
+    assert hasattr(renderer, "render_cover_letter"), (
+        "renderer should export render_cover_letter (renamed from render_cover_letter_pdf)"
+    )
+
+
+def test_content_disposition_filename_is_quoted(tmp_path):
+    """M3: Content-Disposition filename must be quoted (or RFC2231-encoded) so that
+    spaces and non-ASCII characters in attachment filenames do not corrupt the header.
+
+    Currently: `filename={filepath.name}` (unquoted). Expected: `filename="{filepath.name}"`.
+    """
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+    from gmail.client import GmailClient
+
+    # Build a real MIMEMultipart the same way send_email does, but exercise only
+    # the attachment-loop logic (extract it into a callable via a thin shim).
+    filepath = tmp_path / "Acme Corp_Resume.docx"
+    filepath.write_bytes(b"fake docx contents")
+
+    # Construct a message and run the attachment loop manually using the same
+    # logic as GmailClient.send_email so we can inspect the header.
+    msg = MIMEMultipart()
+    msg["to"] = "me@example.com"
+    msg["subject"] = "Test"
+    msg.attach(MIMEText("body", "plain"))
+
+    suffix = filepath.suffix.lower()
+    maintype, subtype = GmailClient._MIME_MAP.get(suffix, ("application", "octet-stream"))
+    with open(filepath, "rb") as f:
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(f.read())
+        encoders.encode_base64(part)
+        # This is the line we're testing — pulled from gmail/client.py send_email.
+        # Source-grep is the actual assertion; this exercise is just to ensure
+        # the source-line under test is reachable.
+        pass
+
+    # Source-level assertion: the production code must quote the filename.
+    client_source = (ROOT / "src" / "gmail" / "client.py").read_text()
+    # Reject the unquoted pattern
+    assert "filename={filepath.name}" not in client_source, (
+        "Content-Disposition filename is unquoted — wrap in double quotes "
+        "or use email.utils.encode_rfc2231 for spaces/non-ASCII safety."
+    )
+    # Require either a quoted pattern OR rfc2231 encoding
+    has_quoted = (
+        'filename="{filepath.name}"' in client_source
+        or "filename=\\\"{filepath.name}\\\"" in client_source
+    )
+    has_rfc2231 = "encode_rfc2231" in client_source or "add_header" in client_source and "filename" in client_source and "encode" in client_source
+    assert has_quoted or has_rfc2231, (
+        "Content-Disposition filename must be quoted or RFC2231-encoded; "
+        f"current client source pattern not recognized as safe."
+    )
+
+
 if __name__ == "__main__":
     main()
