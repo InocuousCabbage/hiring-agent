@@ -81,10 +81,18 @@ def render_resume_pdf(
     job: dict,
     date_str: str,
     output_dir: Path,
-) -> Path:
+) -> tuple[Path, Path]:
     """
     Fill the lane's base resume template with tailored content and convert to PDF.
-    Returns the PDF path (or DOCX path if PDF conversion is unavailable).
+
+    Returns (pdf_path, docx_path) — both files are written to output_dir.
+    The DOCX is the editable intermediate; the PDF is the converted final.
+    Content is semantically identical because the PDF is generated from the
+    same DOCX.
+
+    If PDF conversion is unavailable (no LibreOffice / docx2pdf), the first
+    element falls back to the DOCX path so callers always receive two valid
+    Path objects (the same path twice, in that degraded case).
     """
     template_path = _ROOT / lane["template"]
     if not template_path.exists():
@@ -101,11 +109,11 @@ def render_resume_pdf(
     _docx_to_pdf(docx_path, output_dir)
 
     if pdf_path.exists():
-        log.info("renderer.resume_pdf", path=str(pdf_path))
-        return pdf_path
+        log.info("renderer.resume_pdf", pdf=str(pdf_path), docx=str(docx_path))
+        return pdf_path, docx_path
 
     log.warning("renderer.pdf_unavailable_returning_docx", path=str(docx_path))
-    return docx_path
+    return docx_path, docx_path
 
 
 def render_cover_letter_pdf(
@@ -113,10 +121,15 @@ def render_cover_letter_pdf(
     job: dict,
     date_str: str,
     output_dir: Path,
-) -> Path:
+) -> tuple[Path, Path]:
     """
     Build a clean cover letter DOCX from the paragraph list and convert to PDF.
-    Returns the PDF path (or DOCX path if PDF conversion is unavailable).
+
+    Returns (pdf_path, docx_path) — both files are written to output_dir.
+    The DOCX is the editable intermediate; the PDF is the converted final.
+
+    If PDF conversion is unavailable, the first element falls back to the DOCX
+    path so callers always receive two valid Path objects.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     base = f"{_safe_filename(job['company'])}_{_safe_filename(job['title'])}_Cover_Letter"
@@ -127,11 +140,11 @@ def render_cover_letter_pdf(
     _docx_to_pdf(docx_path, output_dir)
 
     if pdf_path.exists():
-        log.info("renderer.cl_pdf", path=str(pdf_path))
-        return pdf_path
+        log.info("renderer.cl_pdf", pdf=str(pdf_path), docx=str(docx_path))
+        return pdf_path, docx_path
 
     log.warning("renderer.pdf_unavailable_returning_docx", path=str(docx_path))
-    return docx_path
+    return docx_path, docx_path
 
 
 # ── Resume template filling ───────────────────────────────────────────────────

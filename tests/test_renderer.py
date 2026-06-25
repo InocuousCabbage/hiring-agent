@@ -12,8 +12,12 @@ Outputs both files to test_data/output/ and prints paths for visual inspection.
 
 import json
 import sys
+import zipfile
 from datetime import date
 from pathlib import Path
+
+import pytest
+from docx import Document
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -172,31 +176,38 @@ def main() -> None:
 
     # ── Resume ───────────────────────────────────────────────────────────────
     print("\n[1/2] Rendering resume DOCX → PDF...")
-    resume_path = render_resume_pdf(
+    resume_pdf, resume_docx = render_resume_pdf(
         tailored_resume=SAMPLE_TAILORED_RESUME,
         lane=SAMPLE_LANE,
         job=job,
         date_str=today,
         output_dir=output_dir,
     )
-    resume_type = "PDF" if str(resume_path).endswith(".pdf") else "DOCX (no PDF converter)"
-    print(f"      {resume_type}: {resume_path}")
+    resume_type = "PDF" if str(resume_pdf).endswith(".pdf") else "DOCX (no PDF converter)"
+    print(f"      PDF  : {resume_type}: {resume_pdf}")
+    print(f"      DOCX : {resume_docx}")
 
     # ── Cover letter ─────────────────────────────────────────────────────────
     print("\n[2/2] Rendering cover letter DOCX → PDF...")
-    cl_path = render_cover_letter_pdf(
+    cl_pdf, cl_docx = render_cover_letter_pdf(
         cover_letter=SAMPLE_COVER_LETTER,
         job=job,
         date_str=today,
         output_dir=output_dir,
     )
-    cl_type = "PDF" if str(cl_path).endswith(".pdf") else "DOCX (no PDF converter)"
-    print(f"      {cl_type}: {cl_path}")
+    cl_type = "PDF" if str(cl_pdf).endswith(".pdf") else "DOCX (no PDF converter)"
+    print(f"      PDF  : {cl_type}: {cl_pdf}")
+    print(f"      DOCX : {cl_docx}")
 
     # ── Verify files exist and have content ──────────────────────────────────
     print("\n── File check ──")
     ok = True
-    for label, path in [("Resume", resume_path), ("Cover letter", cl_path)]:
+    for label, path in [
+        ("Resume PDF",   resume_pdf),
+        ("Resume DOCX",  resume_docx),
+        ("Cover PDF",    cl_pdf),
+        ("Cover DOCX",   cl_docx),
+    ]:
         if path.exists():
             size = path.stat().st_size
             status = "✓ OK" if size > 1000 else "⚠ suspiciously small"
@@ -207,10 +218,71 @@ def main() -> None:
 
     if ok:
         print("\nOpen to inspect:")
-        print(f"  open '{resume_path}'")
-        print(f"  open '{cl_path}'")
+        print(f"  open '{resume_pdf}'")
+        print(f"  open '{cl_pdf}'")
     else:
         print("\n⚠ One or more files missing — check logs above.")
+
+
+# ── Pytest unit tests ─────────────────────────────────────────────────────────
+
+_TEMPLATE_PATH = ROOT / "templates" / "resumes" / "base_resume.docx"
+_TEMPLATE_MISSING = not _TEMPLATE_PATH.exists()
+_TEMPLATE_SKIP_REASON = (
+    f"Base resume template missing at {_TEMPLATE_PATH} "
+    "(user-supplied + gitignored — set up per SETUP.md to run renderer tests)."
+)
+
+
+@pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
+def test_render_resume_returns_pdf_and_docx_tuple(tmp_path):
+    """render_resume_pdf returns (pdf_path, docx_path); DOCX is a valid OOXML file."""
+    pdf_path, docx_path = render_resume_pdf(
+        tailored_resume=SAMPLE_TAILORED_RESUME,
+        lane=SAMPLE_LANE,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+
+    # DOCX is always produced — even if PDF conversion fails
+    assert docx_path.exists(), f"DOCX not written at {docx_path}"
+    assert docx_path.suffix == ".docx"
+    assert zipfile.is_zipfile(docx_path), "DOCX must be a valid OOXML/ZIP file"
+
+    doc = Document(str(docx_path))
+    # base_resume.docx has 26+ paragraphs (per renderer.py docstring)
+    assert len(doc.paragraphs) > 20, (
+        f"Expected >20 paragraphs in tailored resume DOCX, got {len(doc.paragraphs)}"
+    )
+
+    # PDF is only produced if a converter (LibreOffice/docx2pdf) is available.
+    # When unavailable, renderer falls back to returning the DOCX as the first slot.
+    assert pdf_path.exists(), f"Renderer must return an extant path, got {pdf_path}"
+
+
+def test_render_cover_letter_returns_pdf_and_docx_tuple(tmp_path):
+    """render_cover_letter_pdf returns (pdf_path, docx_path); DOCX is valid.
+
+    Cover letters are built from scratch — no resume template required, so this
+    test does not need the skip guard that the resume test has.
+    """
+    pdf_path, docx_path = render_cover_letter_pdf(
+        cover_letter=SAMPLE_COVER_LETTER,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+
+    assert docx_path.exists(), f"Cover letter DOCX not written at {docx_path}"
+    assert docx_path.suffix == ".docx"
+    assert zipfile.is_zipfile(docx_path)
+
+    doc = Document(str(docx_path))
+    # Cover letter has applicant name + contact + N paragraphs from SAMPLE_COVER_LETTER
+    assert len(doc.paragraphs) >= len(SAMPLE_COVER_LETTER["paragraphs"]) + 2
+
+    assert pdf_path.exists()
 
 
 if __name__ == "__main__":

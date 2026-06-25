@@ -153,22 +153,28 @@ def run_pipeline(
                 skipped.append({**job, "reason": "QA failed after retries"})
                 continue
 
-            # ── Render PDFs ───────────────────────────────────────────────────
+            # ── Render PDFs + DOCX ────────────────────────────────────────────
             output_dir.mkdir(parents=True, exist_ok=True)
-            resume_pdf = render_resume_pdf(
+            resume_pdf, resume_docx = render_resume_pdf(
                 tailored_resume=tailored_resume,
                 lane=lane,
                 job=job,
                 date_str=today,
                 output_dir=output_dir,
             )
-            cl_pdf = render_cover_letter_pdf(
+            cl_pdf, cl_docx = render_cover_letter_pdf(
                 cover_letter=cover_letter,
                 job=job,
                 date_str=today,
                 output_dir=output_dir,
             )
-            job_log.info("step.render_pdf", resume=str(resume_pdf), cover_letter=str(cl_pdf))
+            job_log.info(
+                "step.render_pdf",
+                resume_pdf=str(resume_pdf),
+                resume_docx=str(resume_docx),
+                cover_letter_pdf=str(cl_pdf),
+                cover_letter_docx=str(cl_docx),
+            )
 
             # ── Hiring manager lookup ──────────────────────────────────────
             hm_info = None
@@ -193,7 +199,9 @@ def run_pipeline(
                 **job,
                 "lane": lane["label"],
                 "resume_pdf": resume_pdf,
+                "resume_docx": resume_docx,
                 "cover_letter_pdf": cl_pdf,
+                "cover_letter_docx": cl_docx,
                 "hiring_manager": hm_info,
             })
 
@@ -255,7 +263,9 @@ def main() -> None:
             cl_type = "PDF" if str(p["cover_letter_pdf"]).endswith(".pdf") else "DOCX"
             print(f"\n  • {p['title']} @ {p['company']}  [{p['lane']}]")
             print(f"    Resume ({r_type})       : {p['resume_pdf']}")
+            print(f"    Resume (DOCX)          : {p['resume_docx']}")
             print(f"    Cover Letter ({cl_type}) : {p['cover_letter_pdf']}")
+            print(f"    Cover Letter (DOCX)    : {p['cover_letter_docx']}")
             hm = p.get("hiring_manager")
             if hm:
                 print(f"    Hiring Manager       : {hm['name']} — {hm.get('title', 'N/A')} ({hm['confidence']})")
@@ -316,11 +326,17 @@ def main() -> None:
             log.error("step.send_digest", status="aborted", reason="MY_EMAIL not set")
         else:
             subject = config["gmail"]["digest_subject_template"].format(date=today)
-            body = compose_digest(processed=processed, skipped=skipped)
+            attachment_note = (
+                "Both PDF (for direct submission) and editable DOCX "
+                "(for last-minute edits in Word/Google Docs) are attached.\n\n"
+            )
+            body = attachment_note + compose_digest(processed=processed, skipped=skipped)
             attachments = []
             for p in processed:
                 attachments.append(p["resume_pdf"])
+                attachments.append(p["resume_docx"])
                 attachments.append(p["cover_letter_pdf"])
+                attachments.append(p["cover_letter_docx"])
             try:
                 gmail.send_digest(
                     to=recipient,

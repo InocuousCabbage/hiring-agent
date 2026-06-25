@@ -1,8 +1,8 @@
 # Hiring.cafe Job Alert Agent
 
 Automated job application pipeline: ingests Hiring.cafe email alerts, fetches JDs,
-classifies into marketing lanes, tailors resumes + cover letters, generates PDFs,
-and sends a digest email — all hands-off.
+classifies into marketing lanes, tailors resumes + cover letters, generates PDFs
+**and editable DOCX files**, and sends a digest email — all hands-off.
 
 ## Architecture
 
@@ -109,6 +109,7 @@ python src/main.py
 ## Key Design Decisions
 
 - **DOCX templates → PDF** (not HTML→PDF) for maximum style fidelity to your base resumes
+- **Dual output** — the digest email attaches BOTH the PDF (for direct submission) and the editable DOCX (for last-minute edits in Word / Google Docs / LibreOffice)
 - **Claude API** for all LLM reasoning (lane classification, tailoring, QA validation)
 - **Idempotent** via Gmail labels + stored message IDs
 - **Retry-with-fix** QA loop (max 2 retries) before skipping a job

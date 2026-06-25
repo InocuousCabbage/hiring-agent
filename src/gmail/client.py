@@ -225,6 +225,17 @@ class GmailClient:
 
     # ── Send ────────────────────────────────────────────────────
 
+    # MIME type dispatch for outbound attachments. Keyed on the lowercase
+    # filename suffix. Anything not in the map gets a safe octet-stream
+    # fallback so unknown formats don't break the send.
+    _MIME_MAP = {
+        ".pdf": ("application", "pdf"),
+        ".docx": (
+            "application",
+            "vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    }
+
     def send_email(
         self,
         to: str,
@@ -232,7 +243,7 @@ class GmailClient:
         body_text: str,
         attachments: list[Path] | None = None,
     ):
-        """Send an email with optional PDF attachments."""
+        """Send an email with optional PDF/DOCX attachments."""
         msg = MIMEMultipart()
         msg["to"] = to
         msg["subject"] = subject
@@ -240,8 +251,12 @@ class GmailClient:
 
         for filepath in (attachments or []):
             filepath = Path(filepath)
+            suffix = filepath.suffix.lower()
+            maintype, subtype = self._MIME_MAP.get(
+                suffix, ("application", "octet-stream")
+            )
             with open(filepath, "rb") as f:
-                part = MIMEBase("application", "pdf")
+                part = MIMEBase(maintype, subtype)
                 part.set_payload(f.read())
                 encoders.encode_base64(part)
                 part.add_header(
@@ -263,7 +278,7 @@ class GmailClient:
         body_text: str,
         attachments: list[Path] | None = None,
     ):
-        """Send a digest email with optional PDF attachments (retries on transient errors)."""
+        """Send a digest email with optional PDF/DOCX attachments (retries on transient errors)."""
         self.refresh_connection()
         self._retry_call(
             lambda: self.send_email(
