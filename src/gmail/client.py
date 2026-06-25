@@ -225,6 +225,17 @@ class GmailClient:
 
     # ── Send ────────────────────────────────────────────────────
 
+    # MIME type dispatch for outbound attachments. Keyed on the lowercase
+    # filename suffix. Anything not in the map gets a safe octet-stream
+    # fallback so unknown formats don't break the send.
+    _MIME_MAP = {
+        ".pdf": ("application", "pdf"),
+        ".docx": (
+            "application",
+            "vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    }
+
     def send_email(
         self,
         to: str,
@@ -232,7 +243,7 @@ class GmailClient:
         body_text: str,
         attachments: list[Path] | None = None,
     ):
-        """Send an email with optional PDF attachments."""
+        """Send an email with optional PDF/DOCX attachments."""
         msg = MIMEMultipart()
         msg["to"] = to
         msg["subject"] = subject
@@ -240,13 +251,21 @@ class GmailClient:
 
         for filepath in (attachments or []):
             filepath = Path(filepath)
+            suffix = filepath.suffix.lower()
+            maintype, subtype = self._MIME_MAP.get(
+                suffix, ("application", "octet-stream")
+            )
             with open(filepath, "rb") as f:
-                part = MIMEBase("application", "pdf")
+                part = MIMEBase(maintype, subtype)
                 part.set_payload(f.read())
                 encoders.encode_base64(part)
+                # Quote the filename so spaces and special characters survive
+                # MIME parsing. Without quotes, "Acme Corp_Resume.docx" would
+                # be truncated at the first space by RFC 2183 parsers and
+                # arrive as "Acme" on the recipient side.
                 part.add_header(
                     "Content-Disposition",
-                    f"attachment; filename={filepath.name}",
+                    f'attachment; filename="{filepath.name}"',
                 )
                 msg.attach(part)
 
@@ -263,7 +282,7 @@ class GmailClient:
         body_text: str,
         attachments: list[Path] | None = None,
     ):
-        """Send a digest email with optional PDF attachments (retries on transient errors)."""
+        """Send a digest email with optional PDF/DOCX attachments (retries on transient errors)."""
         self.refresh_connection()
         self._retry_call(
             lambda: self.send_email(

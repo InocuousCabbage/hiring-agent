@@ -14,7 +14,7 @@ This is an automated job application pipeline. It:
 5. Writes a custom cover letter for each job
 6. Runs quality checks (no fabricated claims, one page max, etc.)
 7. Converts everything to PDF
-8. Emails you a digest with all the tailored documents attached
+8. Emails you a digest with all the tailored documents attached — **both PDF (for direct submission) and editable DOCX (for last-minute edits in Word / Google Docs / LibreOffice)**
 
 You set it up once, then it runs automatically.
 

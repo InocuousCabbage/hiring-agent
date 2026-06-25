@@ -173,11 +173,18 @@ class TestDigestModuleCleaned:
         assert hasattr(digest, "compose_digest")
         assert callable(digest.compose_digest)
 
-    def test_no_pathlib_import(self):
-        """Path import was only used by the removed send_digest."""
+    def test_no_send_digest_residue(self):
+        """The removed send_digest used Gmail API/MIME plumbing — none of that
+        should remain in digest.py. Path import is now legitimately needed by
+        compose_digest to introspect attachment suffixes for the body note
+        (PDF + DOCX vs DOCX-only), so it is no longer forbidden."""
         source = (ROOT / "src" / "gmail" / "digest.py").read_text()
-        assert "from pathlib" not in source
-        assert "import Path" not in source
+        assert "MIMEText" not in source
+        assert "MIMEMultipart" not in source
+        assert "google.auth" not in source
+        assert "googleapiclient" not in source
+        # send_digest itself stays gone
+        assert "def send_digest" not in source
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

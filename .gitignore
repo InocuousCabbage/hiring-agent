@@ -22,3 +22,6 @@ logs/
 .personal-backup/
 # Sample email files (contain personal email headers)
 test_data/*.eml
+
+# OBF/m2c1 planning artifacts (local working docs, not part of repo)
+.agent/

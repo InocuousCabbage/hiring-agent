@@ -32,6 +32,7 @@ import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
+from typing import Optional
 
 import structlog
 from docx import Document
@@ -75,16 +76,25 @@ _LO_CANDIDATES = [
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def render_resume_pdf(
+def render_resume(
     tailored_resume: dict,
     lane: dict,
     job: dict,
     date_str: str,
     output_dir: Path,
-) -> Path:
+) -> tuple[Optional[Path], Path]:
     """
     Fill the lane's base resume template with tailored content and convert to PDF.
-    Returns the PDF path (or DOCX path if PDF conversion is unavailable).
+
+    Returns (pdf_path or None, docx_path) — DOCX is always written to output_dir.
+    The DOCX is the editable intermediate; the PDF is the converted final.
+    Content is semantically identical because the PDF is generated from the
+    same DOCX.
+
+    If PDF conversion is unavailable (no LibreOffice / docx2pdf installed), the
+    first element is None to give callers an unambiguous "no PDF" signal — they
+    can then filter the None, log it, or fall back to a DOCX-only message
+    without falsely claiming a PDF exists.
     """
     template_path = _ROOT / lane["template"]
     if not template_path.exists():
@@ -101,22 +111,27 @@ def render_resume_pdf(
     _docx_to_pdf(docx_path, output_dir)
 
     if pdf_path.exists():
-        log.info("renderer.resume_pdf", path=str(pdf_path))
-        return pdf_path
+        log.info("renderer.resume_documents", pdf=str(pdf_path), docx=str(docx_path))
+        return pdf_path, docx_path
 
-    log.warning("renderer.pdf_unavailable_returning_docx", path=str(docx_path))
-    return docx_path
+    log.warning("renderer.pdf_unavailable_docx_only", docx=str(docx_path))
+    return None, docx_path
 
 
-def render_cover_letter_pdf(
+def render_cover_letter(
     cover_letter: dict,
     job: dict,
     date_str: str,
     output_dir: Path,
-) -> Path:
+) -> tuple[Optional[Path], Path]:
     """
     Build a clean cover letter DOCX from the paragraph list and convert to PDF.
-    Returns the PDF path (or DOCX path if PDF conversion is unavailable).
+
+    Returns (pdf_path or None, docx_path) — DOCX is always written to output_dir.
+    The DOCX is the editable intermediate; the PDF is the converted final.
+
+    If PDF conversion is unavailable, the first element is None — see
+    render_resume() docstring for rationale.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     base = f"{_safe_filename(job['company'])}_{_safe_filename(job['title'])}_Cover_Letter"
@@ -127,11 +142,11 @@ def render_cover_letter_pdf(
     _docx_to_pdf(docx_path, output_dir)
 
     if pdf_path.exists():
-        log.info("renderer.cl_pdf", path=str(pdf_path))
-        return pdf_path
+        log.info("renderer.cover_letter_documents", pdf=str(pdf_path), docx=str(docx_path))
+        return pdf_path, docx_path
 
-    log.warning("renderer.pdf_unavailable_returning_docx", path=str(docx_path))
-    return docx_path
+    log.warning("renderer.pdf_unavailable_docx_only", docx=str(docx_path))
+    return None, docx_path
 
 
 # ── Resume template filling ───────────────────────────────────────────────────
