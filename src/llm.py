@@ -85,30 +85,39 @@ def _call_via_cli(prompt: str, model: str, system: str | None, timeout: int) -> 
 
     # For long prompts, write to temp file to avoid OS argument length limits
     # and CLI parsing issues. Threshold: 8000 chars (~safe ARG_MAX margin).
-    if len(full_prompt) > 8000:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, prefix="claude_prompt_"
-        ) as f:
-            f.write(full_prompt)
-            tmp_path = f.name
-        try:
-            # Read prompt from file via shell redirection
+    try:
+        if len(full_prompt) > 8000:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, prefix="claude_prompt_"
+            ) as f:
+                f.write(full_prompt)
+                tmp_path = f.name
+            try:
+                # Read prompt from file via shell redirection
+                result = subprocess.run(
+                    f'cat "{tmp_path}" | claude -p',
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    shell=True,
+                )
+            finally:
+                os.unlink(tmp_path)
+        else:
             result = subprocess.run(
-                f'cat "{tmp_path}" | claude -p',
+                ["claude", "-p", full_prompt],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                shell=True,
             )
-        finally:
-            os.unlink(tmp_path)
-    else:
-        result = subprocess.run(
-            ["claude", "-p", full_prompt],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+    except subprocess.TimeoutExpired as exc:
+        # Redact prompt from exception — TimeoutExpired.cmd contains the full
+        # argv (including the prompt when passed inline). Never let str(exc)
+        # leak the prompt into logs or downstream error messages.
+        log.error("llm.cli_timeout", model=model, timeout=exc.timeout, prompt_len=len(full_prompt))
+        raise RuntimeError(
+            f"Claude CLI timed out after {exc.timeout}s (model={model}, prompt_len={len(full_prompt)})"
+        ) from None
 
     if result.returncode != 0:
         log.error("llm.cli_failed", returncode=result.returncode, stderr=result.stderr[:500])
