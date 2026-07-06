@@ -102,18 +102,30 @@ def run_pipeline(
 
         try:
             # ── Fetch JD ─────────────────────────────────────────────────────
-            jd = fetch_job_description(
+            jd_result = fetch_job_description(
                 url=job["url"],
                 timeout=config["scraper"]["timeout_seconds"],
                 min_length=config["scraper"]["min_jd_length"],
                 job_title=job.get("title", ""),
                 company=job.get("company", ""),
             )
-            if jd is None:
+            if jd_result is None:
                 job_log.warning("step.fetch_jd", status="skipped", reason="JD retrieval failed")
                 skipped.append({**job, "reason": "JD retrieval failed"})
                 continue
-            job_log.info("step.fetch_jd", status="success", jd_length=len(jd))
+            jd = jd_result.text
+            # Surface ATS metadata onto the job dict for Phase 3 auto-apply.
+            # Falls back to None when the JD came from a non-ATS source
+            # (e.g. pure hiring.cafe or a company careers page).
+            job["ats_apply_url"] = jd_result.ats_apply_url
+            job["ats"] = jd_result.ats
+            job_log.info(
+                "step.fetch_jd",
+                status="success",
+                jd_length=len(jd),
+                ats=jd_result.ats,
+                ats_apply_url=jd_result.ats_apply_url,
+            )
 
             # ── Classify lane ─────────────────────────────────────────────────
             lane = classify_lane(jd_text=jd, lanes_config=config["lanes"])
