@@ -22,8 +22,6 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -157,6 +155,40 @@ class TestFetchJobDescriptionSurfacesAts:
         assert result is not None
         assert isinstance(result, JDFetchResult)
         assert result.text.startswith("About the role")
+        assert result.ats_apply_url is None
+        assert result.ats is None
+
+    def test_hiring_cafe_ats_fallback_with_non_ats_url_drops_both(self):
+        """
+        _find_ats_link (jd_fetcher.py:437) can return an off-site "Apply" URL
+        that is NOT on any ATS_DOMAIN (e.g. workable.com, a company careers
+        page). When that URL still yields a valid JD, ats_apply_url must be
+        None — a URL without a recognized vendor is unroutable for Phase 3.
+
+        Regression for the guard added in the hiring_cafe_ats path so its
+        behavior matches google_broad and pure hiring.cafe.
+        """
+        non_ats_apply_url = "https://acme-careers.workable.com/jobs/12345"
+        with patch.object(jd_fetcher, "_search_for_jd", return_value=None), \
+             patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
+             patch.object(jd_fetcher, "_resolve_if_sendgrid", return_value="https://hiring.cafe/job/xyz"), \
+             patch.object(
+                 jd_fetcher,
+                 "_fetch_with_playwright",
+                 return_value=("too short and no section headers", non_ats_apply_url),
+             ), \
+             patch.object(jd_fetcher, "_fetch_ats_page", return_value=_GOOD_JD_TEXT):
+            result = fetch_job_description(
+                url="https://sendgrid.net/wf/click?abc",
+                timeout=5,
+                min_length=200,
+                job_title="Marketing Ops Lead",
+                company="Acme",
+            )
+        assert result is not None
+        # JD text still comes through from the fallback fetch...
+        assert "Responsibilities" in result.text
+        # ...but ats fields are None because the URL isn't a recognized vendor.
         assert result.ats_apply_url is None
         assert result.ats is None
 

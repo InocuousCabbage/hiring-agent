@@ -194,10 +194,16 @@ def fetch_job_description(
             ats_text = _fetch_ats_page(hiring_cafe_ats_url, timeout)
             if ats_text and len(ats_text) >= min_length and _has_jd_sections(ats_text):
                 log.info("jd_fetcher.success", url=hiring_cafe_ats_url, chars=len(ats_text), source="hiring_cafe_ats")
+                # _find_ats_link may return a non-ATS "Apply" URL (any off-site
+                # anchor whose text contains "apply", see line 437). Mirror the
+                # guard used in the google_broad and pure-hiring.cafe paths so
+                # Phase 3 auto-apply never sees ats_apply_url set with ats=None
+                # (a URL with no vendor is unroutable).
+                inferred = _infer_ats_name(hiring_cafe_ats_url)
                 return JDFetchResult(
                     text=_clean_text(ats_text),
-                    ats_apply_url=hiring_cafe_ats_url,
-                    ats=_infer_ats_name(hiring_cafe_ats_url),
+                    ats_apply_url=hiring_cafe_ats_url if inferred else None,
+                    ats=inferred,
                 )
     else:
         log.warning("jd_fetcher.resolve_failed", url=url[:80])
