@@ -42,6 +42,10 @@ import importlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ContextManager, Literal, Protocol
 
+import structlog
+
+_log = structlog.get_logger(__name__)
+
 if TYPE_CHECKING:  # pragma: no cover - purely for editors / type-checkers
     from playwright.sync_api import Page
 
@@ -144,7 +148,18 @@ def get_transport(config: dict, kind: str | None) -> Transport:
     if not bb_cfg.get("enabled"):
         return _resolve_transport("local")
 
-    return _resolve_transport("browserbase")
+    # H12 fix: even when routing says browserbase, a resolver failure (env
+    # missing, module not importable) must degrade to LocalTransport rather
+    # than propagate — the pipeline is never-blocking. Emit an audit event
+    # so operators can spot the degrade.
+    try:
+        return _resolve_transport("browserbase")
+    except Exception as exc:  # noqa: BLE001 — resolver-side failure
+        _log.warning(
+            "apply.transport.browserbase_fallback",
+            reason=type(exc).__name__,
+        )
+        return _resolve_transport("local")
 
 
 # ── Re-exports (must run AFTER the factory infra is defined) ──────────────────
