@@ -5,11 +5,15 @@ pre-auto-apply blockers so the fixes cannot silently regress.
 Covers:
   Fix 2 (llm.py TimeoutExpired):  prompt content never appears in the
                                   RuntimeError raised on CLI timeout.
-  Fix 3 (renderer PDF hard-fail): render_resume_pdf / render_cover_letter_pdf
-                                  raise RuntimeError when PDF isn't produced,
-                                  instead of returning the .docx.
   Fix 5 (deploy flock):           cron entry uses flock -n on a pidfile so
                                   overlapping cron ticks skip.
+
+Fix 3 (renderer PDF hard-fail) tests intentionally omitted: origin/main
+refactored render_resume_pdf / render_cover_letter_pdf into dual-output
+render_resume / render_cover_letter returning tuple[Optional[Path], Path],
+where returning None,docx is the deliberate signal that PDF conversion
+was unavailable — not a silent bug. Downstream _build_attachments filters
+None. Re-introducing hard-fail would break the dual-output contract.
 """
 
 import subprocess
@@ -72,76 +76,6 @@ class TestTimeoutExpiredScrub:
             except RuntimeError as exc:
                 assert exc.__cause__ is None
                 assert exc.__suppress_context__ is True
-
-
-# ── Fix 3: renderer PDF hard-fail ─────────────────────────────────────────────
-
-class TestRendererHardFail:
-    """render_resume_pdf and render_cover_letter_pdf must raise when the PDF
-    doesn't materialize — never silently return the .docx path (auto-apply
-    would upload a broken artifact with a mismatched extension)."""
-
-    def _job(self):
-        return {"company": "ExampleCo", "title": "PMM"}
-
-    def test_render_resume_pdf_raises_when_pdf_missing(self, tmp_path):
-        from pdf_gen.renderer import render_resume_pdf
-
-        # Fake a lane template that exists so the template check passes.
-        template = tmp_path / "base_resume.docx"
-        template.write_bytes(b"fake docx")
-        lane = {"template": str(template), "label": "PMM"}
-
-        with patch("pdf_gen.renderer._fill_resume_template"), \
-             patch("pdf_gen.renderer._docx_to_pdf") as fake_conv:
-            # Simulate LibreOffice not producing the PDF (silent failure).
-            fake_conv.side_effect = lambda docx_path, output_dir: None
-            with pytest.raises(RuntimeError, match="PDF conversion failed"):
-                render_resume_pdf(
-                    tailored_resume={},
-                    lane=lane,
-                    job=self._job(),
-                    date_str="2026-07-06",
-                    output_dir=tmp_path / "out",
-                )
-
-    def test_render_cover_letter_pdf_raises_when_pdf_missing(self, tmp_path):
-        from pdf_gen.renderer import render_cover_letter_pdf
-
-        with patch("pdf_gen.renderer._create_cover_letter_docx"), \
-             patch("pdf_gen.renderer._docx_to_pdf") as fake_conv:
-            fake_conv.side_effect = lambda docx_path, output_dir: None
-            with pytest.raises(RuntimeError, match="PDF conversion failed"):
-                render_cover_letter_pdf(
-                    cover_letter={"paragraphs": []},
-                    job=self._job(),
-                    date_str="2026-07-06",
-                    output_dir=tmp_path / "out",
-                )
-
-    def test_render_resume_pdf_returns_when_pdf_exists(self, tmp_path):
-        # Happy path stays intact: real PDF present → returns pdf path.
-        from pdf_gen.renderer import render_resume_pdf
-
-        template = tmp_path / "base_resume.docx"
-        template.write_bytes(b"fake docx")
-        lane = {"template": str(template), "label": "PMM"}
-
-        def fake_convert(docx_path, output_dir):
-            # Materialize the expected PDF.
-            (Path(output_dir) / f"ExampleCo_PMM_Resume.pdf").write_bytes(b"pdf")
-
-        with patch("pdf_gen.renderer._fill_resume_template"), \
-             patch("pdf_gen.renderer._docx_to_pdf", side_effect=fake_convert):
-            out = render_resume_pdf(
-                tailored_resume={},
-                lane=lane,
-                job=self._job(),
-                date_str="2026-07-06",
-                output_dir=tmp_path / "out",
-            )
-            assert out.suffix == ".pdf"
-            assert out.exists()
 
 
 # ── Fix 5: deploy/cron_entry.sh flock guard ───────────────────────────────────
