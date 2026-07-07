@@ -7,6 +7,12 @@ token.json
 templates/resumes/*.docx
 templates/cover_letter.docx
 
+# Personal data files (not shipped with repo)
+templates/candidate_profile.yaml
+
+# Local state (dedup DB, run history)
+state/
+
 # Python
 __pycache__/
 *.pyc
