@@ -31,3 +31,6 @@ test_data/*.eml
 
 # OBF/m2c1 planning artifacts (local working docs, not part of repo)
 .agent/
+
+# Local code-review + planning scratch (per-run reviewer outputs, not shipped)
+reviews/
