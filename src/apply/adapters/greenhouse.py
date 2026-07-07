@@ -62,6 +62,11 @@ from src.apply.adapters._labels import (
     enumerate_questions,
     resolve,
 )
+from src.apply.dedup import (
+    AlreadyAppliedError,
+    _extract_ats_domain,
+    _extract_ats_job_id,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from playwright.sync_api import Page
@@ -663,11 +668,16 @@ class GreenhouseAdapter:
         dry_run: bool = bool(getattr(ctx, "dry_run", ctx.config.get("dry_run", False)))
 
         # ── Gate 1: HARD dedup (before any browser touch) ──
+        # H5 fix: was_applied must query with the SAME (ats_domain, ats_job_id)
+        # shape DedupDB.record writes with — i.e. _extract_ats_domain(apply_url)
+        # ('boards.greenhouse.io'), NOT self.name ('greenhouse'). Otherwise the
+        # gate misses and the follow-up record() at end-of-flow raises
+        # AlreadyAppliedError, previously swallowed silently → double-apply.
         try:
             hit = ctx.dedup.was_applied(
                 company,
-                self.name,
-                _extract_board_token_and_job_id(apply_url)[1],
+                _extract_ats_domain(apply_url),
+                _extract_ats_job_id(apply_url),
                 apply_url,
             )
         except Exception:
@@ -907,6 +917,9 @@ class GreenhouseAdapter:
                 trace_path=trace,
             )
             # Only record to dedup on a DOM-verified submission.
+            # H5 fix: narrow the except to AlreadyAppliedError so real
+            # duplicates emit dedup_hit (not the misleading record_failed)
+            # AND other DB errors surface for the operator.
             try:
                 ctx.dedup.record(
                     result,
@@ -915,8 +928,13 @@ class GreenhouseAdapter:
                     role_title,
                     apply_url,
                 )
-            except Exception:
+            except AlreadyAppliedError:
                 log.info(
+                    "apply.dedup_hit",
+                    extra={"ats": self.name, "reason": "record_race"},
+                )
+            except Exception:
+                log.warning(
                     "apply.dedup.record_failed", extra={"ats": self.name}
                 )
             log.info(
