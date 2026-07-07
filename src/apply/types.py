@@ -104,6 +104,11 @@ class ApplyContext:
     `profile` embeds the S1 `CandidateProfile`. `mode` mirrors `apply.mode`
     but is snapshotted here so a config-mutation mid-run cannot flip an
     in-flight adapter from review to auto.
+
+    ``dedup`` + ``captcha_detector`` are populated by the seam so the adapter
+    doesn't have to reach into globals. Optional (default None) so tests and
+    branches without S5 can build the context freely; adapters that use them
+    should defend against None.
     """
 
     profile: "CandidateProfile"
@@ -116,6 +121,11 @@ class ApplyContext:
     mode: Literal["review", "auto"]
     resume_docx_path: Path | None = None     # AUDIT ADD: DOCX fallback for docx-only lane
     cover_letter_docx_path: Path | None = None  # AUDIT ADD: DOCX fallback for docx-only lane
+    # Post-review addition: adapters read ctx.dedup + ctx.captcha_detector.
+    # Left untyped (`Any` / callable) to avoid dragging S5/S9 into every
+    # ApplyContext consumer.
+    dedup: object | None = None
+    captcha_detector: object | None = None
 
 
 # ---------------------------------------------------------------------------

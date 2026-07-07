@@ -266,6 +266,17 @@ def run_for_job(
             "profile_path", "templates/candidate_profile.yaml"
         )
         profile = CandidateProfile.load(profile_path)
+        # Post-review addition: seam constructs DedupDB and threads it via
+        # ApplyContext. Adapters expect ctx.dedup — previously it was missing
+        # from the frozen dataclass, which crashed every production apply as
+        # soon as H4 delivered a real page.
+        dedup = None
+        try:
+            from src.apply.dedup import DedupDB as _DedupDB
+            db_path = apply_config.get("dedup_db_path") or "state/applied_jobs.db"
+            dedup = _DedupDB(db_path)
+        except Exception:  # noqa: BLE001 — seam never blocks on dedup init
+            dedup = None
         ctx = ApplyContext(
             profile=profile,
             job=job,
@@ -277,6 +288,7 @@ def run_for_job(
             mode=apply_config.get("mode", "review"),
             resume_docx_path=resume_docx_path,
             cover_letter_docx_path=cover_letter_docx_path,
+            dedup=dedup,
         )
         job_url = job.get("ats_apply_url") or job.get("url", "") or ""
         result = _call_apply_to_job(job_url=job_url, ctx=ctx, config=apply_config)
