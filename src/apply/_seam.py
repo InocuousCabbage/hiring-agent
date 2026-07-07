@@ -300,7 +300,18 @@ def finalize(config: dict) -> None:
         return
     try:
         result = _call_rotate(config=config)
-        rotated = getattr(result, "rotated_count", 0)
-        _log.info("apply.retention.rotated", rotated=rotated)
+        # H7 fix: RotateResult is namedtuple(deleted_traces, deleted_screenshots,
+        # errors). The old `rotated_count` attr didn't exist. Emit the total
+        # AND the per-kind breakdown so operators can spot skew.
+        deleted_traces = getattr(result, "deleted_traces", 0) or 0
+        deleted_screenshots = getattr(result, "deleted_screenshots", 0) or 0
+        rotated_total = int(deleted_traces) + int(deleted_screenshots)
+        _log.info(
+            "apply.retention.rotated",
+            rotated=rotated_total,
+            deleted_traces=deleted_traces,
+            deleted_screenshots=deleted_screenshots,
+            errors=getattr(result, "errors", 0),
+        )
     except Exception as exc:  # noqa: BLE001 — never-blocking
         _log.warning("apply.retention.error", error=str(exc))
