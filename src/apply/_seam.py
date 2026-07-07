@@ -83,9 +83,53 @@ def _call_configure_storage_dir(config: dict) -> None:
 
 
 def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> list:
-    from src.apply.review import poll_pending_reviews
+    """H2 + H3 fix: build the ReviewStore + resolve an adapter, and pass the
+    WRAPPED config shape poll_pending_reviews reads (`config["apply"]`).
 
-    return poll_pending_reviews(gmail=gmail, now=now, config=config) or []
+    ``config`` here is the INNER apply_config (unwrapped by the caller in
+    initialize()). poll_pending_reviews' real signature is
+    ``(gmail, store, now, config, *, adapter=None)`` and it reads
+    ``config["apply"].get(...)`` — so we re-wrap before passing.
+    """
+    from src.apply.review import poll_pending_reviews
+    from src.apply.state_store import ReviewStore
+
+    # H1 fix: DedupDB owns the CREATE TABLE for review_pending. We touch it
+    # first so the reconciled schema is in place before ReviewStore opens the
+    # same DB file. Best-effort: if dedup_db_path is missing, fall back to a
+    # local review-only DB path so the poller can still open a store.
+    db_path = config.get("dedup_db_path") or "state/applied_jobs.db"
+    try:
+        from src.apply.dedup import DedupDB
+        DedupDB(db_path)
+    except Exception:  # noqa: BLE001 — never-blocking; ReviewStore still runs its own CREATE.
+        pass
+
+    store = ReviewStore(db_path)
+
+    # H4: the poller's YES branch needs an adapter to re-run the submit path.
+    # MVP is greenhouse-only (per S12 D3). If greenhouse isn't importable in
+    # this checkout, we still call poll — the AMBIGUOUS / NO / auto_decline
+    # branches don't need the adapter, and the YES branch soft-fails
+    # gracefully with adapter=None.
+    adapter: Any = None
+    try:
+        from src.apply.adapters.greenhouse import GreenhouseAdapter
+        adapter = GreenhouseAdapter()
+    except Exception:  # noqa: BLE001 — poller tolerates adapter=None.
+        adapter = None
+
+    # H3: poll_pending_reviews reads config["apply"] — re-wrap the inner dict.
+    wrapped = {"apply": config}
+    try:
+        return poll_pending_reviews(
+            gmail, store, now, wrapped, adapter=adapter
+        ) or []
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001 — teardown is best-effort.
+            pass
 
 
 def _call_apply_to_job(*, job_url: str, ctx: Any, config: dict) -> "ApplyResult | None":
