@@ -529,6 +529,9 @@ def execute_confirmed_submit(
 
     # Only record on DOM-verified confirmation (S8 owns the confirmation
     # marker; we trust its status). Never submitted → never touch dedup DB.
+    # Lazy-import AlreadyAppliedError so the branch remains importable on
+    # branches that lack the S5 module.
+    from src.apply.dedup import AlreadyAppliedError  # noqa: E402
     if getattr(result, "status", None) == "submitted":
         try:
             # H6 fix: role_title is a required kwarg on DedupDB.record.
@@ -540,8 +543,13 @@ def execute_confirmed_submit(
                 role_title=decision.role_title,
                 job_url=decision.apply_url,
             )
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, AlreadyAppliedError):
             # Idempotent replay path. Not an error — a rerun of the same review.
+            # H6 (post-review) fix: DedupDB.record catches sqlite3.IntegrityError
+            # and re-raises AlreadyAppliedError, so the plain
+            # `except sqlite3.IntegrityError` was dead code — a real replay
+            # would have propagated an uncaught AlreadyAppliedError into the
+            # seam's poll_pending_reviews try/except and lost the whole tick.
             log.info(
                 "apply.review.already_recorded",
                 review_id=decision.review_id,

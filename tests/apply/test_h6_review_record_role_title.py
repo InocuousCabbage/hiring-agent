@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.apply.dedup import AlreadyAppliedError
 from src.apply.review import Decision, execute_confirmed_submit
 
 
@@ -86,3 +87,62 @@ def test_review_yes_branch_records_with_role_title():
     assert call["applicant"] == "jane"
     assert call["company"] == "Acme Corp"
     assert call["job_url"] == "https://boards.greenhouse.io/acme/jobs/1"
+
+
+def test_review_yes_branch_catches_already_applied_on_replay():
+    """H6 post-review: DedupDB.record catches sqlite3.IntegrityError and
+    re-raises AlreadyAppliedError. execute_confirmed_submit must catch that,
+    not just sqlite3.IntegrityError — otherwise an idempotent replay loses
+    the whole poll batch."""
+    decision = Decision(
+        review_id="0195c5a0-1234-7abc-8def-999999999999",
+        status="submitted",
+        apply_url="https://boards.greenhouse.io/acme/jobs/1",
+        ats="greenhouse",
+        company="Acme Corp",
+        role_title="Senior Engineer",
+        applicant="jane",
+        thread_id="THREAD_777",
+    )
+
+    from contextlib import contextmanager
+
+    class _Page:
+        url = ""
+        def goto(self, url): self.url = url
+
+    @contextmanager
+    def _session_ctx(*, storage_state_path, headless):
+        yield (_Page(), None)
+
+    class _FakeResult:
+        status = "submitted"
+        ats = "greenhouse"
+        apply_url = "https://boards.greenhouse.io/acme/jobs/1"
+        application_id = None
+        confirmation_screenshot = None
+        reason = None
+        human_review_url = None
+        submitted_at = "2026-07-07T00:00:00+00:00"
+        trace_path = None
+        review_id = None
+
+    adapter = MagicMock()
+    adapter.apply.return_value = _FakeResult()
+
+    class _FakeDedupDB:
+        def was_applied(self, **kwargs):
+            return False
+        def record(self, result, **kwargs):
+            # Simulate the replay path — record raises AlreadyAppliedError.
+            raise AlreadyAppliedError("already applied: replay")
+
+    result = execute_confirmed_submit(
+        decision, adapter, config={"apply": {"dry_run": False}},
+        session_ctx=_session_ctx,
+        load_state_fn=lambda ats, applicant: None,
+        dedup_db=_FakeDedupDB(),
+    )
+
+    # Must return already_applied (not raise, not fall through as 'submitted').
+    assert result.status == "already_applied"
