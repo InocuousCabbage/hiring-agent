@@ -103,3 +103,34 @@ pdf:
   # Uses LibreOffice for DOCX→PDF conversion
   libreoffice_path: "libreoffice"  # or full path if needed
   filename_template: "{date}_{company}_{title}_{type}.pdf"
+
+# ─── Auto-Apply (Phase 3) ─────────────────────────────────
+# DEFAULT OFF for safety. Set apply.enabled: true only after
+# `python -m src.apply.bootstrap greenhouse` completes.
+# Schema is frozen — master-plan §4.7 (22 keys, incl. 4 under browserbase).
+apply:
+  enabled: false                       # master switch; default OFF (safety)
+  mode: review                         # review | auto
+  allowed_ats: [greenhouse]            # Phase 3 MVP; 3.5 adds lever, ashby; 3.6 adds workday, icims
+  long_tail: none                      # none | computer_use  (variation-C graft opt-in)
+  dry_run: false                       # if true, fill + screenshot + never click submit even on YES
+  timeout_seconds: 90
+  navigation_retries: 2
+  rate_limit_per_ats_per_day: 10
+  review_timeout_hours: 72
+  review_reping_hours: 24
+  retention_days: 30
+  screenshot_dir: state/screenshots
+  trace_dir: state/traces
+  storage_state_dir: config/credentials/apply
+  dedup_db_path: state/applied_jobs.db
+  captcha_action: escalate             # escalate | skip
+  captcha_transport: browserbase       # browserbase | local  (local = escalate immediately)
+  profile_path: templates/candidate_profile.yaml
+  gmail_label_prefix: "hiring-agent/apply"
+  fast_path_recipient: env:MY_EMAIL
+  browserbase:
+    enabled: true
+    solve_captchas: true              # Q_BB2
+    proxies: true                     # Q_BB3
+    block_ads: true

@@ -1,0 +1,10 @@
+# pyproject.toml — minimal pytest config block owned by shard S19 (live-ats-gate).
+# This file registers the `live_ats` marker and DESELECTS it from the default
+# `pytest` invocation. Opt-in the gated live suite via `pytest -m live_ats`.
+# See tests/apply/live/ and spec 19-s19-live-ats-gate.md acceptance #1.
+
+[tool.pytest.ini_options]
+markers = [
+    "live_ats: hits a real ATS demo endpoint; excluded from default pytest run; opt-in via pytest -m live_ats. Never CI. Never real employer.",
+]
+addopts = "-m 'not live_ats'"

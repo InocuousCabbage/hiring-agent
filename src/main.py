@@ -11,6 +11,7 @@ Flags:
 """
 
 import argparse
+import logging
 import os
 import sys
 import yaml
@@ -35,6 +36,255 @@ from gmail.digest import compose_digest
 from contacts.hm_finder import find_hiring_manager
 
 log = structlog.get_logger()
+
+# ── Config-gate (Phase 3 auto-apply) ────────────────────────────────────────
+# See .agent/one-big-feature/auto-apply-2026-07-06/03-specs/03-s3-config-gate.md
+# `_validate_apply_config` runs at pipeline entry BEFORE the S17 seam. When
+# apply.enabled is false, it no-ops so a malformed apply block cannot break
+# the pre-Phase-3 pipeline.
+
+_config_logger = logging.getLogger(__name__)
+
+
+class ConfigError(RuntimeError):
+    """Raised on invalid apply: config when apply.enabled is true.
+
+    Caught by main() and surfaced with sys.exit(1) — never leaks a stack trace
+    to end-users. Never raised when apply.enabled is false (soft-fail path).
+    """
+
+
+# Hard-coded enum tuples — a rename in src/apply/types.py surfaces here as a
+# test failure rather than a silent import shim (landmine L14 guardrail).
+_ALLOWED_ATS = ("greenhouse", "lever", "ashby", "workday", "icims", "computer_use")
+_MODE_VALUES = ("review", "auto")
+_LONG_TAIL_VALUES = ("none", "computer_use")
+_CAPTCHA_ACTION_VALUES = ("escalate", "skip")
+_CAPTCHA_TRANSPORT_VALUES = ("browserbase", "local")
+
+_APPLY_TOP_LEVEL_KEYS = frozenset({
+    "enabled", "mode", "allowed_ats", "long_tail", "dry_run",
+    "timeout_seconds", "navigation_retries", "rate_limit_per_ats_per_day",
+    "review_timeout_hours", "review_reping_hours", "retention_days",
+    "screenshot_dir", "trace_dir", "storage_state_dir", "dedup_db_path",
+    "captcha_action", "captcha_transport", "profile_path",
+    "gmail_label_prefix", "fast_path_recipient", "browserbase",
+})
+_APPLY_BROWSERBASE_KEYS = frozenset({"enabled", "solve_captchas", "proxies", "block_ads"})
+
+# Path keys treated as DIRECTORIES (mkdir target). `dedup_db_path` is a FILE
+# so its parent is what needs to be writable / created.
+_PATH_DIR_KEYS = ("screenshot_dir", "trace_dir", "storage_state_dir")
+
+
+def _writable_ancestor(path: Path) -> Path:
+    """Walk `path` upward until an existing filesystem node is found —
+    that node is the writability target. Pure filesystem inspection; no side
+    effects (no mkdir), so a validation failure downstream cannot leak a
+    partial-state dir tree onto disk."""
+    check = path
+    while not check.exists() and check.parent != check:
+        check = check.parent
+    return check
+
+
+def _validate_apply_config(config: dict) -> None:
+    """Validate the `apply:` block. No-op when `apply.enabled` is false.
+
+    Pure inspection — never mutates `config`. On any validation failure raises
+    ConfigError WITHOUT creating any directories (atomicity: all-or-nothing).
+    Directories are materialized only after every check passes.
+    """
+    apply_cfg = config.get("apply", {})
+    if not isinstance(apply_cfg, dict):
+        # Soft-fail: without a mapping we can't inspect `enabled`; treat as OFF.
+        # A dict with enabled=true will be validated fully below.
+        return
+    if not apply_cfg.get("enabled", False):
+        return  # soft-fail — pre-Phase-3 pipeline unaffected by malformed block
+
+    # ── Unknown-key rejection ───────────────────────────────────────────────
+    unknown = set(apply_cfg) - _APPLY_TOP_LEVEL_KEYS
+    if unknown:
+        raise ConfigError(f"apply: unknown key: {sorted(unknown)[0]}")
+
+    # ── Required-key presence ───────────────────────────────────────────────
+    missing = _APPLY_TOP_LEVEL_KEYS - set(apply_cfg)
+    if missing:
+        raise ConfigError(f"apply: missing required key: {sorted(missing)[0]}")
+
+    # ── Bool types ──────────────────────────────────────────────────────────
+    for bkey in ("enabled", "dry_run"):
+        if not isinstance(apply_cfg[bkey], bool):
+            raise ConfigError(
+                f"apply.{bkey}: must be a bool, got {type(apply_cfg[bkey]).__name__}"
+            )
+
+    # ── Enum values ─────────────────────────────────────────────────────────
+    mode = apply_cfg["mode"]
+    if mode not in _MODE_VALUES:
+        raise ConfigError(f"apply.mode: must be one of {_MODE_VALUES}, got {mode!r}")
+
+    long_tail = apply_cfg["long_tail"]
+    if long_tail not in _LONG_TAIL_VALUES:
+        raise ConfigError(
+            f"apply.long_tail: must be one of {_LONG_TAIL_VALUES}, got {long_tail!r}"
+        )
+
+    captcha_action = apply_cfg["captcha_action"]
+    if captcha_action not in _CAPTCHA_ACTION_VALUES:
+        raise ConfigError(
+            f"apply.captcha_action: must be one of {_CAPTCHA_ACTION_VALUES}, got {captcha_action!r}"
+        )
+
+    captcha_transport = apply_cfg["captcha_transport"]
+    if captcha_transport not in _CAPTCHA_TRANSPORT_VALUES:
+        raise ConfigError(
+            f"apply.captcha_transport: must be one of {_CAPTCHA_TRANSPORT_VALUES}, got {captcha_transport!r}"
+        )
+
+    # ── allowed_ats: non-empty list of known ATSes ──────────────────────────
+    allowed = apply_cfg["allowed_ats"]
+    if not isinstance(allowed, list) or not allowed:
+        raise ConfigError("apply.allowed_ats: must be a non-empty list")
+    for ats in allowed:
+        if ats not in _ALLOWED_ATS:
+            raise ConfigError(
+                f"apply.allowed_ats: unknown ATS {ats!r}, must be one of {_ALLOWED_ATS}"
+            )
+
+    # ── Integer range checks ────────────────────────────────────────────────
+    rate = apply_cfg["rate_limit_per_ats_per_day"]
+    if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0 or rate > 100:
+        raise ConfigError(
+            f"apply.rate_limit_per_ats_per_day: must be int in (0, 100], got {rate!r}"
+        )
+
+    timeout_seconds = apply_cfg["timeout_seconds"]
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+        raise ConfigError(
+            f"apply.timeout_seconds: must be a positive int, got {timeout_seconds!r}"
+        )
+
+    nav_retries = apply_cfg["navigation_retries"]
+    if not isinstance(nav_retries, int) or isinstance(nav_retries, bool) or nav_retries < 0:
+        raise ConfigError(
+            f"apply.navigation_retries: must be a non-negative int, got {nav_retries!r}"
+        )
+
+    retention_days = apply_cfg["retention_days"]
+    if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days <= 0:
+        raise ConfigError(
+            f"apply.retention_days: must be a positive int, got {retention_days!r}"
+        )
+
+    reping = apply_cfg["review_reping_hours"]
+    review_timeout = apply_cfg["review_timeout_hours"]
+    if not isinstance(reping, int) or isinstance(reping, bool) or reping <= 0:
+        raise ConfigError(
+            f"apply.review_reping_hours: must be a positive int, got {reping!r}"
+        )
+    if not isinstance(review_timeout, int) or isinstance(review_timeout, bool) or review_timeout <= 0:
+        raise ConfigError(
+            f"apply.review_timeout_hours: must be a positive int, got {review_timeout!r}"
+        )
+    if reping >= review_timeout:
+        raise ConfigError(
+            f"apply.review_reping_hours ({reping}) must be < review_timeout_hours ({review_timeout})"
+        )
+
+    # ── String types ────────────────────────────────────────────────────────
+    label_prefix = apply_cfg["gmail_label_prefix"]
+    if not isinstance(label_prefix, str) or not label_prefix:
+        raise ConfigError("apply.gmail_label_prefix: must be a non-empty string")
+
+    # ── fast_path_recipient env: prefix (L9-shaped allowlist) ──────────────
+    fpr = apply_cfg["fast_path_recipient"]
+    if not isinstance(fpr, str) or not fpr:
+        raise ConfigError("apply.fast_path_recipient: must be a non-empty string")
+    if fpr.startswith("env:"):
+        env_name = fpr[len("env:"):]
+        if not env_name:
+            raise ConfigError(
+                "apply.fast_path_recipient: 'env:' prefix requires a variable name"
+            )
+        if env_name not in os.environ:
+            raise ConfigError(
+                f"apply.fast_path_recipient: env var {env_name!r} is unset"
+            )
+
+    # ── browserbase sub-block ───────────────────────────────────────────────
+    bb = apply_cfg["browserbase"]
+    if not isinstance(bb, dict):
+        raise ConfigError("apply.browserbase: must be a mapping")
+    bb_unknown = set(bb) - _APPLY_BROWSERBASE_KEYS
+    if bb_unknown:
+        raise ConfigError(
+            f"apply.browserbase: unknown key: {sorted(bb_unknown)[0]}"
+        )
+    bb_missing = _APPLY_BROWSERBASE_KEYS - set(bb)
+    if bb_missing:
+        raise ConfigError(
+            f"apply.browserbase: missing required key: {sorted(bb_missing)[0]}"
+        )
+    for bkey in sorted(_APPLY_BROWSERBASE_KEYS):
+        if not isinstance(bb[bkey], bool):
+            raise ConfigError(
+                f"apply.browserbase.{bkey}: must be a bool, got {type(bb[bkey]).__name__}"
+            )
+
+    # Transport wiring must be consistent.
+    if captcha_transport == "browserbase" and not bb["enabled"]:
+        raise ConfigError(
+            "browserbase transport selected but browserbase.enabled is false"
+        )
+
+    # ── profile_path: file exists + dry-load via S1's CandidateProfile ─────
+    profile_path = Path(apply_cfg["profile_path"])
+    if not profile_path.is_file():
+        raise ConfigError(
+            f"apply.profile_path: file does not exist: {profile_path}"
+        )
+
+    # S1 stub or real impl — both expose CandidateProfile.load + ProfileValidationError.
+    try:
+        from apply.profile import CandidateProfile, ProfileValidationError
+    except ImportError:  # pragma: no cover — pre-S1 defensive path
+        CandidateProfile = None  # type: ignore[assignment]
+        ProfileValidationError = Exception  # type: ignore[misc,assignment]
+    if CandidateProfile is not None:
+        try:
+            CandidateProfile.load(profile_path)
+        except ProfileValidationError as exc:
+            raise ConfigError(
+                f"apply.profile_path: invalid candidate profile: {exc}"
+            ) from exc
+
+    # ── Path key writability (dirs + dedup_db_path parent) ──────────────────
+    for pkey in _PATH_DIR_KEYS:
+        pval = Path(apply_cfg[pkey])
+        anchor = _writable_ancestor(pval)
+        if not os.access(anchor, os.W_OK):
+            raise ConfigError(
+                f"apply.{pkey}: parent path is not writable: {anchor}"
+            )
+
+    ddp = Path(apply_cfg["dedup_db_path"])
+    ddp_anchor = _writable_ancestor(ddp.parent)
+    if not os.access(ddp_anchor, os.W_OK):
+        raise ConfigError(
+            f"apply.dedup_db_path: parent path is not writable: {ddp_anchor}"
+        )
+
+    # ── All validation passed — NOW emit warnings + create dirs ────────────
+    if long_tail == "computer_use":
+        # Ben's opt-in default OFF is expressed by the YAML default of `none`;
+        # a live `computer_use` selection is a loud signal.
+        _config_logger.warning("apply.long_tail.computer_use.enabled")
+
+    for pkey in _PATH_DIR_KEYS:
+        Path(apply_cfg[pkey]).mkdir(parents=True, exist_ok=True)
+    ddp.parent.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> dict:
@@ -69,15 +319,19 @@ def _build_attachments(processed: list[dict]) -> list[Path]:
         "cover_letter_docx",
     )
     attachments: list[Path] = []
-    seen: set = set()
+    seen: set[str] = set()
     for p in processed:
-        for key in keys:
-            path = p.get(key)
+        for k in keys:
+            path = p.get(k)
             if path is None:
                 continue
-            if path not in seen:
-                seen.add(path)
-                attachments.append(path)
+            # Normalise to Path + canonical string key for dedup.
+            path_obj = Path(path)
+            key = str(path_obj)
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append(path_obj)
     return attachments
 
 
@@ -88,11 +342,33 @@ def run_pipeline(
     today: str,
     output_dir: Path,
     dry_run: bool = False,
-) -> tuple[list[dict], list[dict]]:
+    gmail_client=None,
+) -> tuple[list[dict], list[dict], list]:
     """
     Process a list of parsed job dicts through the full pipeline.
-    Returns (processed, skipped).
+    Returns (processed, skipped, apply_events).
+
+    `apply_events` is the list of `ApplyEvent` items returned by the S12
+    review poller (S17 seam). Empty list when `apply.enabled` is false or
+    the poller failed. Callers may pass through as
+    `compose_digest(processed, skipped, apply_events=apply_events)` for
+    the S14 rollup.
     """
+    # ── S3 config-gate: validate apply: block before any adapter code runs.
+    # No-op when apply.enabled is false (soft-fail); on invalid config raises
+    # ConfigError caught by main(). MUST run BEFORE the S17 auto-apply seam.
+    _validate_apply_config(config)
+
+    # ── S17 auto-apply seam: initialize once per run_pipeline invocation.
+    # No-op + zero imports pulled when apply.enabled is false. When enabled,
+    # this installs the S16 PII scrubber (BEFORE any adapter log line),
+    # threads apply.storage_state_dir into the S6 credentials backend, and
+    # runs the S12 review poller once for the 24h/72h state machine.
+    # Live-config guarantee (L14): apply_config is a REFERENCE, not a copy.
+    apply_config = config.get("apply", {})
+    from src.apply import _seam as _apply_seam
+    apply_events = _apply_seam.initialize(config, gmail_client)
+
     processed = []
     skipped = []
 
@@ -243,6 +519,24 @@ def run_pipeline(
                 except Exception as exc:
                     job_log.warning("step.hm_lookup", status="error", error=str(exc))
 
+            # ── S17 auto-apply seam (per-job) ───────────────────────────────
+            # Runs deferred inside `_apply_seam.run_for_job` — never raises;
+            # returns ApplyResult or None. `apply_result` is stapled onto the
+            # processed[] dict for the S14 digest rollup + downstream shape
+            # stability. When apply.enabled is false, run_for_job returns
+            # None immediately without importing the dispatcher stack.
+            apply_result = _apply_seam.run_for_job(
+                job=job,
+                jd_text=jd,
+                lane=lane,
+                resume_path=resume_pdf,
+                cover_letter_path=cl_pdf,
+                resume_docx_path=resume_docx,
+                cover_letter_docx_path=cl_docx,
+                apply_config=apply_config,
+                job_log=job_log,
+            )
+
             processed.append({
                 **job,
                 "lane": lane["label"],
@@ -251,13 +545,19 @@ def run_pipeline(
                 "cover_letter_pdf": cl_pdf,
                 "cover_letter_docx": cl_docx,
                 "hiring_manager": hm_info,
+                "apply_result": apply_result,
             })
 
         except Exception as exc:
             job_log.error("step.process_job", status="error", error=str(exc), exc_info=True)
             skipped.append({**job, "reason": f"Unexpected error: {exc}"})
 
-    return processed, skipped
+    # ── S17 auto-apply seam: finalize once per run_pipeline (retention).
+    # Runs S15's `rotate(config)` inside its own try/except so a filesystem
+    # error can never abort the pipeline. No-op when apply.enabled is false.
+    _apply_seam.finalize(config)
+
+    return processed, skipped, apply_events
 
 
 def main() -> None:
@@ -293,14 +593,18 @@ def main() -> None:
             sys.exit(1)
         log.info("pipeline.test_mode", job_count=len(jobs))
 
-        processed, skipped = run_pipeline(
-            jobs=jobs,
-            config=config,
-            project_bank=project_bank,
-            today=today,
-            output_dir=output_dir,
-            dry_run=True,
-        )
+        try:
+            processed, skipped, apply_events = run_pipeline(
+                jobs=jobs,
+                config=config,
+                project_bank=project_bank,
+                today=today,
+                output_dir=output_dir,
+                dry_run=True,
+            )
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
         print(f"\n{'='*60}")
         print(f"TEST MODE COMPLETE  ({today})")
@@ -309,14 +613,14 @@ def main() -> None:
         for p in processed:
             print(f"\n  • {p['title']} @ {p['company']}  [{p['lane']}]")
 
-            # Resume: PDF is Optional. None → fallback mode (no PDF converter)
+            # Resume: PDF is Optional. None → fallback mode (no PDF converter).
             if p["resume_pdf"] is None:
                 print(f"    Resume (DOCX, no PDF converter) : {p['resume_docx']}")
             else:
                 print(f"    Resume PDF                       : {p['resume_pdf']}")
                 print(f"    Resume DOCX                      : {p['resume_docx']}")
 
-            # Cover letter: same Optional-pdf handling
+            # Cover letter: same Optional-pdf handling.
             if p["cover_letter_pdf"] is None:
                 print(f"    Cover Letter (DOCX, no PDF converter) : {p['cover_letter_docx']}")
             else:
@@ -367,14 +671,19 @@ def main() -> None:
         return
 
     output_dir = ROOT / "output" / today
-    processed, skipped = run_pipeline(
-        jobs=jobs,
-        config=config,
-        project_bank=project_bank,
-        today=today,
-        output_dir=output_dir,
-        dry_run=args.dry_run,
-    )
+    try:
+        processed, skipped, apply_events = run_pipeline(
+            jobs=jobs,
+            config=config,
+            project_bank=project_bank,
+            today=today,
+            output_dir=output_dir,
+            dry_run=args.dry_run,
+            gmail_client=gmail,
+        )
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if not args.dry_run:
         recipient = os.getenv("MY_EMAIL")
@@ -382,12 +691,36 @@ def main() -> None:
             log.error("step.send_digest", status="aborted", reason="MY_EMAIL not set")
         else:
             subject = config["gmail"]["digest_subject_template"].format(date=today)
+            # S17 seam: when apply.enabled=true, compose_digest gets the
+            # S12 review-poller output via apply_events kwarg (S14 rollup).
+            # S14's contract: apply_events=None -> legacy str; any list
+            # (even []) -> DigestPayload. We MUST pass the list (even empty)
+            # when apply is enabled so the S14 extension surface stays live.
+            # AUDIT: use _build_attachments() to filter None (docx-only lane)
+            # + dedup, then hand the same list to compose_digest for the
+            # PDF/DOCX detection note AND to gmail.send_digest for real send.
             attachments = _build_attachments(processed)
-            body = compose_digest(
+
+            _apply_on = bool(config.get("apply", {}).get("enabled", False))
+            digest_output = compose_digest(
                 processed=processed,
                 skipped=skipped,
                 attachments=attachments,
+                apply_events=apply_events if _apply_on else None,
             )
+            # S14 returns DigestPayload (namedtuple: body, attachments) when
+            # apply_events is a list; a plain str otherwise. Normalize to
+            # (body, extra_attachments).
+            if isinstance(digest_output, str):
+                body = digest_output
+                extra_attachments: list = []
+            else:
+                body = digest_output.body
+                extra_attachments = list(digest_output.attachments or [])
+            # S14 review-required rows attach a confirmation screenshot;
+            # append those AFTER the resume/cover-letter pairs so digest
+            # ordering stays predictable.
+            attachments.extend(extra_attachments)
             try:
                 gmail.send_digest(
                     to=recipient,
