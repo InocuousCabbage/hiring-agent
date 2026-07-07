@@ -20,11 +20,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import structlog
+
+# H8: word-boundary regexes for slot-matching. Substring match ('cover' in
+# name_attr) hit false positives like `coverage_letter` and
+# `portfolio_cv_samples`. Match only discrete tokens.
+_COVER_TOKEN_RE = re.compile(r"\bcover[_-]?letter\b|\bcoverletter\b", re.IGNORECASE)
+_RESUME_TOKEN_RE = re.compile(
+    r"\b(?:resume|cv|curriculum[_-]?vitae)\b", re.IGNORECASE
+)
 
 from src.apply.controller import Controller, ControllerTimeoutError
 from src.apply.logging import install_scrubber
@@ -209,12 +218,16 @@ class ComputerUseAdapter:
             # portfolio & references file inputs that have no candidate-
             # profile source; stapling resume.pdf into those was the S20
             # collision bug.
+            #
+            # H8 fix: match discrete tokens, not substrings. `portfolio_cv_samples`
+            # must NOT hit the resume branch just because it contains 'cv';
+            # `coverage_letter` must NOT hit the cover-letter branch.
             target_path = ""
             target_label = ""
-            if "cover" in name_attr and cover_path:
+            if _COVER_TOKEN_RE.search(name_attr) and cover_path:
                 target_path = cover_path
                 target_label = "cover_letter"
-            elif ("resume" in name_attr or "cv" in name_attr) and resume_path:
+            elif _RESUME_TOKEN_RE.search(name_attr) and resume_path:
                 target_path = resume_path
                 target_label = "resume"
 
