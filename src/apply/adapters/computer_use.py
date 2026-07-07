@@ -36,13 +36,53 @@ from typing import Any
 
 import structlog
 
-# H8: word-boundary regexes for slot-matching. Substring match ('cover' in
-# name_attr) hit false positives like `coverage_letter` and
-# `portfolio_cv_samples`. Match only discrete tokens.
-_COVER_TOKEN_RE = re.compile(r"\bcover[_-]?letter\b|\bcoverletter\b", re.IGNORECASE)
-_RESUME_TOKEN_RE = re.compile(
-    r"\b(?:resume|cv|curriculum[_-]?vitae)\b", re.IGNORECASE
-)
+# H8 (post-review): token-based slot matching. Word-boundary regex `\bresume\b`
+# is broken on the common `resume_upload` / `cv_upload` field names because
+# Python's `\b` treats `_` as a word char. Word-boundary also mis-matches
+# dash-separated `portfolio-cv-samples` because `-` is a non-word char.
+#
+# The correct behavior is to split the field name on any non-alphanumeric
+# separator + camelCase break, then look for the resume/cover tokens as
+# DISCRETE tokens — with a denylist of qualifiers (portfolio, samples,
+# references, coverage, writing) that indicate the slot is NOT actually the
+# resume or cover-letter slot even when it contains one of those tokens.
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+_RESUME_TOKENS = frozenset({"resume", "cv"})
+_COVER_LETTER_MERGED = "coverletter"
+_NOT_RESUME_MARKERS = frozenset({
+    "portfolio", "sample", "samples", "reference", "references",
+    "coverage", "writing",
+})
+
+
+def _slot_tokens(name_attr: str) -> list[str]:
+    # First split camelCase (curriculumVitae → curriculum vitae), then
+    # split on any non-alphanumeric separator, then lowercase.
+    camel = _CAMEL_SPLIT_RE.sub(" ", name_attr or "")
+    return [t for t in _TOKEN_SPLIT_RE.split(camel.lower()) if t]
+
+
+def _is_cover_letter_slot(name_attr: str) -> bool:
+    toks = _slot_tokens(name_attr)
+    for i in range(len(toks) - 1):
+        if toks[i] == "cover" and toks[i + 1] == "letter":
+            return True
+    return _COVER_LETTER_MERGED in toks
+
+
+def _is_resume_slot(name_attr: str) -> bool:
+    toks = _slot_tokens(name_attr)
+    tok_set = set(toks)
+    if tok_set & _NOT_RESUME_MARKERS:
+        return False
+    if tok_set & _RESUME_TOKENS:
+        return True
+    for i in range(len(toks) - 1):
+        if toks[i] == "curriculum" and toks[i + 1] == "vitae":
+            return True
+    return "curriculumvitae" in tok_set
 
 from src.apply.controller import Controller, ControllerTimeoutError
 from src.apply.logging import install_scrubber
@@ -228,15 +268,15 @@ class ComputerUseAdapter:
             # profile source; stapling resume.pdf into those was the S20
             # collision bug.
             #
-            # H8 fix: match discrete tokens, not substrings. `portfolio_cv_samples`
-            # must NOT hit the resume branch just because it contains 'cv';
-            # `coverage_letter` must NOT hit the cover-letter branch.
+            # H8 fix: match discrete tokens with a denylist of qualifiers,
+            # not substrings and not `\b`-based regex (Python's `\b` mis-handles
+            # underscores + dashes for these field names).
             target_path = ""
             target_label = ""
-            if _COVER_TOKEN_RE.search(name_attr) and cover_path:
+            if _is_cover_letter_slot(name_attr) and cover_path:
                 target_path = cover_path
                 target_label = "cover_letter"
-            elif _RESUME_TOKEN_RE.search(name_attr) and resume_path:
+            elif _is_resume_slot(name_attr) and resume_path:
                 target_path = resume_path
                 target_label = "resume"
 

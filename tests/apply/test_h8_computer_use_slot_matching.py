@@ -136,3 +136,71 @@ def test_computer_use_slot_matching_still_matches_cv_token(tmp_path: Path):
 
     calls = [c for c in page.set_input_files_calls if 'name="cv"' in c[0]]
     assert calls, "regression: 'cv' token input no longer receives the resume"
+
+
+# H8 post-review: additional coverage for the token-based slot matcher.
+
+
+@pytest.mark.parametrize("name_attr", [
+    "resume_upload",
+    "cv_upload",
+    "resume_pdf",
+    "resume-file",
+    "my_resume",
+    "curriculumVitae",
+    "curriculum_vitae",
+])
+def test_h8_common_ats_resume_field_names_matched(tmp_path: Path, name_attr: str):
+    """Common ATS field names with underscore or dash separators must still
+    route the resume file. The old `\\bresume\\b` regex missed these because
+    Python's `\\b` treats `_` as a word char.
+    """
+    inputs = [_FakeInput(name_attr)]
+    page = _RecordingPage(inputs)
+    ctx = _Ctx(tmp_path)
+
+    adapter = ComputerUseAdapter()
+    adapter._file_upload_short_circuit(page, ctx)
+
+    resume_matches = [c for c in page.set_input_files_calls if str(c[1]).endswith("resume.pdf")]
+    assert resume_matches, f"H8 (post-review): {name_attr!r} did not route the resume file"
+
+
+@pytest.mark.parametrize("name_attr", [
+    "cover_letter_upload",
+    "cover-letter-upload",
+    "coverLetter",
+    "coverletter",
+])
+def test_h8_common_ats_cover_letter_field_names_matched(tmp_path: Path, name_attr: str):
+    inputs = [_FakeInput(name_attr)]
+    page = _RecordingPage(inputs)
+    ctx = _Ctx(tmp_path)
+
+    adapter = ComputerUseAdapter()
+    adapter._file_upload_short_circuit(page, ctx)
+
+    cover_matches = [c for c in page.set_input_files_calls if str(c[1]).endswith("cover.pdf")]
+    assert cover_matches, f"H8 (post-review): {name_attr!r} did not route the cover letter"
+
+
+@pytest.mark.parametrize("name_attr", [
+    "portfolio-cv-samples",
+    "portfolio_cv_samples",
+    "writing_samples",
+    "references",
+    "reference_letter",
+    "coverage_letter",
+])
+def test_h8_denylisted_slots_never_receive_resume_or_cover(tmp_path: Path, name_attr: str):
+    """These slots must be SKIPPED — no set_input_files call at all."""
+    inputs = [_FakeInput(name_attr)]
+    page = _RecordingPage(inputs)
+    ctx = _Ctx(tmp_path)
+
+    adapter = ComputerUseAdapter()
+    adapter._file_upload_short_circuit(page, ctx)
+
+    assert not page.set_input_files_calls, (
+        f"H8 (post-review): {name_attr!r} was stapled: {page.set_input_files_calls}"
+    )
