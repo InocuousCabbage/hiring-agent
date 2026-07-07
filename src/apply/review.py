@@ -531,10 +531,13 @@ def execute_confirmed_submit(
     # marker; we trust its status). Never submitted → never touch dedup DB.
     if getattr(result, "status", None) == "submitted":
         try:
+            # H6 fix: role_title is a required kwarg on DedupDB.record.
+            # Missing it crashed the YES branch with TypeError.
             dedup_db.record(
                 result,
                 applicant=decision.applicant,
                 company=decision.company,
+                role_title=decision.role_title,
                 job_url=decision.apply_url,
             )
         except sqlite3.IntegrityError:
