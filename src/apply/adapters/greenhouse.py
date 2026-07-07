@@ -67,6 +67,7 @@ from src.apply.dedup import (
     _extract_ats_domain,
     _extract_ats_job_id,
 )
+from src.apply.retries import navigation_retry, submit_no_retry
 
 if TYPE_CHECKING:  # pragma: no cover
     from playwright.sync_api import Page
@@ -406,6 +407,30 @@ def _label_looks_like_resume(label: str) -> bool:
     return "resume" in norm or "cv" in norm
 
 
+# ── Retry-decorated navigation / submit helpers (H10) ────────────────────────
+#
+# The retry decorators (retries.py) exist to enforce the "navigation retries 3x
+# but submits are never retried" invariant. Before H10 they were defined but
+# never applied at a call site. These thin helpers wrap the relevant
+# Playwright calls so a reviewer can grep the decorators to prove the
+# invariant.
+
+
+@navigation_retry
+def _nav_goto(page: "Page", url: str) -> None:
+    """Retriable navigation. Wraps page.goto so navigation_retry applies."""
+    page.goto(url)
+
+
+@submit_no_retry
+def _submit_click(page: "Page", selector: str = _SUBMIT_LOCATOR) -> None:
+    """MUST NOT retry — retrying a submit risks double-application (L13,
+    variation-B finding). The @submit_no_retry marker enforces the contract
+    at grep-time.
+    """
+    page.locator(selector).click()
+
+
 # ── Confirmation verification (L1) ───────────────────────────────────────────
 
 
@@ -724,7 +749,8 @@ class GreenhouseAdapter:
         trace: Path | None = None
         try:
             # Navigate. `page` is already open (transport-agnostic per spec).
-            page.goto(apply_url)
+            # H10: navigation goes through @navigation_retry helper.
+            _nav_goto(page, apply_url)
             log.info("apply.form_navigated", extra={"ats": self.name})
             pre_submit_url = getattr(page, "url", apply_url) or apply_url
 
@@ -883,7 +909,8 @@ class GreenhouseAdapter:
                 )
 
             # Auto mode: scoped submit (L3), confirmation verify (L1).
-            page.locator(_SUBMIT_LOCATOR).click()
+            # H10: submit goes through @submit_no_retry marker helper.
+            _submit_click(page, _SUBMIT_LOCATOR)
             confirmed, application_id = _verify_confirmation(page, pre_submit_url)
             if not confirmed:
                 screenshot = _take_screenshot(

@@ -4,6 +4,15 @@ Grafted from variation-C as an OPT-IN fallback for unmatched ATS domains.
 Gated on `apply.long_tail == "computer_use"` (default: "none"). Ignored by
 the dispatcher when `long_tail == "none"`.
 
+H10 exemption note: computer_use has no navigation-shaped page.goto call
+worth wrapping with @navigation_retry. All navigation for the computer_use
+adapter is driven by the LLM through Controller (see controller.py), which
+owns its own timeout/retry semantics (ControllerTimeoutError). Applying
+@navigation_retry at this layer would double-retry the LLM step. The submit
+invariant is enforced by the L13 hard-coded review-required return — the
+adapter never emits the submitted status literal so there is no submit
+call site to mark with @submit_no_retry.
+
 LANDMINE L13 (HARD-CODED, NON-CONFIGURABLE):
   This adapter's `apply()` method ALWAYS returns an ApplyResult whose status
   is the review-required literal. There is no branch, no config flag, and no
