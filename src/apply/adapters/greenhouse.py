@@ -716,8 +716,12 @@ class GreenhouseAdapter:
             )
 
         # ── Gate 2: rate limit ──
+        # H5 (post-review): DedupDB.count_today keys on ats_domain
+        # (e.g. 'boards.greenhouse.io'), NOT adapter.name ('greenhouse') —
+        # same shape mismatch H5 fixed on was_applied. Passing self.name
+        # made the query always return 0 → rate limit inoperative.
         try:
-            today_count = ctx.dedup.count_today(self.name)
+            today_count = ctx.dedup.count_today(_extract_ats_domain(apply_url))
         except Exception:
             today_count = 0
         cap = int(ctx.config.get("rate_limit_per_ats_per_day", 10) or 10)

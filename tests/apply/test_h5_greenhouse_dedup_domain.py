@@ -139,6 +139,49 @@ def test_greenhouse_dedup_matches_across_apply_and_check(tmp_path: Path):
     assert result.ats == "greenhouse"
 
 
+def test_greenhouse_count_today_uses_ats_domain(tmp_path: Path):
+    """H5 post-review: gate-2 (rate limit) must also query with ats_domain,
+    not adapter.name. Before the fix, count_today('greenhouse') always
+    returned 0 because DedupDB writes ats_domain='boards.greenhouse.io'.
+    """
+    db = DedupDB(tmp_path / "dedup.db")
+    apply_url = "https://boards.greenhouse.io/acme/jobs/12345"
+
+    # Seed a prior submission — different job_id so gate-1 doesn't fire.
+    other_url = "https://boards.greenhouse.io/acme/jobs/99999"
+    prior = ApplyResult(
+        status="submitted", ats="greenhouse", apply_url=other_url,
+        submitted_at="2026-07-07T00:00:00+00:00",
+    )
+    db.record(prior, applicant="jane", company="Other",
+              role_title="X", job_url=other_url)
+
+    # Sanity: count_today(ats_domain) sees the seeded row.
+    assert db.count_today("boards.greenhouse.io") == 1
+    # And count_today(adapter.name) does NOT — that's the bug we're guarding.
+    assert db.count_today("greenhouse") == 0
+
+    # Under a rate cap of 1, the adapter must observe the gate as full.
+    adapter = GreenhouseAdapter()
+
+    class _CapPage(_FakePage):
+        pass
+
+    class _CapCtx(_Ctx):
+        def __init__(self, dedup, tmp_path):
+            super().__init__(dedup, tmp_path)
+            self.config["rate_limit_per_ats_per_day"] = 1
+
+    result = adapter.apply(_CapPage(), _CapCtx(db, tmp_path))
+    # If the count query used 'greenhouse' → cap 1 not reached → not
+    # rate-limited. If it uses the domain → cap 1 reached → skipped.
+    assert result.status == "skipped", (
+        f"H5 (post-review): rate limit gate did not fire; got {result.status} — "
+        f"count_today likely still queries with adapter.name"
+    )
+    assert result.reason == "rate_limited"
+
+
 def test_dedup_record_failed_swallow_narrowed_to_already_applied(tmp_path: Path):
     """H5 secondary fix: the greenhouse record() catch should be narrow to
     AlreadyAppliedError so genuine dupes log dedup_hit, and other errors
