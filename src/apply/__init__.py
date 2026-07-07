@@ -4,10 +4,11 @@ Only the frozen cross-shard contracts are re-exported here. Everything else
 (dedup, adapters, review-loop, retries) is accessed via its submodule so
 downstream shards can't accidentally couple to unstable internals.
 
-Cluster 1 minimal exports (S1 + S2 + S4). Adapters, dispatcher, and FieldFill
-land with later clusters and get re-exported then.
+Cluster 3 exports: types + base + FieldFill (adapters landed).
+Later cluster adds dispatcher.
 """
 
+from src.apply.adapters._labels import FieldFill
 from src.apply.base import AdapterNotFoundError, ATSAdapter, SessionExpiredError
 from src.apply.types import (
     ApplyContext,
@@ -25,6 +26,7 @@ __all__ = [
     "ApplyEventKind",
     "ApplyResult",
     "ATSAdapter",
+    "FieldFill",
     "SessionContext",
     "SessionExpiredError",
     "Status",
