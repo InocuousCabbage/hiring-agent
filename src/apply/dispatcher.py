@@ -150,9 +150,12 @@ def dispatch(url: str, config: dict) -> "ATSAdapter | None":
             # validator is the right place to flag this on load.
             continue
         if ats_name == "computer_use":
-            # Never selected via allowed_ats iteration; only via long_tail gate.
-            # Surface the misconfig so the operator knows it's inert.
-            log.warning("apply.dispatch_allowed_ats_ignored_computer_use")
+            # H11 post-review: computer_use is a valid allowed_ats entry that
+            # arms the long_tail fallback. It's never selected via the
+            # per-ATS detect() iteration (empty domains tuple), only via the
+            # long_tail gate below. Skip silently in the loop — the previous
+            # `log.warning('apply.dispatch_allowed_ats_ignored_computer_use')`
+            # fired on the intended H11 opt-in configuration, flooding logs.
             continue
         try:
             adapter = _load_adapter(ats_name)
