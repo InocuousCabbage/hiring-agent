@@ -168,6 +168,18 @@ def _call_rotate(*, config: dict) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _safe_apply_config(config: dict) -> dict:
+    """H14: normalize an apply-section that might be ``None``, ``False``, or a
+    non-dict scalar into a plain dict. YAML ``apply: null`` and ``apply: false``
+    both slip past the S3 validator; we defensively map them to ``{}`` so no
+    downstream ``.get`` blows up.
+    """
+    apply_cfg = config.get("apply") if isinstance(config, dict) else None
+    if not isinstance(apply_cfg, dict):
+        return {}
+    return apply_cfg
+
+
 def initialize(config: dict, gmail_client: Any | None) -> list:
     """Called ONCE per `run_pipeline` invocation BEFORE the per-job loop.
 
@@ -180,7 +192,7 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
          FernetFileBackend() calls see the config-driven storage dir.
       3. poll_pending_reviews() — S12 review-loop tick.
     """
-    apply_config = config.get("apply", {})
+    apply_config = _safe_apply_config(config)
     if not apply_config.get("enabled", False):
         _log.info("apply.seam.disabled")
         return []
@@ -238,7 +250,8 @@ def run_for_job(
     ``config['apply']['allowed_ats']`` between run_pipeline ticks is
     observed by the dispatcher.
     """
-    if not apply_config.get("enabled", False):
+    # H14: apply_config may be None/False when yaml maps `apply: null`.
+    if not isinstance(apply_config, dict) or not apply_config.get("enabled", False):
         return None
 
     from src.apply.base import SessionExpiredError
@@ -295,7 +308,7 @@ def finalize(config: dict) -> None:
     Handles S15 retention rotation. Never raises. No-op when
     apply.enabled=false.
     """
-    apply_config = config.get("apply", {})
+    apply_config = _safe_apply_config(config)
     if not apply_config.get("enabled", False):
         return
     try:
