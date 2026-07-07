@@ -1,29 +1,98 @@
 """
 gmail/digest.py — Compose and send the summary digest email.
+
+S14 extension: `compose_digest` grew a keyword-only ``apply_events`` argument.
+- Absent kwarg  -> returns ``str`` (byte-identical to the pre-S14 output).
+- Present kwarg (even an empty list) -> returns a ``DigestPayload`` namedtuple
+  ``(body, attachments)`` so the S17 seam can attach confirmation PNGs.
+
+The five rollup blocks render in a fixed order, each only when at least one
+row exists:
+    1. Submitted
+    2. Review required   (attaches confirmation PNG per row when present)
+    3. Auto-declined
+    4. Blocked (soft-dup)
+    5. Bootstrap needed  (deduped by ATS)
+
+Landmines honored:
+- L6: timestamps go through ``datetime.now(tz=UTC)`` — the deprecated
+  naive-UTC builder is banned by a source-grep in tests/apply/test_digest.py.
+- L7: candidate PII (email, phone, first/last name, address, linkedin_url,
+  answer text) is never rendered into the body or attachment filenames. The
+  per-block renderers read only the whitelisted keys the spec calls out.
 """
 
+from __future__ import annotations
+
+import logging
+from collections import namedtuple
 from pathlib import Path
+from typing import Any, Iterable
+
+_log = logging.getLogger(__name__)
+
+DigestPayload = namedtuple("DigestPayload", ["body", "attachments"])
+
+# Fixed order for the rollup blocks (spec §Acceptance criterion #3, #4).
+_BLOCK_ORDER: tuple[str, ...] = (
+    "submitted",
+    "review_required",
+    "auto_declined",
+    "soft_dup",
+    "bootstrap_needed",
+)
 
 
 def compose_digest(
     processed: list[dict],
     skipped: list[dict],
-    attachments: list | None = None,
-) -> str:
-    """Build the plain-text digest email body.
+    attachments: "list | None" = None,
+    *,
+    apply_events: "list[Any] | None" = None,
+) -> "str | DigestPayload":
+    """Build the digest.
 
-    Adds an attachment-format note conditioned on what is ACTUALLY in
-    `attachments` — checked via Path(p).suffix (canonical), not str.endswith():
+    Return-type contract (spec §Acceptance criterion #5 + tests):
+        - ``apply_events`` unset or ``None`` -> plain ``str`` (pre-S14 shape).
+        - ``apply_events`` is a list (even ``[]``) -> ``DigestPayload``.
 
-      - PDFs and DOCX both present  → "Both PDF + editable DOCX attached"
-      - DOCX present, no PDFs       → "Editable DOCX attached (no PDF
-                                       converter installed on the box)"
-      - No DOCX                     → no note (preserves pre-dual-output
-                                       digest shape for callers that omit
-                                       attachments entirely)
+    ``attachments`` (positional or kwarg) is the pre-S14 origin/main hook for
+    the dual-output renderer; when provided we prepend a PDF-or-DOCX note to
+    the body via Path.suffix inspection (canonical, matches other codepaths).
     """
-    lines = []
+    body = _render_legacy_body(processed, skipped, attachments=attachments)
 
+    # Legacy path — no apply pipeline in play.
+    if apply_events is None:
+        return body
+
+    events: list[Any] = list(apply_events)
+    rollup_text, rollup_attachments = _render_apply_rollup(events, processed)
+    if rollup_text:
+        # Insert rollup BEFORE the "— Hiring Agent (automated)" sign-off so the
+        # signature stays last. Slice on the exact tail we appended.
+        sign_off = "\n\n— Hiring Agent (automated)"
+        if body.endswith(sign_off):
+            body = body[: -len(sign_off)] + "\n" + rollup_text + sign_off
+        else:  # defensive: keep rollup before whatever tail exists
+            body = body + "\n" + rollup_text
+    return DigestPayload(body=body, attachments=rollup_attachments)
+
+
+# ---------------------------------------------------------------------------
+# Legacy body — kept 1:1 with the pre-S14 output so the golden test locks it.
+# ---------------------------------------------------------------------------
+
+
+def _render_legacy_body(
+    processed: list[dict],
+    skipped: list[dict],
+    *,
+    attachments: "list | None" = None,
+) -> str:
+    lines: list[str] = []
+
+    # Origin/main dual-output attachment note (checked via Path.suffix — canonical).
     if attachments:
         suffixes = {Path(p).suffix.lower() for p in attachments}
         has_pdf = ".pdf" in suffixes
@@ -52,7 +121,10 @@ def compose_digest(
         lines.append(f"  URL: {job['url']}")
         hm = job.get("hiring_manager")
         if hm:
-            lines.append(f"  Hiring Manager: {hm.get('name', 'Unknown')} — {hm.get('title', 'N/A')} ({hm.get('confidence', 'N/A')})")
+            lines.append(
+                f"  Hiring Manager: {hm.get('name', 'Unknown')} — "
+                f"{hm.get('title', 'N/A')} ({hm.get('confidence', 'N/A')})"
+            )
             if hm.get("linkedin_url"):
                 lines.append(f"  LinkedIn: {hm['linkedin_url']}")
             if hm.get("email"):
@@ -71,4 +143,193 @@ def compose_digest(
             lines.append("")
 
     lines.append("\n— Hiring Agent (automated)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Apply rollup — five blocks + attachment collection.
+# ---------------------------------------------------------------------------
+
+
+def _render_apply_rollup(
+    events: list[Any],
+    processed_apply_results: Iterable[dict],
+) -> tuple[str, list[Path]]:
+    """Return ``(rollup_text, attachments)``.
+
+    ``processed_apply_results`` is scanned for ``apply_result`` fields the
+    S17 seam will attach to each processed job. When neither the events list
+    nor the processed apply_results contain anything renderable, returns
+    ``("", [])`` so the caller can skip the rollup section entirely.
+    """
+    buckets: dict[str, list[dict]] = {kind: [] for kind in _BLOCK_ORDER}
+
+    for ev in events:
+        kind = getattr(ev, "kind", None)
+        if kind not in buckets:
+            _log.info("digest.unknown_event_kind kind=%s", kind)
+            continue
+        row = getattr(ev, "row", {}) or {}
+        buckets[kind].append(row)
+
+    # ``processed_apply_results`` are ApplyResult objects hanging off processed
+    # jobs (seam contract §2). Merge them into the same buckets so the rollup
+    # doesn't miss a submitted-in-line job.
+    for job in processed_apply_results or []:
+        ar = job.get("apply_result") if isinstance(job, dict) else None
+        if ar is None:
+            continue
+        status = _read_status(ar)
+        row = _apply_result_to_row(ar)
+        if status == "submitted":
+            buckets["submitted"].append(row)
+        elif status == "review_required":
+            buckets["review_required"].append(row)
+        elif status == "auto_declined":
+            buckets["auto_declined"].append(row)
+        elif status == "soft_dup_warn":
+            buckets["soft_dup"].append(row)
+        elif status == "skipped" and row.get("reason") == "session_expired":
+            buckets["bootstrap_needed"].append(row)
+
+    parts: list[str] = []
+    attachments: list[Path] = []
+
+    if buckets["submitted"]:
+        parts.append(_render_submitted(buckets["submitted"]))
+    if buckets["review_required"]:
+        block, atts = _render_review_required(buckets["review_required"])
+        parts.append(block)
+        attachments.extend(atts)
+    if buckets["auto_declined"]:
+        parts.append(_render_auto_declined(buckets["auto_declined"]))
+    if buckets["soft_dup"]:
+        parts.append(_render_soft_dup(buckets["soft_dup"]))
+    if buckets["bootstrap_needed"]:
+        parts.append(_render_bootstrap_needed(buckets["bootstrap_needed"]))
+
+    if not parts:
+        return "", []
+
+    # Dedup attachments by resolved absolute path (spec Acceptance #7).
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for att in attachments:
+        try:
+            key = att.resolve()
+        except OSError:
+            key = att.absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(att)
+
+    return "\n\n".join(parts), deduped
+
+
+def _read_status(ar: Any) -> Any:
+    if isinstance(ar, dict):
+        return ar.get("status")
+    return getattr(ar, "status", None)
+
+
+def _apply_result_to_row(ar: Any) -> dict:
+    """Whitelist-copy fields off an ``ApplyResult`` into the row shape the
+    per-block renderers expect. NEVER copy candidate PII — only structural
+    identifiers + reason/status/ats.
+    """
+    if isinstance(ar, dict):
+        def get(k: str, default: Any = None) -> Any:
+            return ar.get(k, default)
+    else:
+        def get(k: str, default: Any = None) -> Any:
+            return getattr(ar, k, default)
+
+    return {
+        "ats": get("ats"),
+        "application_id": get("application_id"),
+        "review_id": get("review_id"),
+        "reason": get("reason"),
+        # These may be attached by the seam when synthesizing from
+        # ApplyResult; leave absent otherwise.
+        "gmail_thread_id": get("gmail_thread_id"),
+        "screenshot_path": _stringify_path(get("confirmation_screenshot")),
+        "company": get("company"),
+        "similar_role": get("similar_role"),
+    }
+
+
+def _stringify_path(v: Any) -> Any:
+    if v is None:
+        return None
+    return str(v)
+
+
+# ---------------------------------------------------------------------------
+# Per-block renderers.
+# ---------------------------------------------------------------------------
+
+
+def _render_submitted(rows: list[dict]) -> str:
+    lines = ["## Submitted"]
+    for row in rows:
+        ats = row.get("ats", "unknown")
+        app_id = row.get("application_id", "unknown")
+        lines.append(f"- Submitted to {ats} — application_id {app_id}")
+    return "\n".join(lines)
+
+
+def _render_review_required(rows: list[dict]) -> tuple[str, list[Path]]:
+    lines = ["## Review required"]
+    attachments: list[Path] = []
+    for row in rows:
+        thread_id = row.get("gmail_thread_id", "<unknown-thread>")
+        lines.append(f"- reply YES to {thread_id} to submit")
+
+        screenshot = row.get("screenshot_path")
+        if not screenshot:
+            continue
+        path = Path(str(screenshot))
+        if path.exists():
+            attachments.append(path)
+        else:
+            # L7-safe log: identify by review_id, never leak the path (which
+            # could belong to another user's workspace).
+            _log.info(
+                "digest.screenshot_missing review_id=%s",
+                row.get("review_id", "<unknown>"),
+            )
+    return "\n".join(lines), attachments
+
+
+def _render_auto_declined(rows: list[dict]) -> str:
+    lines = ["## Auto-declined"]
+    for row in rows:
+        review_id = row.get("review_id", "<unknown>")
+        lines.append(f"- Auto-declined — no reply in 72 h (review_id {review_id})")
+    return "\n".join(lines)
+
+
+def _render_soft_dup(rows: list[dict]) -> str:
+    lines = ["## Blocked (soft-dup)"]
+    for row in rows:
+        company = row.get("company", "<company>")
+        review_id = row.get("review_id", "<unknown>")
+        lines.append(
+            f"- Blocked (soft-dup) — similar role at {company}: "
+            f"reply YES {review_id} to override"
+        )
+    return "\n".join(lines)
+
+
+def _render_bootstrap_needed(rows: list[dict]) -> str:
+    """Deduplicated by ATS per spec Acceptance #8."""
+    lines = ["## Bootstrap needed"]
+    seen_ats: set[str] = set()
+    for row in rows:
+        ats = row.get("ats", "<ats>")
+        if ats in seen_ats:
+            continue
+        seen_ats.add(ats)
+        lines.append(f"- Bootstrap needed — {ats} session expired")
     return "\n".join(lines)

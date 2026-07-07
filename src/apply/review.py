@@ -1,0 +1,925 @@
+"""
+src/apply/review.py — S12 Gmail YES/NO review-loop implementation.
+
+Spec: .agent/one-big-feature/auto-apply-2026-07-06/03-specs/12-s12-gmail-review-loop.md
+
+Owns:
+    * ``ensure_labels`` — idempotent nested-label boot.
+    * ``stage_review`` — insert ``review_pending`` row + send review email.
+    * ``poll_pending_reviews`` — sweep threads, resolve YES/NO/ambiguous,
+      re-ping at 24h, auto-decline at 72h.
+    * ``execute_confirmed_submit`` — re-open browser via S4 session,
+      re-run S8 adapter, record dedup on DOM-verified confirmation only.
+    * ``Decision`` frozen dataclass.
+    * ``_uuid7`` — RFC 9562 uuid7 (local impl to keep zero-new-deps).
+    * ``_strip_quoted`` + ``_parse_first_line`` — strict first-token parser.
+
+Cross-shard contracts consumed (imported lazily so this module loads on a
+base branch that hasn't yet merged S2/S4/S5/S6/S8):
+    S2  — ``ApplyResult`` / ``ApplyContext`` / ``Status``.
+    S4  — ``session()`` context manager.
+    S5  — ``DedupDB.record`` + ``.was_applied`` + ``review_pending`` schema.
+    S6  — ``load_state(ats, user)``.
+    S8  — ``GreenhouseAdapter.apply(page, ctx)``.
+    S11 — ``@navigation_retry`` (applied to Gmail extension methods in
+          ``src/gmail/client.py``, not here).
+
+Landmine discipline:
+    L6  — every ``datetime`` write goes through ``datetime.now(timezone.utc)``;
+          the deprecated naive UTC-now API is NEVER called (this file's
+          own suite has an in-tree grep guard).
+    L7  — no candidate email, phone, or answer value is ever rendered into a
+          review-email body or a structlog event; only structural metadata
+          (review_id, ats, thread_id, first_sent_at, resolved_at, counts).
+    L12 — the adapter used inside ``execute_confirmed_submit`` is passed by
+          the caller (poller) — this module does NOT hold a class-object
+          dispatch table.
+    L13 — ``execute_confirmed_submit`` never retries submit; the adapter's
+          own ``@submit_no_retry`` marker holds the invariant, and this
+          layer NEVER wraps ``adapter.apply`` in a retry loop.
+    L14 — the label prefix is read from ``config[apply][gmail_label_prefix]``
+          in ONE helper (``_label_names``); the fully-qualified nested-label
+          strings are never composed anywhere else in this module.
+
+Deviations from spec (documented; the parent-agent's task briefing invited
+these):
+    D1. ``ensure_labels`` gains a ``config`` parameter (spec §Contracts-produced
+        listed the signature as ``ensure_labels(gmail)``, but L14 requires the
+        prefix to come from config; carrying config in is the only sane way to
+        satisfy L14 in a single helper).
+    D2. ``stage_review`` gains a ``filled_count`` keyword-only argument
+        (spec §Acceptance 3 requires the count in the body but the frozen
+        ``ApplyResult`` does not carry it; the caller (S8) supplies it at
+        stage-time).
+    D3. ``poll_pending_reviews`` gains an ``adapter`` parameter (spec
+        §Contracts-produced omitted it, but ``execute_confirmed_submit``
+        needs an adapter and the poller is the only call-site — L12 forbids
+        us from resolving it from a class-object table).
+    D4. ``execute_confirmed_submit`` gains three keyword-only injectors —
+        ``session_ctx``, ``load_state_fn``, ``dedup_db`` — that default to
+        the real S4/S6/S5 collaborators. Tests inject mocks; production
+        code uses the defaults. This is a strict test-observability win
+        and preserves the spec's return-type contract.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterator
+from uuid import UUID
+
+import structlog
+
+if TYPE_CHECKING:  # pragma: no cover
+    # These imports are for type-checking only — they must not run at import
+    # time so the module remains importable on a base branch that lacks
+    # sibling shards (S2/S4/S5/S6/S8).
+    from .state_store import ReviewStore
+    from .types import ApplyContext, ApplyResult
+
+
+log = structlog.get_logger()
+
+
+# ─────────────────────────────────────────────────────────
+# Constants (L14 — prefix comes from config, NEVER hardcoded here)
+# ─────────────────────────────────────────────────────────
+
+_LABEL_SUFFIXES: tuple[str, ...] = ("pending", "submitted", "declined")
+
+_AMBIGUOUS_REPLY = (
+    "Please reply YES or NO on the first line — I only read the first token."
+)
+
+_REPING_BODY = (
+    "Still awaiting YES/NO — will auto-decline at 72h from initial send."
+)
+
+# Trailing-punctuation set stripped from the first token before matching.
+_STRIP_TRAILING_PUNCT = ".!,?;:"
+
+
+# ─────────────────────────────────────────────────────────
+# Decision dataclass
+# ─────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Decision:
+    """Resolved outcome of one review-loop tick per row.
+
+    ``status`` is one of the S2 ``Status`` literal values —
+    ``"submitted" | "declined" | "auto_declined" | "review_required"``
+    (``review_required`` used on the ambiguous branch: the row stays in
+    pending, no label move, no state advance).
+    """
+
+    review_id: str
+    status: str
+    apply_url: str
+    ats: str
+    company: str
+    role_title: str
+    applicant: str
+    thread_id: str
+
+
+# ─────────────────────────────────────────────────────────
+# uuid7 (RFC 9562) — zero-new-deps local impl (Ben preference)
+# ─────────────────────────────────────────────────────────
+
+
+def _uuid7() -> str:
+    """Return a fresh RFC 9562 uuid7 as a canonical string.
+
+    Layout (128 bits):
+        bits 127..80 — 48-bit unix_ts_ms.
+        bits 79..76  — 4-bit version = 0b0111 (7).
+        bits 75..64  — 12-bit rand_a.
+        bits 63..62  — 2-bit variant = 0b10 (RFC 4122).
+        bits 61..0   — 62-bit rand_b.
+
+    Time source is ``time.time_ns() // 1_000_000`` (monotonic within a ms,
+    unique-enough given 74 bits of randomness per invocation). This impl is
+    good until 10889 CE, which is more than enough for a Phase 3 MVP.
+    """
+    ts_ms = (time.time_ns() // 1_000_000) & ((1 << 48) - 1)
+    rand = int.from_bytes(os.urandom(10), "big")
+    rand_a = rand & 0xFFF
+    rand_b = (rand >> 12) & ((1 << 62) - 1)
+    uuid_int = (
+        (ts_ms << 80)
+        | (0x7 << 76)
+        | (rand_a << 64)
+        | (0b10 << 62)
+        | rand_b
+    )
+    return str(UUID(int=uuid_int))
+
+
+# ─────────────────────────────────────────────────────────
+# Parser primitives
+# ─────────────────────────────────────────────────────────
+
+_QUOTE_RE = re.compile(r"^\s*>")
+
+
+def _strip_quoted(body: str) -> str:
+    """Return ``body`` with every quoted line (matching ``^\\s*>``) removed.
+
+    Each line is inspected independently; leading whitespace before the ``>``
+    is tolerated (Gmail sometimes indents quoted blocks under a signature).
+    """
+    if not body:
+        return ""
+    kept = [ln for ln in body.splitlines() if not _QUOTE_RE.match(ln)]
+    return "\n".join(kept)
+
+
+def _parse_first_line(first_line: str) -> str:
+    """Strict first-token whole-word case-insensitive YES/NO parser.
+
+    Returns ``"YES"`` | ``"NO"`` | ``"AMBIGUOUS"``.
+
+    Rules (Ben Q4):
+        - Split ``first_line`` on whitespace; take the first token.
+        - Strip trailing punctuation ``.!,?;:`` from the token.
+        - Uppercase.
+        - Match against exactly ``"YES"`` or ``"NO"`` (whole-word).
+
+    ``"Yeah"``, ``"Y"``, ``"maybe"``, ``""``, ``"submit please"`` → AMBIGUOUS.
+    ``"YES please"``, ``"YES!"``, ``"YES."``, ``"Yes, submit"`` → YES.
+    ``"NO thanks"``, ``"No way"``, ``"NO."`` → NO.
+    """
+    if not first_line:
+        return "AMBIGUOUS"
+    tokens = first_line.strip().split()
+    if not tokens:
+        return "AMBIGUOUS"
+    token = tokens[0].rstrip(_STRIP_TRAILING_PUNCT).upper()
+    if token == "YES":
+        return "YES"
+    if token == "NO":
+        return "NO"
+    return "AMBIGUOUS"
+
+
+def _first_non_empty_line(body: str) -> str:
+    """Extract the first non-empty stripped line of ``body`` after removing
+    all quoted lines. Returns ``""`` if the whole body is quoted or blank."""
+    stripped_body = _strip_quoted(body)
+    for line in stripped_body.splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return ""
+
+
+# ─────────────────────────────────────────────────────────
+# Config helpers (L14 — single source of truth for the prefix)
+# ─────────────────────────────────────────────────────────
+
+
+def _label_names(config: dict) -> dict[str, str]:
+    """Return the fully-qualified nested label names, keyed by short suffix.
+
+    Reads ``config["apply"]["gmail_label_prefix"]`` — the ONLY place in this
+    module that composes the full label string. Every other function calls
+    this helper. L14 satisfied.
+    """
+    prefix = config["apply"]["gmail_label_prefix"]
+    return {suffix: f"{prefix}/{suffix}" for suffix in _LABEL_SUFFIXES}
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC ``now``. Central helper so L6 audits stay one grep."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ─────────────────────────────────────────────────────────
+# Label CRUD + boot
+# ─────────────────────────────────────────────────────────
+
+
+def ensure_labels(gmail: Any, config: dict) -> dict[str, str]:
+    """Ensure the three nested labels exist and return their IDs by short name.
+
+    Idempotent by delegation: ``gmail.get_or_create_label(name)`` is the
+    contract that never creates a duplicate label. The dict returned is
+    keyed by short suffix (``pending``, ``submitted``, ``declined``); the
+    values are Gmail label IDs (opaque strings).
+    """
+    names = _label_names(config)
+    return {suffix: gmail.get_or_create_label(full) for suffix, full in names.items()}
+
+
+# ─────────────────────────────────────────────────────────
+# Review email body (L7 — no PII)
+# ─────────────────────────────────────────────────────────
+
+
+def _render_review_email(
+    *,
+    company: str,
+    role_title: str,
+    apply_url: str,
+    ats: str,
+    review_id: str,
+    filled_count: int,
+) -> tuple[str, str]:
+    """Return ``(subject, body)``. Body contains ONLY structural metadata —
+    no candidate email, phone, resume path, or answer values (L7)."""
+    subject = f"[hiring-agent] Application to {company} — {role_title} [review_id={review_id}]"
+    body = (
+        f"Application to {company} — {role_title} [review_id={review_id}]\n"
+        "\n"
+        f"apply_url: {apply_url}\n"
+        f"ats: {ats}\n"
+        f"filled fields: {filled_count}\n"
+        "\n"
+        "Reply YES to submit, NO to skip. Only your first line is read.\n"
+        "Confirmation screenshot attached inline.\n"
+    )
+    return subject, body
+
+
+# ─────────────────────────────────────────────────────────
+# stage_review
+# ─────────────────────────────────────────────────────────
+
+
+def stage_review(
+    result: "ApplyResult",
+    ctx: "ApplyContext",
+    gmail: Any,
+    store: "ReviewStore",
+    *,
+    filled_count: int = 0,
+) -> str:
+    """Stage a review: insert a ``review_pending`` row, send the email, and
+    return the ``review_id`` (uuid7).
+
+    ``filled_count`` is passed by the caller (S8's adapter) because the
+    frozen ``ApplyResult`` does not carry it. Absent counts default to 0 —
+    the body still renders; only the numeric drops to zero.
+    """
+    review_id = _uuid7()
+    first_sent_at = _now_iso()
+    label_ids = ensure_labels(gmail, ctx.config)
+
+    company = ctx.job.get("company", "")
+    role_title = ctx.job.get("role_title") or ctx.job.get("title") or ""
+    apply_url = result.apply_url or ctx.job.get("apply_url", "")
+    ats = result.ats or ctx.job.get("ats", "")
+    job_url = ctx.job.get("job_url", apply_url)
+
+    subject, body = _render_review_email(
+        company=company,
+        role_title=role_title,
+        apply_url=apply_url,
+        ats=ats,
+        review_id=review_id,
+        filled_count=filled_count,
+    )
+
+    screenshot = result.confirmation_screenshot
+    to = ctx.config["apply"].get("fast_path_recipient", "")
+
+    # Insert first (so the DB has a row even if send fails partway); then send;
+    # then attach thread_id on success. If send raises, the row stays without
+    # a thread_id and the poller will treat it as unpingable until the operator
+    # manually re-runs `--force-decline` (a follow-up escape hatch).
+    store.insert(
+        {
+            "review_id": review_id,
+            "job_url": job_url,
+            "apply_url": apply_url,
+            "company": company,
+            "role_title": role_title,
+            "ats": ats,
+            "filled_at": first_sent_at,
+            "screenshot_path": str(screenshot) if screenshot else "",
+            "trace_path": (
+                str(getattr(result, "trace_path", None))
+                if getattr(result, "trace_path", None)
+                else None
+            ),
+            "first_sent_at": first_sent_at,
+            "last_repinged_at": None,
+            "repings_sent": 0,
+            "gmail_thread_id": None,
+            "resolution": None,
+            "resolved_at": None,
+        }
+    )
+
+    attachments = [screenshot] if screenshot else []
+    msg_id, thread_id = gmail.send_with_labels(
+        subject=subject,
+        body=body,
+        to=to,
+        labels=[label_ids["pending"]],
+        attachments=attachments,
+    )
+    store.set_thread_id(review_id, thread_id)
+
+    log.info(
+        "apply.review.staged",
+        review_id=review_id,
+        ats=ats,
+        thread_id=thread_id,
+        first_sent_at=first_sent_at,
+        filled_count=filled_count,
+    )
+    return review_id
+
+
+# ─────────────────────────────────────────────────────────
+# execute_confirmed_submit
+# ─────────────────────────────────────────────────────────
+
+
+def _fake_apply_result(status: str, **fields) -> Any:
+    """Build an ``ApplyResult`` when the S2 shard is available; fall back to a
+    duck-typed stand-in when it isn't (base branch import safety).
+
+    The stand-in has the same attribute surface the downstream S5 dedup call
+    and the poll-loop return path read from — status/ats/apply_url/etc.
+    """
+    try:
+        from .types import ApplyResult
+        return ApplyResult(status=status, **fields)
+    except Exception:  # pragma: no cover — base-branch fallback
+        class _Result:
+            pass
+        r = _Result()
+        r.status = status
+        for k, v in fields.items():
+            setattr(r, k, v)
+        for k in (
+            "ats",
+            "apply_url",
+            "application_id",
+            "confirmation_screenshot",
+            "reason",
+            "human_review_url",
+            "submitted_at",
+            "trace_path",
+            "review_id",
+        ):
+            if not hasattr(r, k):
+                setattr(r, k, None)
+        return r
+
+
+def _default_session_ctx() -> Callable[..., Any]:
+    """Lazy import of S4's ``session`` context manager."""
+    from src.browser.session import session as _s  # noqa: E402
+    return _s
+
+
+def _default_load_state() -> Callable[[str, str], dict | None]:
+    from src.apply.credentials import load_state as _l  # noqa: E402
+    return _l
+
+
+def _default_dedup_db(config: dict) -> Any:
+    from src.apply.dedup import DedupDB  # noqa: E402
+    return DedupDB(config["apply"]["dedup_db_path"])
+
+
+def execute_confirmed_submit(
+    decision: Decision,
+    adapter: Any,
+    config: dict,
+    *,
+    session_ctx: Callable[..., Any] | None = None,
+    load_state_fn: Callable[[str, str], dict | None] | None = None,
+    dedup_db: Any | None = None,
+) -> Any:
+    """Re-open the browser via S4, re-run the adapter, and record dedup ONLY
+    on DOM-verified confirmation.
+
+    Never retries submit (L13). The adapter's own ``@submit_no_retry`` marker
+    holds the invariant end-to-end; this layer calls ``adapter.apply`` exactly
+    ONCE per invocation, and NEVER wraps it in a retry loop.
+
+    L5 discipline (browser cleanup): the S4 ``session()`` ctx manager owns
+    the ``browser + context + page`` teardown in a nested try/finally — we
+    just enter/exit it cleanly.
+
+    Idempotency: ``DedupDB.record`` may raise ``sqlite3.IntegrityError`` on
+    a UNIQUE(company, ats_domain, ats_job_id) collision — which happens on
+    a replay after a prior successful confirm-submit. Catch it and return
+    ``ApplyResult(status="already_applied")``.
+    """
+    if session_ctx is None:
+        session_ctx = _default_session_ctx()
+    if load_state_fn is None:
+        load_state_fn = _default_load_state()
+    if dedup_db is None:
+        dedup_db = _default_dedup_db(config)
+
+    # Belt-and-suspenders: check dedup BEFORE re-running the adapter. If a
+    # background task recorded this app during the review window, short-circuit.
+    try:
+        already = dedup_db.was_applied(
+            company=decision.company,
+            ats_domain=None,
+            ats_job_id=None,
+            job_url=decision.apply_url,
+        )
+    except TypeError:
+        # Support DedupDB.was_applied signatures that differ slightly.
+        already = dedup_db.was_applied(decision.apply_url)
+    if already:
+        log.info(
+            "apply.review.already_recorded",
+            review_id=decision.review_id,
+            reason="was_applied_precheck",
+        )
+        return _fake_apply_result(
+            "already_applied",
+            ats=decision.ats,
+            apply_url=decision.apply_url,
+        )
+
+    # Load storage_state; write to a temp file S4 can consume; delete post-run.
+    state = load_state_fn(decision.ats, decision.applicant) if load_state_fn else None
+    tmp_path: Path | None = None
+    if state:
+        fd, name = tempfile.mkstemp(suffix=".storage_state.json")
+        os.close(fd)
+        tmp_path = Path(name)
+        tmp_path.write_text(json.dumps(state))
+        os.chmod(tmp_path, 0o600)
+
+    result: Any
+    try:
+        with session_ctx(storage_state_path=tmp_path, headless=True) as session_yield:
+            # S4 yields ``(page, trace_path)``; be lenient for callers that
+            # yield just ``page`` (test fakes).
+            if isinstance(session_yield, tuple):
+                page = session_yield[0]
+            else:  # pragma: no cover — defensive
+                page = session_yield
+            try:
+                page.goto(decision.apply_url)
+            except Exception:
+                # goto errors are the adapter's problem — but log-and-fall-through
+                # so we get an ``ApplyResult(failed)`` instead of a bare exception.
+                pass
+            # NEVER retry adapter.apply (L13). Called exactly once.
+            result = adapter.apply(page, _AutoModeCtx(decision, config))
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    # Only record on DOM-verified confirmation (S8 owns the confirmation
+    # marker; we trust its status). Never submitted → never touch dedup DB.
+    if getattr(result, "status", None) == "submitted":
+        try:
+            dedup_db.record(
+                result,
+                applicant=decision.applicant,
+                company=decision.company,
+                job_url=decision.apply_url,
+            )
+        except sqlite3.IntegrityError:
+            # Idempotent replay path. Not an error — a rerun of the same review.
+            log.info(
+                "apply.review.already_recorded",
+                review_id=decision.review_id,
+                reason="integrity_error_on_record",
+            )
+            return _fake_apply_result(
+                "already_applied",
+                ats=decision.ats,
+                apply_url=decision.apply_url,
+            )
+    else:
+        log.warning(
+            "apply.review.submit_failed",
+            review_id=decision.review_id,
+            status=getattr(result, "status", None),
+            reason=getattr(result, "reason", None),
+        )
+    return result
+
+
+class _AutoModeCtx:
+    """Minimal ``ApplyContext``-shaped stand-in for the confirmed-submit re-run.
+
+    Guarantees the attributes the S8 adapter contract reads —
+    ``mode``, ``dry_run``, ``config``, ``applicant``, ``job``, ``profile``,
+    ``resume_path``, ``cover_letter_path``. ``profile`` is lazy-loaded from
+    ``config["apply"]["profile_path"]`` via S1's ``CandidateProfile.load``
+    (imported lazily so this module remains importable on branches that
+    haven't merged S1); if S1 is absent, ``profile`` stays None and the
+    adapter's own ``load_profile`` fallback kicks in.
+    """
+
+    __slots__ = (
+        "mode",
+        "dry_run",
+        "config",
+        "applicant",
+        "job",
+        "profile",
+        "resume_path",
+        "cover_letter_path",
+    )
+
+    def __init__(self, decision: Decision, config: dict):
+        self.mode = "auto"
+        self.dry_run = config.get("apply", {}).get("dry_run", False)
+        self.config = config
+        self.applicant = decision.applicant
+        self.job = {
+            "company": decision.company,
+            "role_title": decision.role_title,
+            "title": decision.role_title,
+            "apply_url": decision.apply_url,
+            "job_url": decision.apply_url,
+            "ats": decision.ats,
+        }
+        self.resume_path = None  # set by integrator from generated PDF path
+        self.cover_letter_path = None
+        self.profile = _load_profile_or_none(config)
+
+
+def _load_profile_or_none(config: dict) -> Any:
+    """Lazy-load S1's ``CandidateProfile`` from ``config[apply][profile_path]``.
+
+    Returns ``None`` if S1 isn't available on this branch or if the config
+    key is missing — the adapter's own fallback handles that case.
+    """
+    try:
+        from src.apply.profile import CandidateProfile  # noqa: E402
+    except Exception:
+        return None
+    path = config.get("apply", {}).get("profile_path")
+    if not path:
+        return None
+    try:
+        return CandidateProfile.load(path)
+    except Exception as e:  # pragma: no cover — merge-time integration path
+        log.warning(
+            "apply.review.profile_load_failed",
+            error_type=type(e).__name__,
+        )
+        return None
+
+
+# ─────────────────────────────────────────────────────────
+# poll_pending_reviews
+# ─────────────────────────────────────────────────────────
+
+
+def _extract_thread_body(msg: dict) -> str:
+    """Pull the human body out of the message dict shape returned by
+    ``GmailClient.search``. Tolerant of two field names: ``body_text`` (S12's
+    contract) and ``text`` (existing ``find_unprocessed_alert`` shape)."""
+    return msg.get("body_text") or msg.get("text") or msg.get("body") or ""
+
+
+def _extract_thread_id(msg: dict) -> str | None:
+    return msg.get("thread_id") or msg.get("threadId")
+
+
+def _extract_msg_id(msg: dict) -> str | None:
+    return msg.get("id") or msg.get("msg_id")
+
+
+def poll_pending_reviews(
+    gmail: Any,
+    store: "ReviewStore",
+    now: datetime,
+    config: dict,
+    *,
+    adapter: Any = None,
+) -> list[Decision]:
+    """Sweep open ``review_pending`` rows; resolve each per Q4/Q5 rules.
+
+    Returns a ``list[Decision]`` — one entry per row that resolved this tick
+    (YES/NO/auto-declined). Ambiguous replies + 24h re-pings do NOT produce
+    a Decision (the row stays in pending).
+
+    ``adapter`` is required for the YES branch (calls
+    ``execute_confirmed_submit(decision, adapter, config)``). The poller
+    accepts a single adapter for MVP (Greenhouse-only per Q1); Phase 3.5
+    will widen this to a per-ATS adapter map resolved from
+    ``config["apply"]["allowed_ats"]``.
+    """
+    label_names = _label_names(config)
+    pending_label_full = label_names["pending"]
+    label_ids = ensure_labels(gmail, config)
+
+    reping_hours = int(config["apply"].get("review_reping_hours", 24))
+    timeout_hours = int(config["apply"].get("review_timeout_hours", 72))
+
+    # Fetch all messages currently under the pending label. Filter to inbox +
+    # ``newer_than:4d`` per spec §GREEN-targets — the 4-day window covers the
+    # 72h auto-decline horizon with 24h of slack for tick lag. The client's
+    # ``search`` returns one dict per matching message.
+    query = f'label:"{pending_label_full}" in:inbox newer_than:4d'
+    inbound = gmail.search(query)
+
+    # Index inbound messages by thread_id — the poller resolves BY-ROW, and
+    # the row carries the thread_id we compare against.
+    inbound_by_thread: dict[str, dict] = {}
+    for msg in inbound:
+        tid = _extract_thread_id(msg)
+        if tid and tid not in inbound_by_thread:
+            inbound_by_thread[tid] = msg
+
+    decisions: list[Decision] = []
+    open_rows = store.list_open()
+
+    for row in open_rows:
+        decision = _resolve_one(
+            row=row,
+            inbound_by_thread=inbound_by_thread,
+            gmail=gmail,
+            store=store,
+            now=now,
+            reping_hours=reping_hours,
+            timeout_hours=timeout_hours,
+            label_ids=label_ids,
+            adapter=adapter,
+            config=config,
+        )
+        if decision is not None:
+            decisions.append(decision)
+
+    return decisions
+
+
+def _row_to_decision(row: dict, *, status: str) -> Decision:
+    return Decision(
+        review_id=row["review_id"],
+        status=status,
+        apply_url=row["apply_url"],
+        ats=row["ats"],
+        company=row["company"],
+        role_title=row["role_title"],
+        applicant=row.get("applicant") or "",
+        thread_id=row.get("gmail_thread_id") or "",
+    )
+
+
+def _resolve_one(
+    *,
+    row: dict,
+    inbound_by_thread: dict[str, dict],
+    gmail: Any,
+    store: "ReviewStore",
+    now: datetime,
+    reping_hours: int,
+    timeout_hours: int,
+    label_ids: dict[str, str],
+    adapter: Any,
+    config: dict,
+) -> Decision | None:
+    review_id = row["review_id"]
+    thread_id = row.get("gmail_thread_id")
+    first_sent_at = _parse_iso(row["first_sent_at"])
+    age = now - first_sent_at
+
+    # 1. 72h auto-decline — highest priority. Fires even if a reply is present
+    # but was never parsed as YES/NO within the window.
+    if age >= timedelta(hours=timeout_hours):
+        resolved_at = _iso(now)
+        store.mark_resolved(review_id, "auto_declined", resolved_at)
+        # Label move: pending → declined. Target the message id when the row
+        # has a Gmail thread — a reply message id is preferred (a reply is
+        # present in ``inbound_by_thread`` even for the auto-decline branch
+        # when the operator replied ambiguously and let the 72h window elapse).
+        # If we NEVER got a Gmail thread_id (stage_review's send failed but
+        # its insert succeeded), skip label ops — a bare review_id is not a
+        # valid Gmail msg_id and would 400 the API call.
+        msg = inbound_by_thread.get(thread_id) if thread_id else None
+        target_id = _extract_msg_id(msg) if msg else thread_id
+        if target_id:
+            gmail.apply_label(target_id, label_ids["declined"])
+            gmail.remove_label(target_id, label_ids["pending"])
+        else:
+            log.warning(
+                "apply.review.auto_decline_no_thread",
+                review_id=review_id,
+                reason="no gmail thread_id — send likely failed at stage_review",
+            )
+        log.info(
+            "apply.review.auto_declined",
+            review_id=review_id,
+            first_sent_at=row["first_sent_at"],
+            resolved_at=resolved_at,
+        )
+        return _row_to_decision(row, status="auto_declined")
+
+    # 2. Reply present? Parse first line.
+    msg = inbound_by_thread.get(thread_id) if thread_id else None
+    if msg is not None:
+        body = _extract_thread_body(msg)
+        first = _first_non_empty_line(body)
+        parsed = _parse_first_line(first)
+        msg_id = _extract_msg_id(msg) or thread_id
+        if parsed == "YES":
+            return _handle_yes(
+                row=row,
+                msg_id=msg_id,
+                gmail=gmail,
+                store=store,
+                label_ids=label_ids,
+                adapter=adapter,
+                config=config,
+                now=now,
+            )
+        if parsed == "NO":
+            return _handle_no(
+                row=row,
+                msg_id=msg_id,
+                gmail=gmail,
+                store=store,
+                label_ids=label_ids,
+                now=now,
+            )
+        # AMBIGUOUS — send clarification, do NOT re-ping, do NOT advance state.
+        gmail.reply_to_thread(thread_id, _AMBIGUOUS_REPLY)
+        log.info(
+            "apply.review.parsed_ambiguous",
+            review_id=review_id,
+            thread_id=thread_id,
+        )
+        return None
+
+    # 3. No reply, past re-ping window, and re-ping not yet sent.
+    if (
+        age >= timedelta(hours=reping_hours)
+        and (row.get("repings_sent") or 0) == 0
+        and thread_id
+    ):
+        gmail.reply_to_thread(thread_id, _REPING_BODY)
+        store.mark_repinged(review_id, _iso(now))
+        log.info(
+            "apply.review.repinged_24h",
+            review_id=review_id,
+            thread_id=thread_id,
+        )
+        return None
+
+    # 4. Nothing to do this tick.
+    return None
+
+
+def _handle_yes(
+    *,
+    row: dict,
+    msg_id: str,
+    gmail: Any,
+    store: "ReviewStore",
+    label_ids: dict[str, str],
+    adapter: Any,
+    config: dict,
+    now: datetime,
+) -> Decision:
+    review_id = row["review_id"]
+    decision = Decision(
+        review_id=review_id,
+        status="submitted",  # staged; upgraded on adapter success
+        apply_url=row["apply_url"],
+        ats=row["ats"],
+        company=row["company"],
+        role_title=row["role_title"],
+        applicant=row.get("applicant") or "",
+        thread_id=row.get("gmail_thread_id") or "",
+    )
+
+    log.info(
+        "apply.review.parsed_yes",
+        review_id=review_id,
+        thread_id=decision.thread_id,
+    )
+
+    result = execute_confirmed_submit(decision, adapter, config)
+    submit_ok = getattr(result, "status", None) == "submitted"
+
+    if submit_ok:
+        resolved_at = _iso(now)
+        store.mark_resolved(review_id, "submitted", resolved_at)
+        gmail.apply_label(msg_id, label_ids["submitted"])
+        gmail.remove_label(msg_id, label_ids["pending"])
+        return decision
+
+    # Submit failed — do NOT move the label; do NOT resolve; keep row pending.
+    # Fast-path email is S13's territory. We log the failure and return an
+    # unchanged pending decision so the caller sees the branch was walked.
+    log.warning(
+        "apply.review.submit_failed",
+        review_id=review_id,
+        status=getattr(result, "status", None),
+    )
+    return Decision(
+        review_id=review_id,
+        status="review_required",
+        apply_url=row["apply_url"],
+        ats=row["ats"],
+        company=row["company"],
+        role_title=row["role_title"],
+        applicant=row.get("applicant") or "",
+        thread_id=row.get("gmail_thread_id") or "",
+    )
+
+
+def _handle_no(
+    *,
+    row: dict,
+    msg_id: str,
+    gmail: Any,
+    store: "ReviewStore",
+    label_ids: dict[str, str],
+    now: datetime,
+) -> Decision:
+    review_id = row["review_id"]
+    resolved_at = _iso(now)
+    store.mark_resolved(review_id, "declined", resolved_at)
+    gmail.apply_label(msg_id, label_ids["declined"])
+    gmail.remove_label(msg_id, label_ids["pending"])
+    log.info(
+        "apply.review.parsed_no",
+        review_id=review_id,
+        thread_id=row.get("gmail_thread_id"),
+    )
+    return _row_to_decision(row, status="declined")
+
+
+# ─────────────────────────────────────────────────────────
+# datetime helpers (L6 — every read/write is tz-aware UTC)
+# ─────────────────────────────────────────────────────────
+
+
+def _iso(dt: datetime) -> str:
+    """Serialize an aware datetime to ISO-8601. Naive datetimes are rejected."""
+    if dt.tzinfo is None:  # pragma: no cover — caller-side bug
+        raise ValueError("naive datetime — pass an aware UTC datetime")
+    return dt.isoformat()
+
+
+def _parse_iso(s: str) -> datetime:
+    """Parse an ISO-8601 timestamp. Assumes UTC if tz is absent."""
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
