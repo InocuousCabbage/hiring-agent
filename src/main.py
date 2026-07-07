@@ -593,6 +593,23 @@ def main() -> None:
             sys.exit(1)
         log.info("pipeline.test_mode", job_count=len(jobs))
 
+        # H13 fix: pass a gmail_client even in --test mode. The seam's
+        # poll_pending_reviews needs a client (or a stub) — passing
+        # gmail_client=None would crash when the seam calls gmail.search().
+        # A None-safe stub keeps --test hermetic (no real Gmail auth).
+        class _NoopGmailClient:
+            def search(self, query):
+                return []
+            def get_or_create_label(self, name):
+                return f"stub:{name}"
+            def send_with_labels(self, subject, body, to, labels, attachments):
+                return ("stub_msg_id", "stub_thread_id")
+            def apply_label(self, msg_id, label_id):
+                return None
+            def remove_label(self, msg_id, label_id):
+                return None
+            def reply_to_thread(self, thread_id, body):
+                return None
         try:
             processed, skipped, apply_events = run_pipeline(
                 jobs=jobs,
@@ -601,6 +618,7 @@ def main() -> None:
                 today=today,
                 output_dir=output_dir,
                 dry_run=True,
+                gmail_client=_NoopGmailClient(),
             )
         except ConfigError as exc:
             print(f"config error: {exc}", file=sys.stderr)
