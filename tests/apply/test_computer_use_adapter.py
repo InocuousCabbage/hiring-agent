@@ -437,9 +437,13 @@ def test_dispatch_returns_none_when_long_tail_none():
 
 
 def test_dispatch_returns_computer_use_when_long_tail_opt_in():
+    # H11: long_tail fallback also requires the fallback name in allowed_ats.
     result = dispatch(
         "https://unknown-ats.example.com/1",
-        {"apply": {"long_tail": "computer_use"}},
+        {"apply": {
+            "long_tail": "computer_use",
+            "allowed_ats": ["computer_use"],
+        }},
     )
     assert result is not None
     assert isinstance(result, ComputerUseAdapter)
@@ -802,7 +806,14 @@ def test_dispatcher_registration_observable_via_monkeypatch(monkeypatch):
         "src.apply.adapters.computer_use.ComputerUseAdapter",
         _StubAdapter,
     )
-    result = dispatch("https://x.example/1", {"apply": {"long_tail": "computer_use"}})
+    # H11: long_tail fallback also requires computer_use in allowed_ats.
+    result = dispatch(
+        "https://x.example/1",
+        {"apply": {
+            "long_tail": "computer_use",
+            "allowed_ats": ["computer_use"],
+        }},
+    )
     assert isinstance(result, _StubAdapter)
 
 

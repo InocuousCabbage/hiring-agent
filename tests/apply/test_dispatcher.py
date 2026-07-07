@@ -298,10 +298,14 @@ def test_dispatcher_falls_back_to_computer_use_when_long_tail_configured(monkeyp
 
     unknown_url = "https://unknown-ats.example.test/apply/1"
 
-    # long_tail='computer_use' + unmatched URL → ComputerUseAdapter
+    # H11: fallback requires computer_use in allowed_ats too. Widen the
+    # allowlist to encode the operator opt-in.
     adapter = dispatcher.dispatch(
         unknown_url,
-        {"apply": {"allowed_ats": ["greenhouse"], "long_tail": "computer_use"}},
+        {"apply": {
+            "allowed_ats": ["greenhouse", "computer_use"],
+            "long_tail": "computer_use",
+        }},
     )
     assert adapter is not None, "expected ComputerUseAdapter fallback, got None"
     assert isinstance(adapter, _FakeComputerUseAdapter)
@@ -310,7 +314,10 @@ def test_dispatcher_falls_back_to_computer_use_when_long_tail_configured(monkeyp
     # long_tail='none' + unmatched URL → None
     adapter_none = dispatcher.dispatch(
         unknown_url,
-        {"apply": {"allowed_ats": ["greenhouse"], "long_tail": "none"}},
+        {"apply": {
+            "allowed_ats": ["greenhouse", "computer_use"],
+            "long_tail": "none",
+        }},
     )
     assert adapter_none is None, "long_tail='none' must NOT trigger fallback"
 

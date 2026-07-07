@@ -169,8 +169,12 @@ def dispatch(url: str, config: dict) -> "ATSAdapter | None":
             continue
 
     # S20: no per-ATS match. Consider long-tail catch-all.
+    # H11 fix: the fallback is still an ATS adapter and must respect the
+    # apply.allowed_ats gate. If the operator hasn't opted 'computer_use'
+    # into allowed_ats, we do NOT fire the fallback — even when
+    # apply.long_tail == 'computer_use'.
     long_tail = validate_long_tail(_long_tail(config))
-    if long_tail == "computer_use":
+    if long_tail == "computer_use" and "computer_use" in _allowed_ats(config):
         try:
             return _load_adapter("computer_use")
         except (ImportError, AttributeError, AdapterNotFoundError):
