@@ -18,13 +18,12 @@ Design contracts:
 - ``mark_resolved`` updates ``resolution`` + ``resolved_at`` together so
   ``list_open()`` cannot race a half-written row.
 
-Schema note (merge-time follow-up): S5's shipped ``001_init.sql`` currently
-omits ``first_sent_at``, ``repings_sent``, ``filled_at`` and ``resolved_at``
-that master-plan §4.6 + S12's spec require. Because our ``_ensure_schema``
-uses ``CREATE TABLE IF NOT EXISTS`` with the full §4.6 columns, tests pass
-standalone; the integrator must reconcile S5's migration with this schema
-before the shards ship together. See merge-time follow-ups in the writer's
-final report.
+H1 reconciliation (2026-07-07): the ``001_init.sql`` migration is now the
+SINGLE SOURCE OF TRUTH for the ``review_pending`` schema. ReviewStore uses
+``CREATE TABLE IF NOT EXISTS`` with the SAME column definitions so tests can
+still spin up ``:memory:`` or ``tmp_path`` databases without a separate
+migration step, but if a DedupDB migration ran first the CREATE is a no-op
+and the column names line up. See tests/apply/test_h1_schema_reconciliation.py.
 """
 
 from __future__ import annotations
@@ -34,25 +33,25 @@ from pathlib import Path
 from typing import Iterable
 
 
-# ── Schema (master-plan §4.6, with S12's additions) ────────────────
+# ── Schema (must stay byte-identical to ``migrations/001_init.sql``) ────────
 
 _CREATE_REVIEW_PENDING = """
 CREATE TABLE IF NOT EXISTS review_pending (
-    review_id        TEXT PRIMARY KEY,
-    job_url          TEXT NOT NULL,
-    apply_url        TEXT NOT NULL,
-    company          TEXT NOT NULL,
-    role_title       TEXT NOT NULL,
-    ats              TEXT NOT NULL,
-    filled_at        TEXT NOT NULL,
-    screenshot_path  TEXT NOT NULL,
-    trace_path       TEXT,
-    first_sent_at    TEXT NOT NULL,
-    last_repinged_at TEXT,
-    repings_sent     INTEGER NOT NULL DEFAULT 0,
-    gmail_thread_id  TEXT,
-    resolution       TEXT,
-    resolved_at      TEXT
+    review_id           TEXT PRIMARY KEY,
+    job_url             TEXT NOT NULL,
+    apply_url           TEXT NOT NULL,
+    company             TEXT NOT NULL,
+    role_title          TEXT NOT NULL,
+    ats                 TEXT NOT NULL,
+    filled_at           TEXT NOT NULL,
+    screenshot_path     TEXT NOT NULL,
+    trace_path          TEXT,
+    first_sent_at       TEXT NOT NULL,
+    last_repinged_at    TEXT,
+    repings_sent        INTEGER NOT NULL DEFAULT 0,
+    gmail_thread_id     TEXT,
+    resolution          TEXT,
+    resolved_at         TEXT
 )
 """
 

@@ -428,13 +428,21 @@ class DedupDB:
         gmail_thread_id: str | None,
     ) -> None:
         """Insert a row into ``review_pending``. The Gmail review loop (S12)
-        calls this when an apply requires human review."""
+        calls this when an apply requires human review.
+
+        H1 fix: the reconciled schema uses ``filled_at`` and ``first_sent_at``
+        in place of the old ``created_at``. Both fall to _utcnow_iso() here
+        since the row is inserted immediately after the review email is sent.
+        """
+        now = _utcnow_iso()
         with self._connect() as conn, conn:
             conn.execute(
                 "INSERT INTO review_pending ("
                 "review_id, job_url, apply_url, company, role_title, ats, "
-                "screenshot_path, trace_path, gmail_thread_id, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "filled_at, screenshot_path, trace_path, "
+                "first_sent_at, last_repinged_at, repings_sent, "
+                "gmail_thread_id, resolution, resolved_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     review_id,
                     job_url,
@@ -442,10 +450,15 @@ class DedupDB:
                     company,
                     role_title,
                     ats,
+                    now,
                     screenshot_path,
                     trace_path,
+                    now,
+                    None,
+                    0,
                     gmail_thread_id,
-                    _utcnow_iso(),
+                    None,
+                    None,
                 ),
             )
 
@@ -461,13 +474,17 @@ class DedupDB:
         return dict(row) if row is not None else None
 
     def list_pending_reviews(self) -> list[dict]:
-        """Return all rows where ``resolution IS NULL``, oldest first."""
+        """Return all rows where ``resolution IS NULL``, oldest first.
+
+        H1 fix: ordering uses ``first_sent_at`` (post-reconciliation column
+        name) instead of the retired ``created_at``.
+        """
         with self._connect() as conn, conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 "SELECT * FROM review_pending "
                 "WHERE resolution IS NULL "
-                "ORDER BY created_at ASC"
+                "ORDER BY first_sent_at ASC"
             )
             return [dict(row) for row in cur.fetchall()]
 

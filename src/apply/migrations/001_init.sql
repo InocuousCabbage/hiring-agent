@@ -46,6 +46,11 @@ CREATE INDEX IF NOT EXISTS ix_applied_jobs_ats_day
     ON applied_jobs (ats_domain, applied_at);
 
 
+-- H1 fix: this schema is the SINGLE SOURCE OF TRUTH for review_pending.
+-- state_store.py's CRUD writes against these column names. The prior
+-- (12-column) shape drifted from state_store's (15-column) schema and
+-- caused `no such column: first_sent_at` errors on first prod insert.
+-- See tests/apply/test_h1_schema_reconciliation.py.
 CREATE TABLE IF NOT EXISTS review_pending (
     review_id           TEXT PRIMARY KEY,
     job_url             TEXT NOT NULL,
@@ -53,10 +58,13 @@ CREATE TABLE IF NOT EXISTS review_pending (
     company             TEXT NOT NULL,
     role_title          TEXT NOT NULL,
     ats                 TEXT NOT NULL,
+    filled_at           TEXT NOT NULL,      -- when the form was filled (pre-review)
     screenshot_path     TEXT NOT NULL,
     trace_path          TEXT,
+    first_sent_at       TEXT NOT NULL,      -- when the review email was first sent
+    last_repinged_at    TEXT,               -- when we last re-pinged the reviewer
+    repings_sent        INTEGER NOT NULL DEFAULT 0,
     gmail_thread_id     TEXT,
-    resolution          TEXT,           -- e.g. 'submit', 'abort', 'edited'; NULL while pending
-    created_at          TEXT NOT NULL,
-    last_repinged_at    TEXT
+    resolution          TEXT,               -- e.g. 'submitted', 'declined', 'auto_declined'
+    resolved_at         TEXT
 );
