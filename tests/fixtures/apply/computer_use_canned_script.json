@@ -1,0 +1,11 @@
+[
+  {"tool": "screenshot", "args": {}},
+  {"tool": "click", "args": {"coordinate": [180, 220]}},
+  {"tool": "type", "args": {"text": "Jane"}},
+  {"tool": "click", "args": {"coordinate": [180, 260]}},
+  {"tool": "type", "args": {"text": "Doe"}},
+  {"tool": "click", "args": {"coordinate": [180, 300]}},
+  {"tool": "type", "args": {"text": "candidate@example.test"}},
+  {"tool": "screenshot", "args": {}},
+  {"tool": "scroll", "args": {"dx": 0, "dy": 200}}
+]
