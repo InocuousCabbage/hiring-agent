@@ -778,8 +778,29 @@ class GreenhouseAdapter:
             # 05-renderer-contract-audit.md). If BOTH are None, refuse to
             # substitute — passing the RESUME_SENTINEL literal to
             # page.set_input_files() would crash with "no such file".
-            resume_path = getattr(ctx, "resume_path", None)
-            resume_docx_path = getattr(ctx, "resume_docx_path", None)
+            #
+            # H15 fix: Path("") is TRUTHY (PosixPath(".")). We must reject
+            # empty-string paths AND non-existent files, not just falsy ones,
+            # so `resume_path or resume_docx_path` cannot pick a `.` value.
+            def _usable(p):
+                if p is None:
+                    return None
+                try:
+                    pp = Path(p) if not isinstance(p, Path) else p
+                except (TypeError, ValueError):
+                    return None
+                # Path("") → PosixPath("."); reject empty stem.
+                if str(pp) in ("", "."):
+                    return None
+                try:
+                    if not pp.exists():
+                        return None
+                except OSError:
+                    return None
+                return pp
+
+            resume_path = _usable(getattr(ctx, "resume_path", None))
+            resume_docx_path = _usable(getattr(ctx, "resume_docx_path", None))
             upload_path = resume_path or resume_docx_path
             if not upload_path and any(f.value is RESUME_SENTINEL for f in plan):
                 log.warning(
