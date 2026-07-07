@@ -201,17 +201,58 @@ def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult
         log.info("apply.no_adapter", host=_host(job_url))
         return ApplyResult(status="skipped", reason=reason)
 
-    # NOTE: `page=None` is a deliberate S2 placeholder. This skeleton delivers
-    # the soft-fail contract; the real Page comes from S17's seam wiring, which
-    # will open a session via S4 (LocalTransport) or S10 (BrowserbaseTransport)
-    # and pass it in. Any adapter that dereferences `page` under None gets
-    # soft-failed into `status="failed"` by the try/except below — no crash
-    # can escape this function.
+    # H4 fix: open a transport session and pass the real Page to adapter.apply.
+    # get_transport() picks LocalTransport (default) or BrowserbaseTransport
+    # based on config.apply.captcha_transport + apply.browserbase.enabled.
+    # For the initial gate here we pass kind=None (no CAPTCHA detected yet);
+    # if an adapter escalates a CAPTCHA it will surface via its own
+    # captcha_escalated status.
+    from src.apply.transport import get_transport
+
     try:
-        result = adapter.apply(page=None, ctx=ctx)  # type: ignore[arg-type]
-    except Exception as exc:  # noqa: BLE001 — soft-fail all adapter exceptions
+        transport = get_transport(config, kind=None)
+    except Exception as exc:  # noqa: BLE001 — H12 covers graceful fallback; still soft-fail here.
         log.warning(
-            "apply.adapter_exception",
+            "apply.transport_resolve_failed",
+            ats=getattr(adapter, "name", None),
+            host=_host(job_url),
+            reason=_exc_repr(exc),
+        )
+        return ApplyResult(
+            status="failed",
+            ats=getattr(adapter, "name", None),
+            reason=f"transport resolve failed: {_exc_repr(exc)}",
+        )
+
+    # H9: propagate SessionExpiredError to the seam. Every other exception is
+    # soft-failed here so apply_to_job's `never raises` contract holds.
+    from src.apply.base import SessionExpiredError
+
+    try:
+        with transport.open(job_url, storage_state=None) as session:
+            page = getattr(session, "page", None)
+            try:
+                result = adapter.apply(page=page, ctx=ctx)  # type: ignore[arg-type]
+            except SessionExpiredError:
+                raise  # H9: re-raise so the seam catches it and fires notify.
+            except Exception as exc:  # noqa: BLE001 — soft-fail all other adapter exceptions
+                log.warning(
+                    "apply.adapter_exception",
+                    ats=getattr(adapter, "name", None),
+                    host=_host(job_url),
+                    reason=_exc_repr(exc),
+                )
+                return ApplyResult(
+                    status="failed",
+                    ats=getattr(adapter, "name", None),
+                    reason=_exc_repr(exc),
+                )
+    except SessionExpiredError:
+        # H9: never swallow this — the seam's handler owns notify_session_expired.
+        raise
+    except Exception as exc:  # noqa: BLE001 — transport open() failure
+        log.warning(
+            "apply.transport_exception",
             ats=getattr(adapter, "name", None),
             host=_host(job_url),
             reason=_exc_repr(exc),

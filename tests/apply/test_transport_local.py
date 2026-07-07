@@ -76,7 +76,7 @@ def _install_fake_browser(monkeypatch, fake_cm, captured_kwargs: dict):
 
 def test_local_transport_delegates_to_session(monkeypatch):
     """AC #3: LocalTransport.open delegates to browser.session and yields TransportSession."""
-    from apply.transport import LocalTransport, TransportSession
+    from src.apply.transport import LocalTransport, TransportSession
 
     fake_page = MagicMock(name="fake_page")
     fake_cm = _FakeSessionCM(fake_page)
@@ -101,7 +101,7 @@ def test_local_transport_delegates_to_session(monkeypatch):
 
 def test_local_transport_closes_underlying_session_on_exception(monkeypatch):
     """AC #5 shape: exception inside `with` still runs underlying session __exit__."""
-    from apply.transport import LocalTransport
+    from src.apply.transport import LocalTransport
 
     fake_page = MagicMock(name="fake_page")
     fake_cm = _FakeSessionCM(fake_page)
@@ -120,7 +120,7 @@ def test_local_transport_ignores_dict_storage_state_without_error(monkeypatch):
     """LocalTransport accepts (but does not require) a storage_state dict; S17 will
     materialize state for real. This test guarantees the Protocol shape works today
     without crashing on a passed dict."""
-    from apply.transport import LocalTransport
+    from src.apply.transport import LocalTransport
 
     fake_page = MagicMock(name="fake_page")
     fake_cm = _FakeSessionCM(fake_page)

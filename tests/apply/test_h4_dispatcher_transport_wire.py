@@ -23,6 +23,9 @@ class _RealPage:
         self.marker = marker
         self.url = "https://boards.greenhouse.io/example/jobs/12345"
 
+    def goto(self, url):  # LocalTransport calls this after yield
+        self.url = url
+
     def close(self):  # pragma: no cover — defensive
         pass
 

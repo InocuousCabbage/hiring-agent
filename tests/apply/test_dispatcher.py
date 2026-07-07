@@ -57,6 +57,41 @@ def _install_fake_adapter(monkeypatch, adapter_cls):
     monkeypatch.setitem(sys.modules, "src.apply.adapters.greenhouse", greenhouse_mod)
 
 
+class _FakePage:
+    """Minimal stand-in for a Playwright Page."""
+
+    def __init__(self):
+        self.url = ""
+
+    def close(self):  # pragma: no cover
+        pass
+
+
+def _install_fake_transport(monkeypatch):
+    """Patch dispatcher's transport factory to yield a FakePage.
+
+    H4 fix requires dispatcher to open a transport session before adapter.apply.
+    These pre-existing tests exercised the adapter dispatch only — the fake
+    transport keeps them focused on that boundary.
+    """
+    from contextlib import contextmanager
+    import src.apply.transport as transport_mod
+
+    class _FakeTransport:
+        @contextmanager
+        def open(self, url, storage_state):
+            class _FakeSession:
+                page = _FakePage()
+                replay_url = None
+                transport = "local"
+                proxies_enabled = False
+                solve_captchas = False
+
+            yield _FakeSession()
+
+    monkeypatch.setattr(transport_mod, "get_transport", lambda config, kind: _FakeTransport())
+
+
 def _sample_ctx():
     from src.apply.types import ApplyContext
     from tests.fixtures.apply.profile_factory import load_example_profile
@@ -158,6 +193,7 @@ def test_apply_to_job_soft_fails_on_adapter_exception(monkeypatch):
     """Any exception raised inside adapter.apply MUST become status='failed'
     with reason='<ExcType>: <msg>' — never re-raise. (§4 + Q_BB1 addendum)"""
     _install_fake_adapter(monkeypatch, _BoomAdapter)
+    _install_fake_transport(monkeypatch)
     from src.apply.dispatcher import apply_to_job
 
     ctx = _sample_ctx()
@@ -189,6 +225,7 @@ def test_apply_to_job_returns_skipped_when_no_adapter(monkeypatch):
 def test_apply_to_job_returns_apply_result_on_success(monkeypatch):
     """Happy path: adapter returns a submitted result; apply_to_job passes it through."""
     _install_fake_adapter(monkeypatch, _FakeGreenhouseAdapter)
+    _install_fake_transport(monkeypatch)
     from src.apply.dispatcher import apply_to_job
 
     ctx = _sample_ctx()

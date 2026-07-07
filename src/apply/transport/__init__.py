@@ -96,8 +96,8 @@ class Transport(Protocol):
 # takes effect because the class is re-looked-up per call.
 
 _TRANSPORT_REGISTRY: dict[str, tuple[str, str]] = {
-    "local": ("apply.transport.local", "LocalTransport"),
-    "browserbase": ("apply.transport.browserbase", "BrowserbaseTransport"),
+    "local": ("src.apply.transport.local", "LocalTransport"),
+    "browserbase": ("src.apply.transport.browserbase", "BrowserbaseTransport"),
 }
 
 

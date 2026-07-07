@@ -154,7 +154,7 @@ def fake_env(monkeypatch):
 @pytest.fixture
 def patched_transport(monkeypatch, canned_response, call_log, fake_env):
     """Patches both seams: _client_factory + _playwright_factory."""
-    import apply.transport.browserbase as bb_mod
+    import src.apply.transport.browserbase as bb_mod
 
     fake_client = _FakeBrowserbaseClient(canned_response, call_log)
     fake_pw = _FakePlaywright(call_log)
@@ -174,7 +174,7 @@ def patched_transport(monkeypatch, canned_response, call_log, fake_env):
 
 
 def test_browserbase_open_calls_sessions_create_with_locked_settings(patched_transport):
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     transport = BrowserbaseTransport()
     with transport.open("https://x.example.com", None):
@@ -199,7 +199,7 @@ def test_browserbase_open_calls_sessions_create_with_locked_settings(patched_tra
 
 
 def test_browserbase_populates_replay_url(patched_transport, canned_response):
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     transport = BrowserbaseTransport()
     with transport.open("https://x.example.com", None) as ts:
@@ -214,7 +214,7 @@ def test_browserbase_populates_replay_url(patched_transport, canned_response):
 
 
 def test_browserbase_release_called_on_normal_exit(patched_transport):
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     transport = BrowserbaseTransport()
     with transport.open("https://x.example.com", None):
@@ -232,7 +232,7 @@ def test_browserbase_release_called_on_normal_exit(patched_transport):
 
 
 def test_browserbase_release_called_on_exception(patched_transport):
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     transport = BrowserbaseTransport()
     with pytest.raises(RuntimeError, match="boom"):
@@ -252,7 +252,7 @@ def test_browserbase_release_called_on_exception(patched_transport):
 
 
 def test_browserbase_teardown_order(patched_transport):
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     transport = BrowserbaseTransport()
     with transport.open("https://x.example.com", None):
@@ -280,7 +280,7 @@ def test_browserbase_teardown_order(patched_transport):
 
 
 def test_browserbase_seeds_cookies_from_storage_state(patched_transport):
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     cookies = [
         {"name": "gh_session", "value": "abcd1234", "domain": ".greenhouse.io", "path": "/"},
@@ -299,7 +299,7 @@ def test_browserbase_seeds_cookies_from_storage_state(patched_transport):
 
 def test_browserbase_no_cookies_when_storage_state_none(patched_transport):
     """AC #4 boundary: storage_state=None must NOT call context.add_cookies."""
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     transport = BrowserbaseTransport()
     with transport.open("https://x.example.com", None):
@@ -325,7 +325,7 @@ def test_browserbase_import_succeeds_without_env(monkeypatch):
     ]:
         sys.modules.pop(mod, None)
 
-    import apply.transport.browserbase  # noqa: F401 — must succeed
+    import src.apply.transport.browserbase  # noqa: F401 — must succeed
 
 
 def test_browserbase_missing_env_raises_at_open_not_import(monkeypatch):
@@ -333,7 +333,7 @@ def test_browserbase_missing_env_raises_at_open_not_import(monkeypatch):
     monkeypatch.delenv("BROWSERBASE_API_KEY", raising=False)
     monkeypatch.delenv("BROWSERBASE_PROJECT_ID", raising=False)
 
-    from apply.transport import BrowserbaseTransport, TransportConfigError
+    from src.apply.transport import BrowserbaseTransport, TransportConfigError
 
     transport = BrowserbaseTransport()
     with pytest.raises(TransportConfigError):
@@ -345,7 +345,7 @@ def test_browserbase_missing_only_project_id_raises(monkeypatch):
     monkeypatch.setenv("BROWSERBASE_API_KEY", "bb_test_key")
     monkeypatch.delenv("BROWSERBASE_PROJECT_ID", raising=False)
 
-    from apply.transport import BrowserbaseTransport, TransportConfigError
+    from src.apply.transport import BrowserbaseTransport, TransportConfigError
 
     transport = BrowserbaseTransport()
     with pytest.raises(TransportConfigError):
@@ -357,7 +357,7 @@ def test_browserbase_missing_only_project_id_raises(monkeypatch):
 
 
 def test_get_transport_returns_local_when_kind_is_none():
-    from apply.transport import LocalTransport, get_transport
+    from src.apply.transport import LocalTransport, get_transport
 
     cfg = {"apply": {"captcha_transport": "browserbase", "browserbase": {"enabled": True}}}
     t = get_transport(cfg, None)
@@ -365,7 +365,7 @@ def test_get_transport_returns_local_when_kind_is_none():
 
 
 def test_get_transport_returns_browserbase_when_captcha_and_config_allow():
-    from apply.transport import BrowserbaseTransport, get_transport
+    from src.apply.transport import BrowserbaseTransport, get_transport
 
     cfg = {"apply": {"captcha_transport": "browserbase", "browserbase": {"enabled": True}}}
     t = get_transport(cfg, "cloudflare_turnstile")
@@ -373,7 +373,7 @@ def test_get_transport_returns_browserbase_when_captcha_and_config_allow():
 
 
 def test_get_transport_returns_local_when_transport_local():
-    from apply.transport import LocalTransport, get_transport
+    from src.apply.transport import LocalTransport, get_transport
 
     cfg = {"apply": {"captcha_transport": "local", "browserbase": {"enabled": True}}}
     t = get_transport(cfg, "cloudflare_turnstile")
@@ -381,7 +381,7 @@ def test_get_transport_returns_local_when_transport_local():
 
 
 def test_get_transport_returns_local_when_browserbase_disabled():
-    from apply.transport import LocalTransport, get_transport
+    from src.apply.transport import LocalTransport, get_transport
 
     cfg = {"apply": {"captcha_transport": "browserbase", "browserbase": {"enabled": False}}}
     t = get_transport(cfg, "recaptcha_v2")
@@ -390,7 +390,7 @@ def test_get_transport_returns_local_when_browserbase_disabled():
 
 def test_get_transport_reads_config_every_call(monkeypatch):
     """L14: no cached global — mutating config between calls must be honored."""
-    from apply.transport import BrowserbaseTransport, LocalTransport, get_transport
+    from src.apply.transport import BrowserbaseTransport, LocalTransport, get_transport
 
     cfg = {"apply": {"captcha_transport": "browserbase", "browserbase": {"enabled": True}}}
     assert isinstance(get_transport(cfg, "hcaptcha"), BrowserbaseTransport)
@@ -460,7 +460,7 @@ class _StructlogCapture:
 
 def test_log_events_contain_no_pii_keys(patched_transport):
     """AC #11 + L7: opened/released events carry only allowed keys."""
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     cookies = [
         {"name": "gh_session", "value": "SECRETVAL", "domain": ".greenhouse.io", "path": "/"},
@@ -507,7 +507,7 @@ def test_log_events_contain_no_pii_keys(patched_transport):
 def test_no_live_browserbase_http(monkeypatch, patched_transport):
     """Belt-and-suspenders: patch httpx and requests to explode on network call,
     then run the full open/close flow — no exception means no live traffic."""
-    from apply.transport import BrowserbaseTransport
+    from src.apply.transport import BrowserbaseTransport
 
     def _explode(*a, **kw):
         raise AssertionError("LIVE HTTP CALL — test infra leaked past the seam")
