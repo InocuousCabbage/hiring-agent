@@ -305,16 +305,37 @@ def stage_review(
     *,
     filled_count: int = 0,
 ) -> str:
-    """Stage a review: insert a ``review_pending`` row, send the email, and
-    return the ``review_id`` (uuid7).
+    """Stage a review: send the email, insert a ``review_pending`` row with
+    the resulting Gmail thread id, and return the ``review_id`` (uuid7).
 
     ``filled_count`` is passed by the caller (S8's adapter) because the
     frozen ``ApplyResult`` does not carry it. Absent counts default to 0 —
     the body still renders; only the numeric drops to zero.
+
+    H5 fix: ``fast_path_recipient`` is resolved via the same ``env:``-aware
+    resolver S13's notify.py uses. The shipped default ``env:MY_EMAIL`` was
+    previously sent verbatim to Gmail as a literal recipient string, which
+    the API rejected with an invalid-address error AFTER the row had been
+    inserted — leaving a row with a NULL thread id that could never be
+    pinged. The fix also flips the ordering: send FIRST, insert row with the
+    thread id AFTER, so a send failure leaves no orphan pending row.
+
+    H4/M1 fix: ``resume_path``, ``cover_letter_path``, and ``applicant`` are
+    persisted onto the row so the YES-branch re-run can hydrate a real
+    _AutoModeCtx (not the previous hardcoded None trio).
     """
+    from src.apply.notify import _resolve_recipient  # H5: reuse resolver
+
     review_id = _uuid7()
     first_sent_at = _now_iso()
-    label_ids = ensure_labels(gmail, ctx.config)
+
+    # H5/M3 shape reconciliation: ctx.config may be the wrapped `{"apply": ...}`
+    # dict (test-suite convention) OR the inner apply dict (seam convention).
+    # ensure_labels + _resolve_recipient both read the WRAPPED shape, so we
+    # normalize here and pass the wrapped form downstream.
+    _cfg_in = ctx.config if isinstance(ctx.config, dict) else {}
+    wrapped_config = _cfg_in if "apply" in _cfg_in else {"apply": _cfg_in}
+    label_ids = ensure_labels(gmail, wrapped_config)
 
     company = ctx.job.get("company", "")
     role_title = ctx.job.get("role_title") or ctx.job.get("title") or ""
@@ -332,12 +353,46 @@ def stage_review(
     )
 
     screenshot = result.confirmation_screenshot
-    to = ctx.config["apply"].get("fast_path_recipient", "")
 
-    # Insert first (so the DB has a row even if send fails partway); then send;
-    # then attach thread_id on success. If send raises, the row stays without
-    # a thread_id and the poller will treat it as unpingable until the operator
-    # manually re-runs `--force-decline` (a follow-up escape hatch).
+    # H5: resolve `env:MY_EMAIL` (and any other `env:*` value) via the same
+    # helper notify.py uses. Refuses to send when the resolver returns None
+    # so no orphan row lands in the DB with a NULL thread id.
+    to = _resolve_recipient(wrapped_config)
+    if not to:
+        log.warning(
+            "apply.review.recipient_unresolved",
+            ats=ats,
+            review_id=review_id,
+        )
+        raise ValueError(
+            "stage_review: fast_path_recipient is unresolved — cannot send "
+            "review email. Set MY_EMAIL or a literal apply.fast_path_recipient."
+        )
+
+    # Send FIRST so a Gmail-side failure aborts before we touch the DB.
+    attachments = [screenshot] if screenshot else []
+    msg_id, thread_id = gmail.send_with_labels(
+        subject=subject,
+        body=body,
+        to=to,
+        labels=[label_ids["pending"]],
+        attachments=attachments,
+    )
+
+    # Then insert the row with a live thread_id (post-review addition:
+    # resume/cover paths + applicant persist so the YES branch can hydrate).
+    # H4/M1: pull resume/cover paths off ctx; pull applicant off ctx or
+    # config (falling back to bootstrap's getpass.getuser to unify the key).
+    import getpass
+
+    resume_path = getattr(ctx, "resume_path", None)
+    cover_letter_path = getattr(ctx, "cover_letter_path", None)
+    applicant = (
+        getattr(ctx, "applicant", None)
+        or wrapped_config.get("apply", {}).get("user")
+        or getpass.getuser()
+    )
+
     store.insert(
         {
             "review_id": review_id,
@@ -356,21 +411,15 @@ def stage_review(
             "first_sent_at": first_sent_at,
             "last_repinged_at": None,
             "repings_sent": 0,
-            "gmail_thread_id": None,
+            "gmail_thread_id": thread_id,
             "resolution": None,
             "resolved_at": None,
+            # H4/M1 additions (see review_pending migration 002).
+            "resume_path": str(resume_path) if resume_path else None,
+            "cover_letter_path": str(cover_letter_path) if cover_letter_path else None,
+            "applicant": applicant,
         }
     )
-
-    attachments = [screenshot] if screenshot else []
-    msg_id, thread_id = gmail.send_with_labels(
-        subject=subject,
-        body=body,
-        to=to,
-        labels=[label_ids["pending"]],
-        attachments=attachments,
-    )
-    store.set_thread_id(review_id, thread_id)
 
     log.info(
         "apply.review.staged",
@@ -447,6 +496,8 @@ def execute_confirmed_submit(
     session_ctx: Callable[..., Any] | None = None,
     load_state_fn: Callable[[str, str], dict | None] | None = None,
     dedup_db: Any | None = None,
+    resume_path: "Path | None" = None,
+    cover_letter_path: "Path | None" = None,
 ) -> Any:
     """Re-open the browser via S4, re-run the adapter, and record dedup ONLY
     on DOM-verified confirmation.
@@ -496,7 +547,26 @@ def execute_confirmed_submit(
         )
 
     # Load storage_state; write to a temp file S4 can consume; delete post-run.
+    #
+    # M2 fix: bootstrap.wrap_state writes a `{"state": <playwright_state>,
+    # "last_verified": ..., "user": ...}` envelope. Playwright's
+    # ``browser.new_context(storage_state=<path>)`` expects the UNWRAPPED
+    # inner dict (top-level `cookies` + `origins` keys). Previously we
+    # json-dumped the envelope verbatim, and Playwright either restored zero
+    # cookies or raised — the bootstrapped session was effectively unused.
     state = load_state_fn(decision.ats, decision.applicant) if load_state_fn else None
+    if state is not None:
+        # Envelope form → unwrap; already-flat state → pass through.
+        try:
+            from src.apply.bootstrap import unwrap_state  # noqa: E402
+            if isinstance(state, dict) and "state" in state and "last_verified" in state:
+                inner, _lv, _u = unwrap_state(state)
+                state = inner
+        except Exception:  # noqa: BLE001 — malformed envelope shouldn't kill submit
+            log.warning(
+                "apply.review.storage_state_unwrap_failed",
+                review_id=decision.review_id,
+            )
     tmp_path: Path | None = None
     if state:
         fd, name = tempfile.mkstemp(suffix=".storage_state.json")
@@ -521,7 +591,17 @@ def execute_confirmed_submit(
                 # so we get an ``ApplyResult(failed)`` instead of a bare exception.
                 pass
             # NEVER retry adapter.apply (L13). Called exactly once.
-            result = adapter.apply(page, _AutoModeCtx(decision, config))
+            # H4/M3: pass persisted resume/cover paths + unwrapped config so
+            # the adapter can actually complete the upload and honor rate limits.
+            result = adapter.apply(
+                page,
+                _AutoModeCtx(
+                    decision,
+                    config,
+                    resume_path=resume_path,
+                    cover_letter_path=cover_letter_path,
+                ),
+            )
     finally:
         if tmp_path is not None:
             try:
@@ -582,6 +662,15 @@ class _AutoModeCtx:
     (imported lazily so this module remains importable on branches that
     haven't merged S1); if S1 is absent, ``profile`` stays None and the
     adapter's own ``load_profile`` fallback kicks in.
+
+    H4/M1 fix: ``resume_path`` + ``cover_letter_path`` now hydrate from the
+    stored review_pending row (previously hardcoded ``None`` — which caused
+    every YES-confirmed re-submit to fail ``no_resume_available``).
+
+    M3 fix: ``config`` is the UNWRAPPED inner apply-config (previously was
+    the wrapped ``{"apply": ...}`` dict). The greenhouse adapter reads
+    ``ctx.config.get("rate_limit_per_ats_per_day")`` etc. off the inner
+    dict, so passing the wrapper silently ignored the caps.
     """
 
     __slots__ = (
@@ -593,12 +682,27 @@ class _AutoModeCtx:
         "profile",
         "resume_path",
         "cover_letter_path",
+        "dedup",
+        "captcha_detector",
     )
 
-    def __init__(self, decision: Decision, config: dict):
+    def __init__(
+        self,
+        decision: Decision,
+        config: dict,
+        *,
+        resume_path: "Path | None" = None,
+        cover_letter_path: "Path | None" = None,
+    ):
+        # M3: hand the adapter the INNER apply-config dict, unwrapping the
+        # ``{"apply": ...}`` envelope if present (defensive — some callers
+        # already pass the inner dict; keep the wrapper case working too).
+        inner = config.get("apply", config) if isinstance(config, dict) else {}
+        if not isinstance(inner, dict):
+            inner = {}
         self.mode = "auto"
-        self.dry_run = config.get("apply", {}).get("dry_run", False)
-        self.config = config
+        self.dry_run = inner.get("dry_run", False)
+        self.config = inner
         self.applicant = decision.applicant
         self.job = {
             "company": decision.company,
@@ -608,9 +712,19 @@ class _AutoModeCtx:
             "job_url": decision.apply_url,
             "ats": decision.ats,
         }
-        self.resume_path = None  # set by integrator from generated PDF path
-        self.cover_letter_path = None
-        self.profile = _load_profile_or_none(config)
+        # H4: paths flow in from the caller (execute_confirmed_submit reads
+        # them off the review_pending row).
+        self.resume_path = resume_path
+        self.cover_letter_path = cover_letter_path
+        # Profile still lazy-loaded from `profile_path` inside the config —
+        # accept either wrapped or unwrapped (same helper below).
+        self.profile = _load_profile_or_none(config if "apply" in (config or {}) else {"apply": inner})
+        # Adapters read ctx.dedup / ctx.captcha_detector — the ReviewStore
+        # doesn't have a natural place to plumb these on the YES branch, so
+        # they stay None and the adapter's `getattr(ctx, ..., None)`
+        # fallbacks apply (dedup gating still fires via the precheck above).
+        self.dedup = None
+        self.captcha_detector = None
 
 
 def _load_profile_or_none(config: dict) -> Any:
@@ -656,6 +770,97 @@ def _extract_msg_id(msg: dict) -> str | None:
     return msg.get("id") or msg.get("msg_id")
 
 
+def _is_review_own_message(msg: dict) -> bool:
+    """H3: return True when ``msg`` is the review email itself, not a reply.
+
+    Heuristics (any one match — no false positives in the ambiguous body-first-
+    token space):
+      1. Explicit `is_own` / `own` boolean set by the fake client / caller.
+      2. Absence of an ``In-Reply-To`` header (originals lack it; replies
+         carry it).
+      3. Body starts with the review email's structural signature ``Application to``
+         (rendered by ``_render_review_email`` — L7-safe since candidate PII
+         never appears in that body).
+    """
+    if msg.get("is_own") or msg.get("own"):
+        return True
+    headers = msg.get("headers") or {}
+    if isinstance(headers, dict):
+        # Case-insensitive lookup: Gmail returns 'In-Reply-To' but callers
+        # sometimes normalize to lowercase.
+        in_reply_to = None
+        for k, v in headers.items():
+            if k.lower() == "in-reply-to":
+                in_reply_to = v
+                break
+        if in_reply_to is None:
+            body = msg.get("body_text") or msg.get("text") or msg.get("body") or ""
+            if body.lstrip().startswith("Application to "):
+                return True
+    else:
+        # No headers at all — fall back to body prefix test only.
+        body = msg.get("body_text") or msg.get("text") or msg.get("body") or ""
+        if body.lstrip().startswith("Application to "):
+            return True
+    return False
+
+
+def _msg_sort_key(msg: dict) -> tuple:
+    """Return a sort key for latest-wins thread selection.
+
+    Prefers ``internal_date`` (Gmail's ms-precision int) then falls back to
+    numeric portion of the message id. All missing → ``(0, "")`` so an
+    id-less/date-less message loses to any other.
+    """
+    idate = msg.get("internal_date") or msg.get("internalDate") or 0
+    try:
+        idate = int(idate)
+    except (TypeError, ValueError):
+        idate = 0
+    return (idate, str(msg.get("id") or msg.get("msg_id") or ""))
+
+
+def _extract_from(msg: dict) -> str | None:
+    """H1: extract the ``From`` header (or its `from_addr` / `sender` alias) so
+    the poller can drop messages that did NOT come from the authorized replier.
+
+    Returns a bare address without the ``Name <addr>`` decoration when possible.
+    """
+    raw = msg.get("from") or msg.get("from_addr") or msg.get("sender") or ""
+    if not raw:
+        return None
+    # Handle "Display Name <addr@example.com>" — take the address inside <>.
+    if "<" in raw and ">" in raw:
+        try:
+            return raw[raw.index("<") + 1 : raw.index(">")].strip().lower()
+        except ValueError:
+            pass
+    return raw.strip().lower()
+
+
+def _authorized_replier(config: dict) -> str | None:
+    """H1: resolve the address whose YES/NO reply is trusted.
+
+    Uses the same `env:`-aware helper as ``notify._resolve_recipient`` so the
+    shipped default ``env:MY_EMAIL`` maps to $MY_EMAIL at call time. Returns a
+    lowercased bare address, or ``None`` when unresolvable (in which case the
+    caller must FAIL CLOSED — no messages authorized).
+    """
+    try:
+        from src.apply.notify import _resolve_recipient  # noqa: E402
+    except Exception:  # pragma: no cover — defensive
+        return None
+    val = _resolve_recipient(config)
+    if not val:
+        return None
+    if "<" in val and ">" in val:
+        try:
+            val = val[val.index("<") + 1 : val.index(">")]
+        except ValueError:
+            pass
+    return val.strip().lower()
+
+
 def poll_pending_reviews(
     gmail: Any,
     store: "ReviewStore",
@@ -683,6 +888,24 @@ def poll_pending_reviews(
     reping_hours = int(config["apply"].get("review_reping_hours", 24))
     timeout_hours = int(config["apply"].get("review_timeout_hours", 72))
 
+    # H1: resolve the authorized replier ONCE per tick. Messages whose From
+    # header does NOT match are ignored (not parsed as YES/NO). Fail closed
+    # if MY_EMAIL is unresolvable — no messages are trusted, the row waits
+    # for auto-decline instead of being spoofed into submission.
+    authorized = _authorized_replier(config)
+
+    # H3: identify the review email's own thread-anchor message. Under the
+    # single-account default (review sent to self) the first-in-thread
+    # message is the review email itself, and its body's first token is
+    # "Application" → the pre-fix parser resolves AMBIGUOUS every tick and
+    # never sees the real operator YES. The fix picks the LATEST non-self
+    # message in each thread; we distinguish self vs. reply by (a) the
+    # per-row anchor thread_id's original send msg_id (unavailable here since
+    # we only stored thread_id) OR (b) In-Reply-To presence (replies carry
+    # it; originals do not) OR (c) the body's first token being "Application"
+    # (the review email's signature). We use (b)+(c) as fallback in
+    # ``_is_review_own_message`` below.
+
     # Fetch all messages currently under the pending label. Filter to inbox +
     # ``newer_than:4d`` per spec §GREEN-targets — the 4-day window covers the
     # 72h auto-decline horizon with 24h of slack for tick lag. The client's
@@ -690,12 +913,32 @@ def poll_pending_reviews(
     query = f'label:"{pending_label_full}" in:inbox newer_than:4d'
     inbound = gmail.search(query)
 
-    # Index inbound messages by thread_id — the poller resolves BY-ROW, and
-    # the row carries the thread_id we compare against.
+    # Index inbound messages by thread_id, keeping the LATEST non-self,
+    # authorized reply per thread. The pre-fix code stored first-message-wins
+    # which meant the review email's OWN body drove parsing (H3).
     inbound_by_thread: dict[str, dict] = {}
     for msg in inbound:
         tid = _extract_thread_id(msg)
-        if tid and tid not in inbound_by_thread:
+        if not tid:
+            continue
+
+        # H1: skip messages whose From is not the authorized replier.
+        if authorized is not None:
+            sender = _extract_from(msg)
+            if sender is not None and sender != authorized:
+                log.info(
+                    "apply.review.reply_ignored_unauthorized",
+                    thread_id=tid,
+                )
+                continue
+
+        # H3: skip messages that ARE the review email itself.
+        if _is_review_own_message(msg):
+            continue
+
+        # Latest-wins: prefer higher internal_date (or int-convertible id).
+        existing = inbound_by_thread.get(tid)
+        if existing is None or _msg_sort_key(msg) > _msg_sort_key(existing):
             inbound_by_thread[tid] = msg
 
     decisions: list[Decision] = []
@@ -809,8 +1052,29 @@ def _resolve_one(
                 label_ids=label_ids,
                 now=now,
             )
-        # AMBIGUOUS — send clarification, do NOT re-ping, do NOT advance state.
+        # AMBIGUOUS — send ONE clarification per thread, then stay silent
+        # until either a valid YES/NO lands or the 72h timeout fires.
+        #
+        # M12 fix: previously the AMBIGUOUS branch resent the clarification
+        # every poll tick — for a single "maybe tomorrow" reply that's ~144
+        # duplicate emails over the 72h window. The clarified_at column on
+        # review_pending gates the resend.
+        if row.get("clarified_at"):
+            log.info(
+                "apply.review.parsed_ambiguous_skipped",
+                review_id=review_id,
+                thread_id=thread_id,
+                reason="already_clarified",
+            )
+            return None
         gmail.reply_to_thread(thread_id, _AMBIGUOUS_REPLY)
+        try:
+            store.mark_clarified(review_id, _iso(now))
+        except Exception:  # noqa: BLE001 — never block on state persistence
+            log.warning(
+                "apply.review.mark_clarified_failed",
+                review_id=review_id,
+            )
         log.info(
             "apply.review.parsed_ambiguous",
             review_id=review_id,
@@ -866,7 +1130,17 @@ def _handle_yes(
         thread_id=decision.thread_id,
     )
 
-    result = execute_confirmed_submit(decision, adapter, config)
+    # H4: hydrate persisted resume/cover paths from the row (previously the
+    # YES branch always sent None/None to the adapter → `no_resume_available`).
+    resume_path_str = row.get("resume_path")
+    cover_path_str = row.get("cover_letter_path")
+    result = execute_confirmed_submit(
+        decision,
+        adapter,
+        config,
+        resume_path=Path(resume_path_str) if resume_path_str else None,
+        cover_letter_path=Path(cover_path_str) if cover_path_str else None,
+    )
     submit_ok = getattr(result, "status", None) == "submitted"
 
     if submit_ok:
