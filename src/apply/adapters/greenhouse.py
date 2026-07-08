@@ -862,43 +862,67 @@ class GreenhouseAdapter:
         # gate misses and the follow-up record() at end-of-flow raises
         # AlreadyAppliedError, previously swallowed silently → double-apply.
         #
-        # iter2-H1: FAIL CLOSED on exception. Pre-fix `except Exception:
-        # hit = False` was fail-OPEN — a broken DB would let a duplicate
-        # slip through. Consistent with H8's fail-closed policy at Gate-3.
+        # iter3-B1: `ctx.dedup=None` is INTENTIONAL on two paths — the
+        # YES-branch replay via `review._AutoModeCtx` (execute_confirmed_submit
+        # owns the was_applied precheck; all adapter gates are meant to
+        # bypass) AND the seam's H7 dedup-init-fail-closed path (dedup is
+        # unavailable + mode is forced to review). Both paths must skip
+        # Gate-1 cleanly. Pre-iter3, iter2-H1's `except Exception` caught
+        # the AttributeError from `None.was_applied(...)` and set hit=True
+        # → adapter returned phantom `already_applied` → M4 reconciled the
+        # YES-branch as 'submitted' with no ATS click, AND the H7 path
+        # skipped stage_review (already_applied not in _STAGE_STATUSES),
+        # so the operator never saw a review email.
         #
-        # iter2-H2: pass `applicant` kwarg so cross-user leaks are closed
-        # at the adapter's own gate too (not just execute_confirmed_submit).
-        # Best-effort: fall back to positional-only call if the dedup
-        # surface doesn't accept the kwarg (older test doubles).
+        # iter2-H1: FAIL CLOSED on GENUINE exception (real dedup surface,
+        # DB error). Return status='skipped' with reason='dedup_check_failed'
+        # so the legacy digest's Skipped section surfaces it — distinct
+        # from status='already_applied' (real hit) so operators can tell
+        # a "we don't know" from a "we know it's applied".
+        #
+        # iter2-H2: pass `applicant` kwarg (with TypeError fallback for
+        # legacy doubles).
         _ats_domain_gate1 = _extract_ats_domain(apply_url)
         _ats_job_id_gate1 = _extract_ats_job_id(apply_url)
-        try:
+        if ctx.dedup is None:
+            # iter3-B1: intentional pass-through — caller owns dedup.
+            hit = False
+        else:
             try:
-                hit = ctx.dedup.was_applied(
-                    company,
-                    _ats_domain_gate1,
-                    _ats_job_id_gate1,
-                    apply_url,
-                    applicant=applicant or None,
+                try:
+                    hit = ctx.dedup.was_applied(
+                        company,
+                        _ats_domain_gate1,
+                        _ats_job_id_gate1,
+                        apply_url,
+                        applicant=applicant or None,
+                    )
+                except TypeError:
+                    # Older test doubles without the applicant kwarg.
+                    hit = ctx.dedup.was_applied(
+                        company,
+                        _ats_domain_gate1,
+                        _ats_job_id_gate1,
+                        apply_url,
+                    )
+            except Exception as exc:  # noqa: BLE001 — fail-CLOSED per iter2-H1
+                log.warning(
+                    "apply.gate1_dedup_check_failed_fail_closed",
+                    extra={
+                        "ats": self.name,
+                        "exc_type": type(exc).__name__,
+                    },
                 )
-            except TypeError:
-                # Older test doubles without the applicant kwarg.
-                hit = ctx.dedup.was_applied(
-                    company,
-                    _ats_domain_gate1,
-                    _ats_job_id_gate1,
-                    apply_url,
+                # iter3: return skipped/dedup_check_failed so the legacy
+                # digest Skipped section surfaces it — distinct from the
+                # true `already_applied` outcome below so operators can
+                # triage broken-DB events versus real duplicates.
+                return ApplyResult(
+                    status="skipped",
+                    ats=self.name,
+                    apply_url=apply_url,
+                    reason=f"dedup_check_failed: {type(exc).__name__}",
                 )
-        except Exception as exc:  # noqa: BLE001 — fail-CLOSED per iter2-H1
-            log.warning(
-                "apply.gate1_dedup_check_failed_fail_closed",
-                extra={
-                    "ats": self.name,
-                    "exc_type": type(exc).__name__,
-                },
-            )
-            # iter2-H1: fail-closed = assume applied (safer than double-apply).
-            hit = True
         if hit:
             log.info("apply.dedup_hit", extra={"ats": self.name})
             return ApplyResult(
@@ -912,10 +936,33 @@ class GreenhouseAdapter:
         # (e.g. 'boards.greenhouse.io'), NOT adapter.name ('greenhouse') —
         # same shape mismatch H5 fixed on was_applied. Passing self.name
         # made the query always return 0 → rate limit inoperative.
-        try:
-            today_count = ctx.dedup.count_today(_extract_ats_domain(apply_url))
-        except Exception:
+        #
+        # iter3-B1: same dedup=None handling as Gate-1 — intentional pass
+        # through on YES-branch replay / H7 fail-closed. Otherwise
+        # count_today would AttributeError.
+        if ctx.dedup is None:
             today_count = 0
+        else:
+            try:
+                today_count = ctx.dedup.count_today(_extract_ats_domain(apply_url))
+            except Exception as exc:  # noqa: BLE001
+                # iter3-M1: on a genuine dedup exception, fail-closed to
+                # skipped/rate_limit_check_failed (consistent with Gate-1's
+                # dedup_check_failed). Better to skip than double-submit or
+                # blow the rate cap.
+                log.warning(
+                    "apply.gate2_rate_check_failed_fail_closed",
+                    extra={
+                        "ats": self.name,
+                        "exc_type": type(exc).__name__,
+                    },
+                )
+                return ApplyResult(
+                    status="skipped",
+                    ats=self.name,
+                    apply_url=apply_url,
+                    reason=f"rate_limit_check_failed: {type(exc).__name__}",
+                )
         cap = int(ctx.config.get("rate_limit_per_ats_per_day", 10) or 10)
         if today_count >= cap:
             log.info(
