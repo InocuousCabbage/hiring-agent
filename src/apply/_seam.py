@@ -137,6 +137,37 @@ def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> li
             pass
 
 
+def _call_stage_review(
+    *,
+    result: Any,
+    ctx: Any,
+    gmail: Any,
+    config: dict,
+) -> str:
+    """B1 seam boundary for review.stage_review.
+
+    Constructs a ReviewStore anchored on the same DB path DedupDB anchors on
+    (repo-root-anchored via ``_resolve_db_path``), and delegates to
+    stage_review. Returns the newly staged review_id.
+
+    Kept as a `_call_*` indirection so tests can patch the boundary without
+    dragging the entire review-loop import graph into the collection step.
+    """
+    from src.apply.dedup import _resolve_db_path
+    from src.apply.review import stage_review
+    from src.apply.state_store import ReviewStore
+
+    db_path = _resolve_db_path(config)
+    store = ReviewStore(db_path)
+    try:
+        return stage_review(result, ctx, gmail, store)
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001 — teardown never-blocking
+            pass
+
+
 def _call_apply_to_job(*, job_url: str, ctx: Any, config: dict) -> "ApplyResult | None":
     from src.apply.dispatcher import apply_to_job
 
@@ -236,6 +267,7 @@ def run_for_job(
     job_log: Any,
     resume_docx_path: Path | None = None,
     cover_letter_docx_path: Path | None = None,
+    gmail_client: Any | None = None,
 ) -> "ApplyResult | None":
     """Called PER JOB after the HM-lookup block, before ``processed.append``.
 
@@ -300,6 +332,42 @@ def run_for_job(
         )
         job_url = job.get("ats_apply_url") or job.get("url", "") or ""
         result = _call_apply_to_job(job_url=job_url, ctx=ctx, config=apply_config)
+
+        # B1: wire stage_review into the review-mode path. When the adapter
+        # returns a status the review loop is meant to gate on, insert a
+        # review_pending row + send the review email. Previously stage_review
+        # was defined but had zero production callers → every review-required
+        # application silently dead-ended.
+        _STAGE_STATUSES = {"review_required", "soft_dup_warn", "captcha_escalated"}
+        if (
+            result is not None
+            and getattr(result, "status", None) in _STAGE_STATUSES
+            and gmail_client is not None
+        ):
+            try:
+                _call_stage_review(
+                    result=result,
+                    ctx=ctx,
+                    gmail=gmail_client,
+                    config=apply_config,
+                )
+            except Exception as stage_exc:  # noqa: BLE001 — never-blocking
+                job_log.warning(
+                    "apply.review.stage_failed",
+                    error=str(stage_exc),
+                    status=getattr(result, "status", None),
+                )
+        elif (
+            result is not None
+            and getattr(result, "status", None) in _STAGE_STATUSES
+            and gmail_client is None
+        ):
+            # No gmail client available (e.g. --test mode) — log and continue.
+            job_log.info(
+                "apply.review.stage_skipped_no_gmail_client",
+                status=getattr(result, "status", None),
+            )
+
         return result
     except SessionExpiredError as exc:
         try:

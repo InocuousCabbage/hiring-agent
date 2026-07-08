@@ -51,9 +51,26 @@ CREATE TABLE IF NOT EXISTS review_pending (
     repings_sent        INTEGER NOT NULL DEFAULT 0,
     gmail_thread_id     TEXT,
     resolution          TEXT,
-    resolved_at         TEXT
+    resolved_at         TEXT,
+    resume_path         TEXT,
+    cover_letter_path   TEXT,
+    applicant           TEXT,
+    clarified_at        TEXT
 )
 """
+
+# H4/M1/M12 additive columns: resume_path, cover_letter_path, applicant,
+# clarified_at. Older DBs (created by migration 001) predate these columns —
+# we ALTER them in on-open so both fresh CREATEs and old CREATEs converge on
+# the same shape. ADDs are idempotent-ish: sqlite raises on duplicate columns,
+# which we catch and ignore.
+_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("resume_path", "TEXT"),
+    ("cover_letter_path", "TEXT"),
+    ("applicant", "TEXT"),
+    ("clarified_at", "TEXT"),
+)
+
 
 _INSERT_COLUMNS: tuple[str, ...] = (
     "review_id",
@@ -71,6 +88,10 @@ _INSERT_COLUMNS: tuple[str, ...] = (
     "gmail_thread_id",
     "resolution",
     "resolved_at",
+    "resume_path",
+    "cover_letter_path",
+    "applicant",
+    "clarified_at",
 )
 
 
@@ -104,6 +125,17 @@ class ReviewStore:
     def _ensure_schema(self) -> None:
         with self._conn:
             self._conn.execute(_CREATE_REVIEW_PENDING)
+            # Idempotent add of the H4/M1/M12 additive columns for DBs that
+            # were created by an earlier CREATE (pre-Phase 1). Each ALTER
+            # raises on duplicate — we catch and continue.
+            for col, sqltype in _ADDITIVE_COLUMNS:
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE review_pending ADD COLUMN {col} {sqltype}"
+                    )
+                except sqlite3.OperationalError:
+                    # Column already exists — expected on Phase 1 fresh CREATEs.
+                    pass
 
     # ── CRUD ───────────────────────────────────────────────────────
 
@@ -166,4 +198,16 @@ class ReviewStore:
             self._conn.execute(
                 "UPDATE review_pending SET gmail_thread_id = ? WHERE review_id = ?",
                 (thread_id, review_id),
+            )
+
+    def mark_clarified(self, review_id: str, at: str) -> None:
+        """M12: record that we've sent a clarification reply on this thread so
+        the next poll tick can skip the resend. Idempotent by design: the
+        `clarified_at` column is a bare timestamp — the guard in review.py's
+        AMBIGUOUS branch checks for non-NULL and short-circuits.
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE review_pending SET clarified_at = ? WHERE review_id = ?",
+                (at, review_id),
             )

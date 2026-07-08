@@ -211,10 +211,44 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 _MIGRATION_SQL_PATH = Path(__file__).parent / "migrations" / "001_init.sql"
+# Phase 1 (H4/M1/M12) additive columns. Kept as a separate migration file so
+# `test_h1_schema_reconciliation.py`'s byte-shape of 001 remains stable.
+_MIGRATION_002_SQL_PATH = Path(__file__).parent / "migrations" / "002_review_pending_paths.sql"
 
 
 def _load_schema_sql() -> str:
-    return _MIGRATION_SQL_PATH.read_text(encoding="utf-8")
+    parts: list[str] = [_MIGRATION_SQL_PATH.read_text(encoding="utf-8")]
+    # 002 uses ALTER TABLE ADD COLUMN which sqlite has no IF NOT EXISTS for.
+    # Split into individual statements and swallow duplicate-column errors so
+    # the migration is safe on both a fresh DB (columns get added) AND an
+    # already-migrated DB (each ADD raises OperationalError — logged and
+    # ignored below in the caller via a per-statement try). The `_load` step
+    # here just concatenates; the caller `DedupDB.__init__` handles the guard.
+    if _MIGRATION_002_SQL_PATH.exists():
+        parts.append(_MIGRATION_002_SQL_PATH.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
+def _execute_migrations(conn: sqlite3.Connection) -> None:
+    """Run 001 as a script (idempotent CREATE IF NOT EXISTS), then run each
+    ADD COLUMN statement from 002 individually so we can swallow the
+    duplicate-column OperationalError that sqlite raises on ALREADY-added
+    columns. Keeps the migration idempotent across cold + warm starts.
+    """
+    conn.executescript(_MIGRATION_SQL_PATH.read_text(encoding="utf-8"))
+    if not _MIGRATION_002_SQL_PATH.exists():
+        return
+    raw = _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8")
+    for stmt in [s.strip() for s in raw.split(";") if s.strip()]:
+        # Skip comment-only lines (executescript would tolerate them; single
+        # execute() does too — this filter is just for the split artifact).
+        if stmt.startswith("--") or not stmt:
+            continue
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            # Column already exists (warm start) — expected + safe.
+            pass
 
 
 # ── DedupDB ──────────────────────────────────────────────────────────────────
@@ -253,9 +287,10 @@ class DedupDB:
         # First connect creates the file. Guarantee close on all paths via
         # `_connect()` (`contextlib.closing` around sqlite3.connect).
         with self._connect() as conn, conn:
-            # `executescript` is idempotent because every CREATE uses
-            # IF NOT EXISTS.
-            conn.executescript(_load_schema_sql())
+            # `_execute_migrations` runs 001 (idempotent CREATE IF NOT EXISTS)
+            # then applies each 002 ALTER individually, swallowing
+            # duplicate-column OperationalErrors so warm starts are safe.
+            _execute_migrations(conn)
 
         if not pre_existed:
             try:
