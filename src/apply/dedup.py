@@ -242,67 +242,163 @@ def _strip_sql_comments(raw: str) -> str:
     return "\n".join(kept)
 
 
-def _execute_migrations(conn: sqlite3.Connection) -> None:
-    """Run 001 as a script (idempotent CREATE IF NOT EXISTS), then run each
-    ADD COLUMN statement from 002 individually so we can swallow the
-    duplicate-column OperationalError that sqlite raises on ALREADY-added
-    columns, then run 003 statement-by-statement (H9 hard-dedup index swap).
-    Keeps the migration idempotent across cold + warm starts.
-    """
-    conn.executescript(_MIGRATION_SQL_PATH.read_text(encoding="utf-8"))
-    if _MIGRATION_002_SQL_PATH.exists():
-        raw = _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8")
-        # SD1 fix: strip `--` comments BEFORE splitting on `;`. The pre-fix
-        # code split first and used `stmt.startswith("--")` as a skip-guard —
-        # but the split delivered a chunk that contained the file's header
-        # comments PLUS the first ALTER, whose first character was `-`. That
-        # skipped `ADD COLUMN resume_path` entirely; only warm starts saw the
-        # column (because ReviewStore.__init__ also ALTERed via its own path).
-        stripped = _strip_sql_comments(raw)
-        for stmt in (s.strip() for s in stripped.split(";")):
-            if not stmt:
-                continue
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError as exc:
-                # Duplicate column on a warm start — expected + safe. Any
-                # other OperationalError (locked DB, no such table, disk I/O,
-                # malformed DB) is a real fault we DO want to see: re-raise
-                # so the caller doesn't silently continue against a partially-
-                # migrated schema.
-                msg = str(exc).lower()
-                if "duplicate column" in msg or "already exists" in msg:
-                    continue
-                raise
+# xhigh-H11: SQLite emits idempotent-DDL errors in a small set of well-known
+# shapes. Pre-fix matched on the bare 'already exists' substring which
+# false-positived on unrelated errors like 'output file already exists' from
+# a disk I/O failure. Post-fix uses regex anchors on the SQLite-specific
+# phrasing so unrelated errors propagate unswallowed.
+_IDEMPOTENT_DDL_ERROR_RE = re.compile(
+    r"("
+    r"duplicate column name"       # ALTER TABLE ADD COLUMN idempotent
+    r"|(?:^|\W)index \S+ already exists"   # CREATE INDEX IF NOT EXISTS re-run
+    r"|(?:^|\W)table \S+ already exists"   # CREATE TABLE IF NOT EXISTS re-run
+    r"|(?:^|\W)trigger \S+ already exists" # CREATE TRIGGER IF NOT EXISTS re-run
+    r"|(?:^|\W)view \S+ already exists"    # CREATE VIEW IF NOT EXISTS re-run
+    r"|no such index"              # DROP INDEX IF EXISTS on absent index
+    r")",
+    re.IGNORECASE,
+)
 
-    if not _MIGRATION_003_SQL_PATH.exists():
-        return
-    # 003 is H9: swap the HARD UNIQUE index from (company, ats_domain,
-    # ats_job_id) to (ats_domain, ats_job_id). Statement-by-statement so
-    # idempotent DDL (CREATE ... IF NOT EXISTS re-run, DROP ... IF EXISTS on
-    # a fresh DB) is safe on both cold and warm starts. The DELETE step is a
-    # one-shot cleanup — on a warm start it's effectively a no-op because
-    # the new UNIQUE index (ux_applied_jobs_hard_v2) already prevents any
-    # further (ats_domain, ats_job_id) collisions.
-    raw_003 = _MIGRATION_003_SQL_PATH.read_text(encoding="utf-8")
-    stripped_003 = _strip_sql_comments(raw_003)
-    for stmt in (s.strip() for s in stripped_003.split(";")):
+
+def _is_idempotent_ddl_error(exc: sqlite3.OperationalError) -> bool:
+    """xhigh-H11: tightened match. True iff the OperationalError is one of
+    the specific SQLite idempotent-DDL variants — NOT any error whose
+    message loosely contains 'already exists'.
+    """
+    return bool(_IDEMPOTENT_DDL_ERROR_RE.search(str(exc)))
+
+
+def _apply_migration_statements(
+    conn: sqlite3.Connection,
+    raw: str,
+    *,
+    swallow_idempotent: bool = True,
+) -> None:
+    """Execute a migration SQL string statement-by-statement.
+
+    xhigh-H10: NEVER call ``executescript`` — it implicitly commits the outer
+    transaction, which breaks a caller-supplied BEGIN..ROLLBACK boundary.
+    Per-statement execution keeps everything atomic within the caller's
+    transaction so a partial failure rolls back cleanly.
+
+    xhigh-H11: when ``swallow_idempotent`` is True, only OperationalError
+    variants matching ``_IDEMPOTENT_DDL_ERROR_PATTERNS`` are swallowed — any
+    other error propagates so partially-migrated state doesn't go undetected.
+    """
+    stripped = _strip_sql_comments(raw)
+    for stmt in (s.strip() for s in stripped.split(";")):
         if not stmt:
             continue
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError as exc:
-            # Idempotent-DDL guard: index already exists, no such index (DROP
-            # on a fresh DB where old index never existed), or duplicate
-            # column. Anything else is a real fault — re-raise so we don't
-            # limp along with a broken schema.
-            msg = str(exc).lower()
-            if (
-                "already exists" in msg
-                or "no such index" in msg
-                or "duplicate column" in msg
-            ):
+            if swallow_idempotent and _is_idempotent_ddl_error(exc):
                 continue
+            raise
+
+
+# xhigh-H6: schema_migrations tracker so destructive migration steps only
+# fire on the first apply. The table itself is bootstrapped inside the same
+# transaction (CREATE IF NOT EXISTS) and each migration id is INSERTed with
+# INSERT OR IGNORE so re-application is a no-op.
+_SCHEMA_MIGRATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS schema_migrations ("
+    "  migration_id TEXT PRIMARY KEY,"
+    "  applied_at   TEXT NOT NULL"
+    ")"
+)
+
+
+def _migration_already_applied(conn: sqlite3.Connection, migration_id: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ? LIMIT 1",
+        (migration_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def _record_migration_applied(conn: sqlite3.Connection, migration_id: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) "
+        "VALUES (?, ?)",
+        (migration_id, _utcnow_iso()),
+    )
+
+
+def _execute_migrations(conn: sqlite3.Connection) -> None:
+    """Apply 001 + 002 + 003 statement-by-statement inside a single caller-
+    controlled transaction (xhigh-H10). 003's destructive DELETE step is
+    gated by ``schema_migrations`` so it fires exactly once per DB
+    (xhigh-H6). Idempotent across cold + warm starts.
+    """
+    # 001 — canonical schema. Runs statement-by-statement so a caller
+    # BEGIN..ROLLBACK stays atomic (xhigh-H10). Errors like "table already
+    # exists" are the warm-start no-op signal.
+    _apply_migration_statements(
+        conn, _MIGRATION_SQL_PATH.read_text(encoding="utf-8"),
+    )
+
+    # Bootstrap the migration tracker BEFORE reading it below.
+    conn.execute(_SCHEMA_MIGRATIONS_DDL)
+
+    # 002 — additive columns (review_pending resume/cover/applicant/etc.).
+    if _MIGRATION_002_SQL_PATH.exists():
+        _apply_migration_statements(
+            conn, _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8"),
+        )
+        _record_migration_applied(conn, "002_review_pending_paths")
+
+    # 003 — H9 hard-dedup index swap + one-shot DELETE. The DELETE is
+    # xhigh-H6-gated by schema_migrations so it can NEVER re-run and
+    # partitions by applicant so multi-user rows are not clobbered.
+    if _MIGRATION_003_SQL_PATH.exists():
+        _apply_migration_003_gated(conn)
+
+
+def _apply_migration_003_gated(conn: sqlite3.Connection) -> None:
+    """Apply migration 003 in two phases:
+
+    Phase 1 (xhigh-H6 one-shot): the destructive DELETE runs iff the
+    ``003_normalized_hard_dedup`` marker is absent from ``schema_migrations``.
+    The DELETE partition also includes ``applicant`` so multi-user rows at
+    the same (ats_domain, ats_job_id) are preserved.
+
+    Phase 2 (idempotent-DDL): the CREATE/DROP INDEX statements are always
+    reapplied — they're already no-ops on warm starts (CREATE ... IF NOT
+    EXISTS + DROP ... IF EXISTS).
+    """
+    marker = "003_normalized_hard_dedup"
+    if not _migration_already_applied(conn, marker):
+        # xhigh-H6: applicant-aware partition. Keep the earliest row PER
+        # (applicant, ats_domain, ats_job_id) rather than globally per
+        # (ats_domain, ats_job_id) — otherwise applicant B's row at the
+        # same posting as applicant A's would be silently discarded.
+        conn.execute(
+            "DELETE FROM applied_jobs "
+            "WHERE ats_domain IS NOT NULL "
+            "  AND ats_job_id IS NOT NULL "
+            "  AND id NOT IN ("
+            "      SELECT MIN(id) FROM applied_jobs "
+            "      WHERE ats_domain IS NOT NULL AND ats_job_id IS NOT NULL "
+            "      GROUP BY applicant, ats_domain, ats_job_id"
+            "  )"
+        )
+        _record_migration_applied(conn, marker)
+
+    # Idempotent index DDL. Runs on every open so the constraint is always
+    # in place even if the marker row somehow existed without the index.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_applied_jobs_hard_v2 "
+            "ON applied_jobs (ats_domain, ats_job_id)"
+        )
+    except sqlite3.OperationalError as exc:
+        if not _is_idempotent_ddl_error(exc):
+            raise
+    try:
+        conn.execute("DROP INDEX IF EXISTS ux_applied_jobs_hard")
+    except sqlite3.OperationalError as exc:
+        if not _is_idempotent_ddl_error(exc):
             raise
 
 
@@ -377,6 +473,8 @@ class DedupDB:
         ats_domain: str | None,
         ats_job_id: str | None,
         job_url: str,
+        *,
+        applicant: str | None = None,
     ) -> bool:
         """True iff a prior row matches the HARD posting identity
         ``(ats_domain, ats_job_id)``, OR (fallback) the exact ``job_url`` when
@@ -390,21 +488,42 @@ class DedupDB:
         posting slip through the gate. The 003 UNIQUE index
         ``ux_applied_jobs_hard_v2`` enforces the same shape at the write
         site.
+
+        xhigh-H7/H13: ``applicant`` is a keyword-only filter that gates
+        cross-user leaks — applicant A's YES-branch precheck must NOT match
+        applicant B's row on the same posting. When ``applicant`` is None
+        (backward-compat) the filter is skipped.
         """
         try:
             with self._connect() as conn, conn:
                 if ats_domain and ats_job_id:
-                    cur = conn.execute(
-                        "SELECT 1 FROM applied_jobs "
-                        "WHERE ats_domain = ? AND ats_job_id = ? "
-                        "LIMIT 1",
-                        (ats_domain, ats_job_id),
-                    )
+                    if applicant is not None:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs "
+                            "WHERE ats_domain = ? AND ats_job_id = ? "
+                            "  AND applicant = ? "
+                            "LIMIT 1",
+                            (ats_domain, ats_job_id, applicant),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs "
+                            "WHERE ats_domain = ? AND ats_job_id = ? "
+                            "LIMIT 1",
+                            (ats_domain, ats_job_id),
+                        )
                 else:
-                    cur = conn.execute(
-                        "SELECT 1 FROM applied_jobs WHERE job_url = ? LIMIT 1",
-                        (job_url,),
-                    )
+                    if applicant is not None:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs "
+                            "WHERE job_url = ? AND applicant = ? LIMIT 1",
+                            (job_url, applicant),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs WHERE job_url = ? LIMIT 1",
+                            (job_url,),
+                        )
                 return cur.fetchone() is not None
         except sqlite3.Error:
             # Contract: never raises. If the DB is unavailable, treat as

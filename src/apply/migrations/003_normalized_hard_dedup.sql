@@ -5,22 +5,33 @@
 -- vs 'Acme, Inc.') at the same posting now hits both the was_applied gate
 -- AND the UNIQUE constraint.
 --
+-- NOTE (xhigh-H6): this file is kept for reference — the migration is
+-- actually applied programmatically by
+-- ``src/apply/dedup.py::_apply_migration_003_gated`` so:
+--   (a) the destructive DELETE is gated by the ``schema_migrations`` marker
+--       table and can only fire ONCE per DB.
+--   (b) the DELETE partition includes ``applicant`` so multi-user rows at
+--       the same (ats_domain, ats_job_id) posting survive.
+--   (c) both index steps stay idempotent via IF NOT EXISTS / IF EXISTS.
+--
 -- See .agent/codebase-audit-2026-07-08.md Group C / finding H9 and
 -- tests/apply/integration/test_dedup_fail_closed.py::
---   test_h9_hard_dedup_normalized_survives_company_spelling_variance.
+--   test_h9_hard_dedup_normalized_survives_company_spelling_variance,
+--   tests/apply/integration/test_phase2_xhigh_fixes.py::
+--   test_migration_003_delete_gated_by_migrations_table,
+--   test_migration_003_delete_does_not_clobber_multi_applicant_rows.
 
--- 1. De-duplicate any pre-existing rows on (ats_domain, ats_job_id) so the
---    new UNIQUE index can be created without violation. Keep the earliest row
---    per (ats_domain, ats_job_id) pair. NULL-triples are left untouched —
---    SQLite treats NULL as distinct from NULL under UNIQUE, so job_url-only
---    fallback rows never collide with each other.
+-- 1. Applicant-aware de-duplication. Keep the earliest row PER
+--    (applicant, ats_domain, ats_job_id) tuple so applicant B's row at the
+--    same posting as applicant A's is preserved. Runs ONCE per DB — gated
+--    by the ``schema_migrations`` marker in ``_apply_migration_003_gated``.
 DELETE FROM applied_jobs
 WHERE ats_domain IS NOT NULL
   AND ats_job_id IS NOT NULL
   AND id NOT IN (
       SELECT MIN(id) FROM applied_jobs
       WHERE ats_domain IS NOT NULL AND ats_job_id IS NOT NULL
-      GROUP BY ats_domain, ats_job_id
+      GROUP BY applicant, ats_domain, ats_job_id
   );
 
 -- 2. Create the new UNIQUE index. Idempotent via IF NOT EXISTS.
