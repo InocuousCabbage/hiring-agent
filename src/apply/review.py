@@ -1236,7 +1236,15 @@ def _handle_yes(
         cover_letter_path=Path(cover_path_str) if cover_path_str else None,
     )
     status = getattr(result, "status", None)
-    submit_ok = status == "submitted"
+    # M4: `already_applied` from the was_applied precheck inside
+    # execute_confirmed_submit means we crashed between the ATS submit
+    # (dedup.record landed in applied_jobs) and mark_resolved (review_pending)
+    # on a prior tick. The real application IS out at the ATS — reconcile as
+    # submitted rather than leaving the row pending to be auto_declined for
+    # a real submission. The `store.mark_resolved` call below (single write
+    # path per L3) overwrites the interim 'claiming' resolution with
+    # 'submitted' as the final state.
+    submit_ok = status in ("submitted", "already_applied")
 
     if submit_ok:
         resolved_at = _iso(now)
