@@ -500,3 +500,75 @@ def test_review_pending_roundtrip(tmp_path):
         assert key in row, f"expected key {key!r} in review_pending row; got {row!r}"
     assert row["review_id"] == review_id
     assert row["job_url"] == "https://boards.greenhouse.io/acme/jobs/99"
+
+
+# ── db_path resolution (CWD split-brain guard) ──────────────────────────────
+
+
+def test_dedup_db_path_resolves_relative_default_against_repo_root(tmp_path, monkeypatch):
+    """Regression guard: config-defaulted ``dedup_db_path`` must resolve against
+    the repo root, not CWD.
+
+    Bug: a naive ``Path("state/applied_jobs.db")`` is CWD-relative. Running the
+    pipeline from repo root today and from a different CWD tomorrow (cron w/ a
+    different working dir) creates TWO separate SQLite DBs — job applied via DB
+    A can be re-submitted through DB B, silent double-apply.
+    """
+    from src.apply.dedup import _resolve_db_path
+
+    monkeypatch.chdir(tmp_path)  # simulate running from a different CWD
+    resolved = _resolve_db_path({"apply": {}})  # use default fallback
+
+    # The resolved path must be ABSOLUTE and rooted at the repo, not at tmp_path.
+    assert resolved.is_absolute(), f"expected absolute path; got {resolved!r}"
+    assert resolved.name == "applied_jobs.db"
+    assert resolved.parent.name == "state"
+    # tmp_path (the simulated foreign CWD) must NOT appear in the resolved path.
+    assert str(tmp_path) not in str(resolved), (
+        f"resolved leaked CWD (would cause split-brain DB): {resolved}"
+    )
+    # Default fallback is 'state/applied_jobs.db' — 2 components — so the
+    # repo-root anchor sits at parents[1] (parents[0] is 'state/').
+    assert resolved.parents[1] == ROOT, (
+        f"expected repo-root anchor {ROOT}; got parents[1]={resolved.parents[1]}"
+    )
+
+
+def test_dedup_db_path_absolute_config_value_is_preserved(tmp_path, monkeypatch):
+    """Absolute paths in config must pass through unchanged (no repo-root prepend)."""
+    from src.apply.dedup import _resolve_db_path
+
+    monkeypatch.chdir(tmp_path)  # CWD irrelevant when config is absolute
+    abs_path = tmp_path / "custom" / "dedup.db"
+    config = {"apply": {"dedup_db_path": str(abs_path)}}
+    resolved = _resolve_db_path(config)
+    assert resolved == abs_path
+
+
+def test_dedup_db_path_expanduser_on_home_relative(monkeypatch):
+    """Home-relative paths in config expand ``~`` to the user home."""
+    from src.apply.dedup import _resolve_db_path
+
+    config = {"apply": {"dedup_db_path": "~/hiring-state/applied.db"}}
+    resolved = _resolve_db_path(config)
+    assert resolved.is_absolute()
+    assert str(resolved).startswith(str(Path.home()))
+    assert resolved.name == "applied.db"
+    assert resolved.parent.name == "hiring-state"
+
+
+def test_dedup_db_path_config_relative_value_anchored_to_repo_root(tmp_path, monkeypatch):
+    """A config-supplied RELATIVE path (e.g. 'var/dedup.db') anchors at repo
+    root, not CWD — same split-brain guard as the default fallback."""
+    from src.apply.dedup import _resolve_db_path
+
+    monkeypatch.chdir(tmp_path)
+    config = {"apply": {"dedup_db_path": "var/dedup.db"}}
+    resolved = _resolve_db_path(config)
+    assert resolved.is_absolute()
+    assert str(tmp_path) not in str(resolved)
+    assert resolved.parents[1] == ROOT, (
+        f"expected repo-root anchor {ROOT}; got parents[1]={resolved.parents[1]}"
+    )
+    assert resolved.name == "dedup.db"
+    assert resolved.parent.name == "var"
