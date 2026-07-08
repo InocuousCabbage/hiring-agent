@@ -761,13 +761,21 @@ def _soft_warn_lookup(dedup: Any, company: str, role_title: str) -> list[dict]:
     disabled the soft-warn gate silently — a broken DB would open the
     auto-submit path. Post-fix returns a synthetic sentinel hit so
     ``soft_warn_active=True`` at the call site routes to review.
-    ``dedup=None`` is treated the same way — the caller (adapter) has no
-    dedup surface, safest default is to route to review.
+
+    iter2-B1: ``dedup=None`` is INTENTIONAL on the YES-branch replay path
+    (``review._AutoModeCtx`` sets ``self.dedup = None`` so the outer
+    ``execute_confirmed_submit`` owns the ``was_applied`` precheck and all
+    other gates are bypassed on the replay). Returning a synthetic hit
+    here would cascade into ``soft_dup_warn`` → ``_handle_yes`` sees
+    non-submit_ok → ``release_claim`` → 72h auto-decline of a REAL
+    operator YES. So dedup=None returns ``[]`` (skip the check) — the
+    fail-closed policy applies only to genuine exceptions from a real
+    dedup surface.
     """
     from src.apply.dedup import normalize_company, normalize_role
     if dedup is None:
-        # xhigh-H8: no dedup surface → fail closed to review.
-        return [{"reason": "soft_warn_lookup_no_dedup", "synthetic": True}]
+        # iter2-B1: intentional pass-through for YES-branch replay.
+        return []
     try:
         return dedup.soft_warn_check(
             normalize_company(company or ""),
@@ -853,15 +861,44 @@ class GreenhouseAdapter:
         # ('boards.greenhouse.io'), NOT self.name ('greenhouse'). Otherwise the
         # gate misses and the follow-up record() at end-of-flow raises
         # AlreadyAppliedError, previously swallowed silently → double-apply.
+        #
+        # iter2-H1: FAIL CLOSED on exception. Pre-fix `except Exception:
+        # hit = False` was fail-OPEN — a broken DB would let a duplicate
+        # slip through. Consistent with H8's fail-closed policy at Gate-3.
+        #
+        # iter2-H2: pass `applicant` kwarg so cross-user leaks are closed
+        # at the adapter's own gate too (not just execute_confirmed_submit).
+        # Best-effort: fall back to positional-only call if the dedup
+        # surface doesn't accept the kwarg (older test doubles).
+        _ats_domain_gate1 = _extract_ats_domain(apply_url)
+        _ats_job_id_gate1 = _extract_ats_job_id(apply_url)
         try:
-            hit = ctx.dedup.was_applied(
-                company,
-                _extract_ats_domain(apply_url),
-                _extract_ats_job_id(apply_url),
-                apply_url,
+            try:
+                hit = ctx.dedup.was_applied(
+                    company,
+                    _ats_domain_gate1,
+                    _ats_job_id_gate1,
+                    apply_url,
+                    applicant=applicant or None,
+                )
+            except TypeError:
+                # Older test doubles without the applicant kwarg.
+                hit = ctx.dedup.was_applied(
+                    company,
+                    _ats_domain_gate1,
+                    _ats_job_id_gate1,
+                    apply_url,
+                )
+        except Exception as exc:  # noqa: BLE001 — fail-CLOSED per iter2-H1
+            log.warning(
+                "apply.gate1_dedup_check_failed_fail_closed",
+                extra={
+                    "ats": self.name,
+                    "exc_type": type(exc).__name__,
+                },
             )
-        except Exception:
-            hit = False
+            # iter2-H1: fail-closed = assume applied (safer than double-apply).
+            hit = True
         if hit:
             log.info("apply.dedup_hit", extra={"ats": self.name})
             return ApplyResult(

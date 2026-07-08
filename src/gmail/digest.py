@@ -277,6 +277,14 @@ def _decision_to_row(dec: Any) -> dict:
     Preserves per-bucket rendering: `Submitted` reads `ats` + `application_id`;
     `Review required` reads `gmail_thread_id` + `screenshot_path`;
     `Auto-declined` reads `review_id`.
+
+    xhigh-H6 (iter2): the `Decision` dataclass carries neither
+    `application_id` nor `reason`, so both come back as None on this path.
+    The `_render_submitted_unrecorded` bucket surfaces the review_id +
+    the review's apply_url anchor so the operator can still triage without
+    the underlying exception name. If callers need the exception name in
+    the digest, they should attach the ApplyResult to the processed job
+    (via `processed_apply_results`) which DOES carry `reason`.
     """
     return {
         "ats": getattr(dec, "ats", None),
@@ -285,6 +293,7 @@ def _decision_to_row(dec: Any) -> dict:
         "gmail_thread_id": getattr(dec, "thread_id", None) or None,
         "company": getattr(dec, "company", None),
         "role_title": getattr(dec, "role_title", None),
+        "apply_url": getattr(dec, "apply_url", None),
     }
 
 
@@ -351,16 +360,27 @@ def _render_submitted_unrecorded(rows: list[dict]) -> str:
     the applied_jobs row never landed. Operators MUST see this because the
     next run's ``was_applied`` precheck will miss and the agent could
     silently double-apply if the DB glitch persists.
+
+    xhigh-H6 (iter2): fall back to review_id / apply_url when application_id
+    or reason are None (Decision-shape rows carry neither). Operators need
+    at least one anchor to triage the affected row in the DB.
     """
     lines = ["## Submitted (not recorded — double-submit risk)"]
     for row in rows:
         ats = row.get("ats") or "unknown"
         app_id = row.get("application_id") or "unknown"
-        reason = row.get("reason") or "unknown_record_error"
-        lines.append(
-            f"- Submitted_unrecorded to {ats} — application_id {app_id} "
-            f"(record failed: {reason})"
-        )
+        reason = row.get("reason")
+        review_id = row.get("review_id") or "<unknown>"
+        apply_url = row.get("apply_url") or "<unknown-url>"
+        # Compose a diagnostic line that ALWAYS carries at least one
+        # locatable identifier (review_id) + the anchor (apply_url) even
+        # when the ApplyResult layer (which carries reason) isn't in play.
+        parts = [f"- Submitted_unrecorded to {ats}"]
+        parts.append(f"application_id {app_id}")
+        if reason:
+            parts.append(f"(record failed: {reason})")
+        parts.append(f"[review_id={review_id}, url={apply_url}]")
+        lines.append(" — ".join(parts))
     return "\n".join(lines)
 
 

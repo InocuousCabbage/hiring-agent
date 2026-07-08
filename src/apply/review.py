@@ -1281,13 +1281,30 @@ def _handle_yes(
     # YES branch always sent None/None to the adapter → `no_resume_available`).
     resume_path_str = row.get("resume_path")
     cover_path_str = row.get("cover_letter_path")
-    result = execute_confirmed_submit(
-        decision,
-        adapter,
-        config,
-        resume_path=Path(resume_path_str) if resume_path_str else None,
-        cover_letter_path=Path(cover_path_str) if cover_path_str else None,
-    )
+    # iter2-H7: wrap the adapter call in try/finally so an unexpected
+    # exception (browser crash, session load failure, network error outside
+    # adapter.apply's try/except) doesn't leave the row stuck in
+    # 'claiming' — list_open filters `resolution IS NULL` and auto_decline's
+    # CAS guard uses the same filter, so a stuck 'claiming' row is
+    # invisible forever. release_claim on exception restores the row to
+    # open so the next tick can retry.
+    try:
+        result = execute_confirmed_submit(
+            decision,
+            adapter,
+            config,
+            resume_path=Path(resume_path_str) if resume_path_str else None,
+            cover_letter_path=Path(cover_path_str) if cover_path_str else None,
+        )
+    except Exception:
+        # iter2-H7: unexpected exception path — release the claim so the
+        # row is retryable + not stuck-invisible. Re-raise so
+        # poll_pending_reviews' per-row try/except sees the failure.
+        try:
+            store.release_claim(review_id)
+        except Exception:  # noqa: BLE001 — never-blocking cleanup
+            pass
+        raise
     status = getattr(result, "status", None)
     # M4: `already_applied` from the was_applied precheck inside
     # execute_confirmed_submit means we crashed between the ATS submit
@@ -1320,19 +1337,25 @@ def _handle_yes(
         resolved_at = _iso(now)
         # xhigh-H5: guarded CAS from 'claiming' → final_resolution so a
         # concurrent handler that already resolved the row (via mark_resolved
-        # or auto_decline) cannot be clobbered. Falls back to unguarded only
-        # if the CAS misses (e.g. the row was reset via release_claim by a
-        # test double).
+        # or auto_decline) cannot be clobbered.
         won = store.mark_resolved_from_claiming(
             review_id, final_resolution, resolved_at
         )
         if not won:
+            # iter2-H4: CAS lost. Do NOT apply the 'submitted' Gmail label —
+            # the row's true state is set by whichever handler won the race
+            # (release_claim reset to NULL, auto_decline, concurrent NO,
+            # etc.). Applying the label anyway would diverge DB from
+            # Gmail's audit trail and mislead the operator. Return None so
+            # the caller sees "nothing resolved this tick for this row";
+            # poll_pending_reviews' aggregator treats None as skip.
             log.info(
                 "apply.review.resolve_cas_lost",
                 review_id=review_id,
                 intended_resolution=final_resolution,
                 reason="row not in 'claiming' state at CAS time",
             )
+            return None
         gmail.apply_label(msg_id, label_ids["submitted"])
         gmail.remove_label(msg_id, label_ids["pending"])
         # xhigh-BLOCKING/H2: return a decision carrying the actual status so
@@ -1379,20 +1402,25 @@ def _handle_no(
     store: "ReviewStore",
     label_ids: dict[str, str],
     now: datetime,
-) -> Decision:
+) -> Decision | None:
     review_id = row["review_id"]
     resolved_at = _iso(now)
     # xhigh-H12: guarded CAS. Only resolve if the row is still open — if a
     # concurrent YES handler already marked it 'submitted' (or the row was
-    # already claimed via try_claim), do NOT clobber. Falls back to logging
-    # the CAS miss so the operator can trace the race.
+    # already claimed via try_claim), do NOT clobber.
     won = store.mark_resolved_from_open(review_id, "declined", resolved_at)
     if not won:
+        # iter2-H5: CAS lost. Do NOT apply the 'declined' Gmail label —
+        # a concurrent YES may have already labeled the thread 'submitted',
+        # and clobbering that with 'declined' would corrupt the audit trail
+        # of a REAL submission. Return None so the caller sees no decision
+        # this tick for this row.
         log.info(
             "apply.review.no_resolve_cas_lost",
             review_id=review_id,
             reason="row already resolved by another handler (YES/auto_decline)",
         )
+        return None
     gmail.apply_label(msg_id, label_ids["declined"])
     gmail.remove_label(msg_id, label_ids["pending"])
     log.info(

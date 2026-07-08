@@ -282,8 +282,16 @@ def _apply_migration_statements(
     transaction so a partial failure rolls back cleanly.
 
     xhigh-H11: when ``swallow_idempotent`` is True, only OperationalError
-    variants matching ``_IDEMPOTENT_DDL_ERROR_PATTERNS`` are swallowed — any
-    other error propagates so partially-migrated state doesn't go undetected.
+    variants matching the ``_IDEMPOTENT_DDL_ERROR_RE`` regex are swallowed —
+    any other OperationalError propagates so partially-migrated state
+    doesn't go undetected.
+
+    iter2-H3: ``sqlite3.IntegrityError`` from CREATE UNIQUE INDEX also
+    swallows-with-warning when swallow_idempotent is True. Legacy DBs with
+    multi-applicant rows at the same posting cannot create the v2 index;
+    without this catch, DedupDB init crashes permanently on that class of
+    upgrade. The application layer's ``was_applied`` predicate still
+    enforces the (ats_domain, ats_job_id) shape at query time.
     """
     stripped = _strip_sql_comments(raw)
     for stmt in (s.strip() for s in stripped.split(";")):
@@ -293,6 +301,26 @@ def _apply_migration_statements(
             conn.execute(stmt)
         except sqlite3.OperationalError as exc:
             if swallow_idempotent and _is_idempotent_ddl_error(exc):
+                continue
+            raise
+        except sqlite3.IntegrityError as exc:
+            # iter2-H3: only swallow IntegrityError from CREATE UNIQUE
+            # INDEX on a legacy DB with pre-existing conflicts. Any other
+            # IntegrityError (INSERT, UPDATE) is a real fault we DO want
+            # to see — filter by statement prefix.
+            if swallow_idempotent and stmt.lstrip().upper().startswith("CREATE UNIQUE INDEX"):
+                import structlog
+                _log = structlog.get_logger("apply.dedup.migration")
+                _log.warning(
+                    "apply.dedup.migration_index_conflict",
+                    reason=(
+                        "legacy rows collide under the new UNIQUE index; "
+                        "index skipped, code-level was_applied predicate "
+                        "still enforces uniqueness at query time"
+                    ),
+                    stmt=stmt,
+                    error=str(exc),
+                )
                 continue
             raise
 
@@ -387,6 +415,15 @@ def _apply_migration_003_gated(conn: sqlite3.Connection) -> None:
 
     # Idempotent index DDL. Runs on every open so the constraint is always
     # in place even if the marker row somehow existed without the index.
+    #
+    # iter2-H3: catch sqlite3.IntegrityError (NOT OperationalError) that
+    # fires when a legacy DB carries multi-applicant rows at the same
+    # (ats_domain, ats_job_id) posting — allowed under the pre-Phase-2
+    # (company, ats_domain, ats_job_id) UNIQUE index but rejected under
+    # the v2 (ats_domain, ats_job_id) key. Pre-fix uncaught → DedupDB
+    # init crashes permanently. Post-fix logs the collision and skips
+    # the CREATE (multi-applicant DB persists without the v2 index; the
+    # code-level ``was_applied`` predicate still enforces the new shape).
     try:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_applied_jobs_hard_v2 "
@@ -395,6 +432,18 @@ def _apply_migration_003_gated(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as exc:
         if not _is_idempotent_ddl_error(exc):
             raise
+    except sqlite3.IntegrityError as exc:
+        # iter2-H3: multi-applicant collision. Log + continue so operators
+        # can triage rather than facing an unrecoverable DedupDB init crash.
+        # The applied_jobs table stays queryable; downstream was_applied
+        # predicates still enforce the (ats_domain, ats_job_id) shape.
+        import structlog
+        _log = structlog.get_logger("apply.dedup.migration")
+        _log.warning(
+            "apply.dedup.migration_003_index_conflict",
+            reason="legacy multi-applicant rows collide under v2 index",
+            error=str(exc),
+        )
     try:
         conn.execute("DROP INDEX IF EXISTS ux_applied_jobs_hard")
     except sqlite3.OperationalError as exc:
