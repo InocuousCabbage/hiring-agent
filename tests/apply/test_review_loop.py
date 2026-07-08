@@ -319,13 +319,25 @@ def _seed_pending_row(store, *, review_id, first_sent_at, repings_sent=0):
     )
 
 
-def _thread_msg(*, body: str, msg_id: str = "REPLY_MSG_1", thread_id: str = "THREAD_1"):
-    """Shape returned by GmailClient.search() — one message per thread."""
+def _thread_msg(
+    *,
+    body: str,
+    msg_id: str = "REPLY_MSG_1",
+    thread_id: str = "THREAD_1",
+    from_addr: str = "operator@example.com",
+):
+    """Shape returned by GmailClient.search() — one message per thread.
+
+    ``from_addr`` defaults to the fixture config's fast_path_recipient so the
+    H1 sender-auth filter passes. Tests that want to exercise the
+    unauthorized-sender path override this.
+    """
     return {
         "id": msg_id,
         "thread_id": thread_id,
         "body_text": body,
         "internal_date_ms": 0,
+        "from": from_addr,
     }
 
 

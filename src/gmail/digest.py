@@ -165,11 +165,24 @@ def _render_apply_rollup(
     buckets: dict[str, list[dict]] = {kind: [] for kind in _BLOCK_ORDER}
 
     for ev in events:
+        # H11 fix: the review poller returns `Decision` (frozen dataclass with
+        # `.status` + flat fields), NOT `ApplyEvent(kind, row)`. Previously
+        # this loop only read `.kind` → miss → `digest.unknown_event_kind` →
+        # every submitted/auto_declined resolution was dropped from the
+        # digest. Now we accept both shapes.
         kind = getattr(ev, "kind", None)
+        row: dict
+        if kind is None:
+            # Decision shape — synthesize a bucket kind from `.status`.
+            status = getattr(ev, "status", None)
+            kind = _decision_status_to_bucket(status)
+            row = _decision_to_row(ev)
+        else:
+            row = getattr(ev, "row", {}) or {}
+
         if kind not in buckets:
             _log.info("digest.unknown_event_kind kind=%s", kind)
             continue
-        row = getattr(ev, "row", {}) or {}
         buckets[kind].append(row)
 
     # ``processed_apply_results`` are ApplyResult objects hanging off processed
@@ -227,6 +240,40 @@ def _render_apply_rollup(
     return "\n\n".join(parts), deduped
 
 
+def _decision_status_to_bucket(status: Any) -> str | None:
+    """H11: map a `Decision.status` string to the digest bucket kind."""
+    if status == "submitted":
+        return "submitted"
+    if status == "review_required":
+        return "review_required"
+    if status == "auto_declined":
+        return "auto_declined"
+    if status == "declined":
+        # Explicit operator NO: fold into auto_declined bucket so it still
+        # renders (dedicated bucket would require a new _BLOCK_ORDER entry).
+        return "auto_declined"
+    if status == "soft_dup_warn":
+        return "soft_dup"
+    return None
+
+
+def _decision_to_row(dec: Any) -> dict:
+    """H11: extract the digest row shape from a `Decision` dataclass.
+
+    Preserves per-bucket rendering: `Submitted` reads `ats` + `application_id`;
+    `Review required` reads `gmail_thread_id` + `screenshot_path`;
+    `Auto-declined` reads `review_id`.
+    """
+    return {
+        "ats": getattr(dec, "ats", None),
+        "application_id": getattr(dec, "application_id", None),
+        "review_id": getattr(dec, "review_id", None),
+        "gmail_thread_id": getattr(dec, "thread_id", None) or None,
+        "company": getattr(dec, "company", None),
+        "role_title": getattr(dec, "role_title", None),
+    }
+
+
 def _read_status(ar: Any) -> Any:
     if isinstance(ar, dict):
         return ar.get("status")
@@ -273,8 +320,13 @@ def _stringify_path(v: Any) -> Any:
 def _render_submitted(rows: list[dict]) -> str:
     lines = ["## Submitted"]
     for row in rows:
-        ats = row.get("ats", "unknown")
-        app_id = row.get("application_id", "unknown")
+        # L2-class fix (Phase 1 xhigh, angles A + C): `dict.get(k, default)`
+        # only fires the default when the key is MISSING — not when the
+        # key is present with value None. Decision→row helpers explicitly
+        # set application_id/ats to None for events without them, so the
+        # digest previously rendered '- Submitted to None — application_id None'.
+        ats = row.get("ats") or "unknown"
+        app_id = row.get("application_id") or "unknown"
         lines.append(f"- Submitted to {ats} — application_id {app_id}")
     return "\n".join(lines)
 
@@ -283,7 +335,12 @@ def _render_review_required(rows: list[dict]) -> tuple[str, list[Path]]:
     lines = ["## Review required"]
     attachments: list[Path] = []
     for row in rows:
-        thread_id = row.get("gmail_thread_id", "<unknown-thread>")
+        # L2 fix: `_apply_result_to_row` and `_decision_to_row` unconditionally
+        # set `gmail_thread_id` even when the underlying object doesn't carry
+        # one — so ``dict.get("gmail_thread_id", default)`` returned the LITERAL
+        # None (the default never fired). Explicit None-check + review_id
+        # fallback so operators never see 'reply YES to None to submit'.
+        thread_id = row.get("gmail_thread_id") or row.get("review_id") or "<unknown-thread>"
         lines.append(f"- reply YES to {thread_id} to submit")
 
         screenshot = row.get("screenshot_path")
@@ -305,7 +362,9 @@ def _render_review_required(rows: list[dict]) -> tuple[str, list[Path]]:
 def _render_auto_declined(rows: list[dict]) -> str:
     lines = ["## Auto-declined"]
     for row in rows:
-        review_id = row.get("review_id", "<unknown>")
+        # L2-class fix — see _render_submitted comment. `or` fallback so a
+        # None value from the Decision-shape row still renders '<unknown>'.
+        review_id = row.get("review_id") or "<unknown>"
         lines.append(f"- Auto-declined — no reply in 72 h (review_id {review_id})")
     return "\n".join(lines)
 
@@ -313,8 +372,9 @@ def _render_auto_declined(rows: list[dict]) -> str:
 def _render_soft_dup(rows: list[dict]) -> str:
     lines = ["## Blocked (soft-dup)"]
     for row in rows:
-        company = row.get("company", "<company>")
-        review_id = row.get("review_id", "<unknown>")
+        # L2-class fix — see _render_submitted comment.
+        company = row.get("company") or "<company>"
+        review_id = row.get("review_id") or "<unknown>"
         lines.append(
             f"- Blocked (soft-dup) — similar role at {company}: "
             f"reply YES {review_id} to override"

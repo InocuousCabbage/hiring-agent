@@ -587,6 +587,7 @@ def run_pipeline(
                 cover_letter_docx_path=cl_docx,
                 apply_config=apply_config,
                 job_log=job_log,
+                gmail_client=gmail_client,
             )
 
             processed.append({

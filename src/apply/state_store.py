@@ -35,25 +35,11 @@ from typing import Iterable
 
 # ── Schema (must stay byte-identical to ``migrations/001_init.sql``) ────────
 
-_CREATE_REVIEW_PENDING = """
-CREATE TABLE IF NOT EXISTS review_pending (
-    review_id           TEXT PRIMARY KEY,
-    job_url             TEXT NOT NULL,
-    apply_url           TEXT NOT NULL,
-    company             TEXT NOT NULL,
-    role_title          TEXT NOT NULL,
-    ats                 TEXT NOT NULL,
-    filled_at           TEXT NOT NULL,
-    screenshot_path     TEXT NOT NULL,
-    trace_path          TEXT,
-    first_sent_at       TEXT NOT NULL,
-    last_repinged_at    TEXT,
-    repings_sent        INTEGER NOT NULL DEFAULT 0,
-    gmail_thread_id     TEXT,
-    resolution          TEXT,
-    resolved_at         TEXT
-)
-"""
+# NOTE: the review_pending schema is owned by ``src/apply/migrations/``
+# (001_init.sql + 002_review_pending_paths.sql) — see ``_ensure_schema``
+# below which delegates to ``dedup._execute_migrations`` so this module and
+# DedupDB stay byte-consistent by construction (Phase 1 audit finding SG1/SG7:
+# split-brain schemas cause hard-to-debug column-missing errors).
 
 _INSERT_COLUMNS: tuple[str, ...] = (
     "review_id",
@@ -71,6 +57,11 @@ _INSERT_COLUMNS: tuple[str, ...] = (
     "gmail_thread_id",
     "resolution",
     "resolved_at",
+    "resume_path",
+    "cover_letter_path",
+    "applicant",
+    "clarified_at",
+    "initial_msg_id",
 )
 
 
@@ -102,8 +93,16 @@ class ReviewStore:
             pass
 
     def _ensure_schema(self) -> None:
+        # SG1/SG7 fix: delegate to the canonical migration runner so this
+        # module and DedupDB stay byte-consistent by construction. Applies
+        # 001_init.sql (creates review_pending) + 002_review_pending_paths.sql
+        # (H4/M1/M12 additive columns) + 003_review_pending_initial_msg_id.sql
+        # (SE3 exact-msg-id self-filter anchor). Idempotent across cold + warm
+        # starts — see ``dedup._execute_migrations`` for the duplicate-column
+        # OperationalError handling.
+        from src.apply.dedup import _execute_migrations
         with self._conn:
-            self._conn.execute(_CREATE_REVIEW_PENDING)
+            _execute_migrations(self._conn)
 
     # ── CRUD ───────────────────────────────────────────────────────
 
@@ -166,4 +165,16 @@ class ReviewStore:
             self._conn.execute(
                 "UPDATE review_pending SET gmail_thread_id = ? WHERE review_id = ?",
                 (thread_id, review_id),
+            )
+
+    def mark_clarified(self, review_id: str, at: str) -> None:
+        """M12: record that we've sent a clarification reply on this thread so
+        the next poll tick can skip the resend. Idempotent by design: the
+        `clarified_at` column is a bare timestamp — the guard in review.py's
+        AMBIGUOUS branch checks for non-NULL and short-circuits.
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE review_pending SET clarified_at = ? WHERE review_id = ?",
+                (at, review_id),
             )
