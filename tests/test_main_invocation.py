@@ -23,7 +23,6 @@ import textwrap
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MAIN_PATH = os.path.join(REPO_ROOT, "src", "main.py")
 
 
 def test_main_script_mode_syspath_bootstrap(tmp_path):
