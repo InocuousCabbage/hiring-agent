@@ -41,6 +41,12 @@ from typing import Iterable
 # DedupDB stay byte-consistent by construction (Phase 1 audit finding SG1/SG7:
 # split-brain schemas cause hard-to-debug column-missing errors).
 
+# xhigh-H5/H12 sentinel: distinguishes "no guard requested" from an
+# explicit ``expected_resolution=None`` (which means "only overwrite from
+# the NULL/open state"). Never leaked outside the module.
+_UNSET: object = object()
+
+
 _INSERT_COLUMNS: tuple[str, ...] = (
     "review_id",
     "job_url",
@@ -156,45 +162,126 @@ class ReviewStore:
                 (at, review_id),
             )
 
-    def mark_resolved(self, review_id: str, resolution: str, at: str) -> None:
-        """Set ``resolution`` and ``resolved_at`` in a single UPDATE."""
+    def mark_resolved(
+        self,
+        review_id: str,
+        resolution: str,
+        at: str,
+        *,
+        expected_resolution: "str | None | object" = _UNSET,
+    ) -> bool:
+        """Set ``resolution`` and ``resolved_at`` in a single UPDATE.
+
+        Returns True iff exactly one row was updated (compare-and-swap
+        semantics when ``expected_resolution`` is provided).
+
+        xhigh-H5/H12: when ``expected_resolution`` is passed, the UPDATE only
+        fires if the current ``resolution`` matches. This closes the
+        clobber race for concurrent YES/NO on the same row and for stale
+        ticks arriving after auto_decline. Semantics:
+
+            expected_resolution=None   → only overwrite from NULL (open row)
+            expected_resolution='X'    → only overwrite from resolution='X'
+            expected_resolution=_UNSET → unguarded (backwards-compat)
+
+        The unguarded default preserves the legacy write-last-wins behaviour
+        so existing callers continue to work; new callers should pass an
+        expected value.
+        """
         with self._conn:
-            self._conn.execute(
-                "UPDATE review_pending "
-                "SET resolution = ?, resolved_at = ? "
-                "WHERE review_id = ?",
-                (resolution, at, review_id),
-            )
+            if expected_resolution is _UNSET:
+                cur = self._conn.execute(
+                    "UPDATE review_pending "
+                    "SET resolution = ?, resolved_at = ? "
+                    "WHERE review_id = ?",
+                    (resolution, at, review_id),
+                )
+            elif expected_resolution is None:
+                cur = self._conn.execute(
+                    "UPDATE review_pending "
+                    "SET resolution = ?, resolved_at = ? "
+                    "WHERE review_id = ? AND resolution IS NULL",
+                    (resolution, at, review_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE review_pending "
+                    "SET resolution = ?, resolved_at = ? "
+                    "WHERE review_id = ? AND resolution = ?",
+                    (resolution, at, review_id, expected_resolution),
+                )
+            return cur.rowcount == 1
+
+    def mark_resolved_from_open(
+        self, review_id: str, resolution: str, at: str
+    ) -> bool:
+        """xhigh-H5/H12 convenience: resolve iff the row is currently open
+        (resolution IS NULL). Returns True on success. Callers on the NO
+        branch use this to protect against overwriting a completed
+        resolution set by a concurrent YES handler on the same row.
+        """
+        return self.mark_resolved(
+            review_id, resolution, at, expected_resolution=None
+        )
+
+    def mark_resolved_from_claiming(
+        self, review_id: str, resolution: str, at: str
+    ) -> bool:
+        """xhigh-H5/H12 convenience: resolve iff the row is currently in the
+        interim 'claiming' state. Used by the YES branch after ``try_claim``
+        succeeds — guarantees mark_resolved cannot clobber a row that has
+        been reset (release_claim) or completed by another handler.
+        """
+        return self.mark_resolved(
+            review_id, resolution, at, expected_resolution="claiming"
+        )
 
     def try_claim(self, review_id: str, at: str) -> bool:
         """H10: atomically claim a review row for the YES-branch submit.
 
-        Sets ``resolution='claiming'`` and ``resolved_at=at`` iff the row's
-        current ``resolution`` is NULL. Returns True on success (this caller
-        won the race), False otherwise. Single UPDATE on a single connection —
-        the row-change count is the authoritative signal, no check-then-act
-        window between two SQLite transactions.
+        Sets ``resolution='claiming'`` iff the row's current ``resolution``
+        is NULL. Returns True on success (this caller won the race), False
+        otherwise. Single UPDATE on a single connection — the row-change
+        count is the authoritative signal, no check-then-act window between
+        two SQLite transactions.
+
+        xhigh-H4/MEDIUM: ``resolved_at`` is NOT written here. Pre-fix set
+        ``resolved_at=at`` during the interim 'claiming' state which polluted
+        compliance dashboards querying ``WHERE resolved_at IS NOT NULL``
+        with mid-claim rows. ``resolved_at`` now only lands at the final
+        ``mark_resolved_from_claiming`` call.
 
         The interim 'claiming' resolution is a placeholder that must be
-        overwritten by ``mark_resolved`` on submit success, or cleared by
-        ``release_claim`` on submit failure so a retry can happen next tick.
+        overwritten by ``mark_resolved_from_claiming`` on submit success, or
+        cleared by ``release_claim`` on submit failure so a retry can
+        happen next tick.
+
+        The ``at`` parameter is retained for backward-compat with existing
+        callers and future extension (e.g. a claim_at column) but is unused
+        at present.
         """
+        _ = at  # xhigh-H4: intentionally not written to resolved_at.
         with self._conn:
             cur = self._conn.execute(
                 "UPDATE review_pending "
-                "SET resolution = 'claiming', resolved_at = ? "
+                "SET resolution = 'claiming' "
                 "WHERE review_id = ? AND resolution IS NULL",
-                (at, review_id),
+                (review_id,),
             )
             return cur.rowcount == 1
 
     def release_claim(self, review_id: str) -> None:
         """H10: release a 'claiming' interim claim so a retry can happen.
 
-        Clears ``resolution`` and ``resolved_at`` back to NULL. Called from
-        ``_handle_yes`` when the adapter re-run fails — without this the row
-        would stay stuck in 'claiming' forever and the operator would see a
-        phantom half-resolved review row.
+        Clears ``resolution`` back to NULL. Called from ``_handle_yes`` when
+        the adapter re-run fails — without this the row would stay stuck in
+        'claiming' forever and the operator would see a phantom half-
+        resolved review row.
+
+        xhigh-H4/MEDIUM: ``resolved_at`` is unconditionally reset to NULL
+        even though ``try_claim`` no longer sets it — defense-in-depth so
+        any legacy 'claiming' rows persisted by the pre-fix code cannot
+        leak into compliance dashboards after this fix ships.
         """
         with self._conn:
             self._conn.execute(
