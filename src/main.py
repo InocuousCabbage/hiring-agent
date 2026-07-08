@@ -27,6 +27,7 @@ import argparse
 import logging
 import os
 import sys
+from typing import Optional
 import yaml
 import structlog
 from datetime import date
@@ -99,6 +100,34 @@ def _writable_ancestor(path: Path) -> Path:
     while not check.exists() and check.parent != check:
         check = check.parent
     return check
+
+
+def _dedup_db_writability_target(raw: "str | os.PathLike[str]") -> Optional[Path]:
+    """Return the parent directory to writability-check + mkdir for the
+    dedup_db_path config value, or ``None`` to skip.
+
+    Consistency fix (sibling of PR #5): naive ``Path(raw).parent`` is
+    CWD-relative — so main.py's writability precheck could log
+    ``dedup DB writable at ./state/…`` while ``src/apply/dedup.py`` silently
+    opens ``<repo>/state/…``. Precheck was meaningless when CWDs differed.
+
+    This routes through the SAME ``_anchor_at_repo_root`` helper dedup.py
+    uses (see ``src/apply/dedup.py``), so the precheck targets the exact
+    filesystem node the DB actually opens against.
+
+    SQLite non-filesystem specs — ``":memory:"`` and ``"file:..."`` URIs —
+    have nothing to check on disk; ``None`` signals "skip both the writability
+    check and the mkdir." Matches the passthrough in dedup._is_sqlite_special_path.
+    """
+    # Lazy-import to keep the top of main.py free of apply-side dependencies
+    # and to preserve the pre-Phase-3 pipeline path (no apply imports pulled
+    # when apply.enabled=false — this function only fires from inside the
+    # apply.enabled=true branch of _validate_apply_config).
+    from apply.dedup import _anchor_at_repo_root, _is_sqlite_special_path
+
+    if _is_sqlite_special_path(os.fspath(raw)):
+        return None
+    return _anchor_at_repo_root(raw).parent
 
 
 def _validate_apply_config(config: dict) -> None:
@@ -282,12 +311,18 @@ def _validate_apply_config(config: dict) -> None:
                 f"apply.{pkey}: parent path is not writable: {anchor}"
             )
 
-    ddp = Path(apply_cfg["dedup_db_path"])
-    ddp_anchor = _writable_ancestor(ddp.parent)
-    if not os.access(ddp_anchor, os.W_OK):
-        raise ConfigError(
-            f"apply.dedup_db_path: parent path is not writable: {ddp_anchor}"
-        )
+    # Route the dedup_db_path writability check through the SAME
+    # `_anchor_at_repo_root` helper that `src/apply/dedup.py` uses, so the
+    # precheck reflects the actual open-path (repo-root anchor) instead of
+    # a CWD-relative fiction. SQLite ``:memory:`` and ``file:`` URIs return
+    # None (nothing to check on disk).
+    ddp_target = _dedup_db_writability_target(apply_cfg["dedup_db_path"])
+    if ddp_target is not None:
+        ddp_anchor = _writable_ancestor(ddp_target)
+        if not os.access(ddp_anchor, os.W_OK):
+            raise ConfigError(
+                f"apply.dedup_db_path: parent path is not writable: {ddp_anchor}"
+            )
 
     # ── All validation passed — NOW emit warnings + create dirs ────────────
     if long_tail == "computer_use":
@@ -297,7 +332,11 @@ def _validate_apply_config(config: dict) -> None:
 
     for pkey in _PATH_DIR_KEYS:
         Path(apply_cfg[pkey]).mkdir(parents=True, exist_ok=True)
-    ddp.parent.mkdir(parents=True, exist_ok=True)
+    # Same anchored target for mkdir — never mkdir a CWD-relative sibling of
+    # the DB dedup.py actually opens against. None → SQLite special path,
+    # nothing to mkdir.
+    if ddp_target is not None:
+        ddp_target.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> dict:

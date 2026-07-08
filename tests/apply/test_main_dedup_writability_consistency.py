@@ -82,28 +82,46 @@ def test_validate_apply_config_no_mkdir_leak_into_cwd_for_relative_dedup_db(
     tmp_path, monkeypatch
 ):
     """Regression: with a relative dedup_db_path and CWD elsewhere, the
-    writability check + mkdir must NOT leak a `state/` directory into the
-    CWD. Naive CWD-relative resolution would create <CWD>/state/ — the
-    split-brain smoking gun."""
+    writability check + mkdir must NOT leak a `dedup_leak/` directory into
+    the CWD. Naive CWD-relative resolution would create <CWD>/dedup_leak/ —
+    the split-brain smoking gun.
+
+    To isolate the dedup_db_path side effect from the DIR_KEYS side effects,
+    the DIR_KEY paths are pointed at a separate `dirs/` subtree under
+    tmp_path and the relative dedup path uses a unique `dedup_leak/` segment
+    that no other config key touches.
+    """
     monkeypatch.setenv("HIRING_AGENT_S3_TEST_EMAIL", "test@example.com")
     monkeypatch.chdir(tmp_path)
     cfg = _valid_config(tmp_path)
-    cfg["apply"]["dedup_db_path"] = "state/applied_jobs.db"  # RELATIVE
+    # Move DIR_KEYS under a distinct subtree so any `dedup_leak/` under
+    # tmp_path can only come from the dedup_db_path buggy code path.
+    cfg["apply"]["screenshot_dir"] = str(tmp_path / "dirs" / "screenshots")
+    cfg["apply"]["trace_dir"] = str(tmp_path / "dirs" / "traces")
+    cfg["apply"]["storage_state_dir"] = str(tmp_path / "dirs" / "storage_state")
+    cfg["apply"]["dedup_db_path"] = "dedup_leak/applied_jobs.db"  # RELATIVE
 
     _validate_apply_config(cfg)
 
-    # Buggy code would have mkdir'd <tmp_path>/state/ (CWD-relative). The fix
-    # anchors at repo root, so no CWD leakage.
-    assert not (tmp_path / "state").exists(), (
-        f"dedup_db_path mkdir leaked into CWD {tmp_path}/state — writability "
-        f"check + mkdir must route through _anchor_at_repo_root."
+    # Buggy code would have mkdir'd <tmp_path>/dedup_leak/ (CWD-relative).
+    # The fix anchors at repo root, so no CWD leakage.
+    assert not (tmp_path / "dedup_leak").exists(), (
+        f"dedup_db_path mkdir leaked into CWD {tmp_path}/dedup_leak — "
+        f"writability check + mkdir must route through _anchor_at_repo_root."
     )
 
-    # Positive assertion: the anchored parent (repo-root state/) exists.
-    anchored_parent = _anchor_at_repo_root("state/applied_jobs.db").parent
+    # Positive assertion: the anchored parent (repo-root dedup_leak/) is
+    # where mkdir landed. Repo root MUST have been used, not tmp_path.
+    anchored_parent = _anchor_at_repo_root("dedup_leak/applied_jobs.db").parent
     assert anchored_parent.exists(), (
         f"expected anchored parent {anchored_parent} to exist after validate"
     )
+    # Cleanup: the anchored parent was created under the real repo root by
+    # this test — remove it so we don't leak a scratch dir into the repo.
+    try:
+        anchored_parent.rmdir()
+    except OSError:
+        pass
 
 
 def test_validate_apply_config_accepts_memory_dedup_db(tmp_path, monkeypatch):
