@@ -26,7 +26,9 @@ Design contracts:
       and re-raises `AlreadyAppliedError`.
     * `count_today` computes the UTC-midnight boundary via `_utcnow()`.
     * The CLI resolves the DB path from `HIRING_AGENT_DEDUP_DB` env, or a
-      `--db-path` flag, or the default `state/applied_jobs.db` relative to CWD.
+      `--db-path` flag, or the default `state/applied_jobs.db`. Relative
+      values from any source anchor at REPO ROOT (never CWD) — see
+      `_anchor_at_repo_root` for the split-brain-guard rationale.
 """
 
 from __future__ import annotations
@@ -193,6 +195,16 @@ def _extract_ats_job_id(apply_url: str | None) -> Optional[str]:
             return parts[-2]
         return None
     return seg or None
+
+
+# ── Repo root anchor (CWD split-brain guard) ─────────────────────────────────
+
+
+# Repo root computed from this file's location: src/apply/dedup.py -> parents[2].
+# Anchoring dedup DB fallback paths here (instead of CWD) prevents split-brain
+# DBs when the pipeline is invoked from different working directories (e.g. a
+# cron run with a different CWD vs. a manual repo-root invocation).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ── Schema loader ────────────────────────────────────────────────────────────
@@ -519,22 +531,63 @@ class DedupDB:
 _DEFAULT_DB_RELATIVE = Path("state") / "applied_jobs.db"
 
 
-def _resolve_db_path(cli_override: str | None) -> Path:
-    """Path resolution order: CLI ``--db-path`` -> env ``HIRING_AGENT_DEDUP_DB``
-    -> default ``state/applied_jobs.db`` relative to CWD.
+def _anchor_at_repo_root(raw: str | os.PathLike[str]) -> Path:
+    """Return an absolute Path for ``raw``, anchoring relative values at repo
+    root (never CWD). Absolute inputs pass through unchanged. Home-relative
+    inputs (``~/...``) are expanded via ``Path.expanduser``.
 
-    The config module (`src/apply/config.py` from S3) is NOT imported here
-    because the S5 shard is landing on its own branch — see the cross-shard
-    contract note in the prompt. When the seam wiring lands (S17), the caller
-    resolves the config path and passes it to `DedupDB(path)` directly; this
-    CLI-only resolver stays put for operator use.
+    Bug guard: naive ``Path("state/applied_jobs.db")`` is CWD-relative — the
+    same repo invoked from two working directories would create TWO separate
+    SQLite DBs, causing split-brain dedup state and silent double-applies.
+    Anchoring at repo root ensures every invocation sees the same DB.
+    """
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p
+    return _REPO_ROOT / p
+
+
+def _resolve_db_path(config: dict) -> Path:
+    """Resolve the dedup DB path from ``config``, falling back to a
+    repo-root-anchored ``state/applied_jobs.db``.
+
+    Accepts either the WRAPPED shape ``{"apply": {"dedup_db_path": ...}}`` (as
+    used by ``src/apply/review.py`` and ``src/main.py``) or the UNWRAPPED apply
+    block ``{"dedup_db_path": ...}`` (as used by ``src/apply/_seam.py``). This
+    covers all in-tree callers without forcing them to reshape config first.
+
+    Relative values — whether the config default or a user override — anchor
+    at repo root, NEVER at CWD. See ``_anchor_at_repo_root`` for rationale.
+    """
+    apply_cfg: dict | None
+    inner = config.get("apply") if isinstance(config, dict) else None
+    if isinstance(inner, dict):
+        apply_cfg = inner
+    elif isinstance(config, dict):
+        apply_cfg = config  # already the unwrapped apply block
+    else:
+        apply_cfg = None
+    raw = None
+    if isinstance(apply_cfg, dict):
+        raw = apply_cfg.get("dedup_db_path")
+    if not raw:
+        raw = str(_DEFAULT_DB_RELATIVE)
+    return _anchor_at_repo_root(raw)
+
+
+def _resolve_cli_db_path(cli_override: str | None) -> Path:
+    """CLI path resolution order: ``--db-path`` -> env ``HIRING_AGENT_DEDUP_DB``
+    -> default ``state/applied_jobs.db`` anchored at repo root.
+
+    Relative paths from any source anchor at repo root (never CWD) — same
+    split-brain guard as ``_resolve_db_path``. See ``_anchor_at_repo_root``.
     """
     if cli_override:
-        return Path(cli_override)
+        return _anchor_at_repo_root(cli_override)
     env = os.environ.get("HIRING_AGENT_DEDUP_DB")
     if env:
-        return Path(env)
-    return Path.cwd() / _DEFAULT_DB_RELATIVE
+        return _anchor_at_repo_root(env)
+    return _anchor_at_repo_root(_DEFAULT_DB_RELATIVE)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -565,7 +618,7 @@ def _main(argv: Iterable[str] | None = None) -> int:
     # don't intercept that.
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    db_path = _resolve_db_path(args.db_path)
+    db_path = _resolve_cli_db_path(args.db_path)
     db = DedupDB(db_path)
     n = db.unblock(args.unblock)
     print(f"unblocked {n} row(s) for {args.unblock}")
