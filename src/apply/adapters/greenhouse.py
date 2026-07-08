@@ -631,6 +631,107 @@ def _apply_result_failure(
     )
 
 
+# ── B3 escalation: record-with-fallback ──────────────────────────────────────
+
+
+def _record_or_escalate(
+    dedup: Any,
+    result: "ApplyResult",
+    *,
+    applicant: str,
+    company: str,
+    role_title: str,
+    job_url: str,
+) -> "ApplyResult":
+    """Record a DOM-verified submission and escalate on record failure.
+
+    B3 audit finding (2026-07-08): the greenhouse adapter used to wrap
+    ``ctx.dedup.record(...)`` in a blanket ``try/except Exception`` that
+    logged an ``apply.dedup.record_failed`` warning and returned the
+    original ``status='submitted'`` result. When the record failed
+    (locked DB, B2 Path bind failure, disk I/O, permissions), the next
+    run's ``was_applied`` precheck missed and the agent silently re-applied
+    to the same posting.
+
+    Post-fix behavior:
+
+    * On success — return the original ``result`` unchanged. The
+      applied_jobs row landed; the caller sees the DOM-verified submit.
+    * On ``AlreadyAppliedError`` — return the original ``result``. This
+      is an idempotent replay (row already recorded on an earlier run);
+      preserving ``status='submitted'`` matches the prior behavior of
+      ``apply.dedup_hit`` and avoids double-warning the operator.
+    * On any other Exception — emit ``apply.dedup.record_failed.escalated``
+      at ``log.error`` and return a NEW ``ApplyResult`` with
+      ``status='submitted_unrecorded'``. The distinct status is what the
+      next run's precheck + digest key on so the operator sees the
+      double-submit risk explicitly.
+
+    Args:
+        dedup: The ``DedupDB`` instance (or a duck-typed test double).
+        result: The DOM-verified ``ApplyResult`` from the adapter.
+        applicant: Applicant slug (matches ``DedupDB.record`` signature).
+        company: Raw company string from the job scrape.
+        role_title: Raw role title from the job scrape.
+        job_url: Canonical job URL.
+
+    Returns:
+        Either ``result`` (success / already_applied) or a new
+        ``ApplyResult`` with ``status='submitted_unrecorded'`` carrying
+        the same DOM-verified evidence (apply_url, application_id,
+        screenshot, trace, submitted_at) plus a ``reason`` string that
+        names the underlying exception type.
+    """
+    try:
+        dedup.record(
+            result,
+            applicant,
+            company,
+            role_title,
+            job_url,
+        )
+    except AlreadyAppliedError:
+        log.info(
+            "apply.dedup_hit",
+            extra={"ats": _ADAPTER_NAME, "reason": "record_race"},
+        )
+        return result
+    except Exception as exc:
+        # Escalate loud: this is the fail-open path the old blanket-catch
+        # silently absorbed. Operators MUST see this in error logs.
+        log.error(
+            "apply.dedup.record_failed.escalated",
+            extra={
+                "ats": _ADAPTER_NAME,
+                "exc_type": type(exc).__name__,
+                "job_url": job_url,
+                "application_id_present": bool(
+                    getattr(result, "application_id", None)
+                ),
+            },
+        )
+        reason_prefix = "record_failed"
+        prior_reason = getattr(result, "reason", None)
+        reason = (
+            f"{reason_prefix}: {type(exc).__name__} — {prior_reason}"
+            if prior_reason
+            else f"{reason_prefix}: {type(exc).__name__}"
+        )
+        return ApplyResult(
+            status="submitted_unrecorded",
+            ats=getattr(result, "ats", _ADAPTER_NAME),
+            apply_url=getattr(result, "apply_url", None),
+            application_id=getattr(result, "application_id", None),
+            confirmation_screenshot=getattr(result, "confirmation_screenshot", None),
+            reason=reason,
+            human_review_url=getattr(result, "human_review_url", None),
+            submitted_at=getattr(result, "submitted_at", None),
+            trace_path=getattr(result, "trace_path", None),
+            review_id=getattr(result, "review_id", None),
+        )
+    return result
+
+
 # ── Adapter class ────────────────────────────────────────────────────────────
 
 
@@ -969,31 +1070,29 @@ class GreenhouseAdapter:
                 trace_path=trace,
             )
             # Only record to dedup on a DOM-verified submission.
-            # H5 fix: narrow the except to AlreadyAppliedError so real
-            # duplicates emit dedup_hit (not the misleading record_failed)
-            # AND other DB errors surface for the operator.
-            try:
-                ctx.dedup.record(
-                    result,
-                    applicant,
-                    company,
-                    role_title,
-                    apply_url,
-                )
-            except AlreadyAppliedError:
-                log.info(
-                    "apply.dedup_hit",
-                    extra={"ats": self.name, "reason": "record_race"},
-                )
-            except Exception:
-                log.warning(
-                    "apply.dedup.record_failed", extra={"ats": self.name}
-                )
+            # B3 fix: route through `_record_or_escalate` so a record
+            # failure (locked DB, disk I/O, permissions, ...) surfaces
+            # as `submitted_unrecorded` instead of the old plain
+            # `submitted`. The prior blanket `except Exception` here
+            # downgraded record failures to an `apply.dedup.record_failed`
+            # warning and returned `submitted` unchanged, causing a silent
+            # double-apply on the next run because `was_applied` still
+            # missed. `_record_or_escalate` preserves the
+            # `AlreadyAppliedError` -> dedup_hit path.
+            result = _record_or_escalate(
+                ctx.dedup,
+                result,
+                applicant=applicant,
+                company=company,
+                role_title=role_title,
+                job_url=apply_url,
+            )
             log.info(
                 "apply.submitted",
                 extra={
                     "ats": self.name,
                     "application_id_present": bool(application_id),
+                    "status": getattr(result, "status", None),
                 },
             )
             return result

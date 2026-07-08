@@ -26,13 +26,22 @@ def test_apply_result_is_frozen():
         result.status = "failed"  # type: ignore[misc]
 
 
-def test_status_literal_has_exactly_8_values():
-    """Status Literal must contain exactly the 8 values from master-plan §4.1."""
+def test_status_literal_has_exactly_9_values():
+    """Status Literal must contain exactly the 9 values from master-plan §4.1
+    plus the B3 addition (``submitted_unrecorded``).
+
+    B3 (audit finding 2026-07-08) widened the Literal by one value to
+    encode the DOM-verified-but-dedup-record-failed state. The escalation
+    is deliberately a distinct status (not a plain ``submitted`` with a
+    reason) so downstream mapping in digest + review loop cannot silently
+    treat it as a normal success.
+    """
     from src.apply.types import Status
 
     args = typing.get_args(Status)
     assert set(args) == {
         "submitted",
+        "submitted_unrecorded",
         "review_required",
         "skipped",
         "failed",
@@ -41,7 +50,7 @@ def test_status_literal_has_exactly_8_values():
         "captcha_escalated",
         "auto_declined",
     }
-    assert len(args) == 8
+    assert len(args) == 9
 
 
 def test_apply_result_defaults_all_optional_fields_to_none():

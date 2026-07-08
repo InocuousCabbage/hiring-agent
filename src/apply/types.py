@@ -32,12 +32,21 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Status Literal (master-plan §4.1) — exactly 8 values, order matters for
-# `typing.get_args` equality checks in tests + downstream tooling.
+# Status Literal (master-plan §4.1) — 9 values (extended for B3 escalation),
+# order matters for `typing.get_args` equality checks in tests + downstream
+# tooling.
+#
+# B3 addition: ``submitted_unrecorded`` — the ATS accepted the submission
+# (DOM-verified) BUT ``DedupDB.record()`` raised, so the applied_jobs row
+# never landed. Distinct from plain ``submitted`` because a plain
+# ``submitted`` result would let the next run's ``was_applied`` precheck
+# miss and re-apply. Not in ``_STATUS_WRITE`` — the record already failed
+# once and we do NOT retry recording the same shape on next attempt.
 # ---------------------------------------------------------------------------
 
 Status = Literal[
     "submitted",           # DOM-verified confirmation seen
+    "submitted_unrecorded", # DOM-verified but dedup record() failed (B3 escalation)
     "review_required",     # filled, awaiting Gmail YES/NO
     "skipped",             # dedup / rate-limit / session-expired / adapter-mismatch
     "failed",              # navigation/upload/submit error surfaced to operator
