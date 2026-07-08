@@ -433,8 +433,10 @@ def _default_load_state() -> Callable[[str, str], dict | None]:
 
 
 def _default_dedup_db(config: dict) -> Any:
-    from src.apply.dedup import DedupDB  # noqa: E402
-    return DedupDB(config["apply"]["dedup_db_path"])
+    # Anchor at repo root — prevents CWD split-brain DBs across invocation
+    # sites (cron w/ a different CWD vs. manual repo-root runs).
+    from src.apply.dedup import DedupDB, _resolve_db_path  # noqa: E402
+    return DedupDB(_resolve_db_path(config))
 
 
 def execute_confirmed_submit(

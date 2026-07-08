@@ -98,7 +98,12 @@ def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> li
     # first so the reconciled schema is in place before ReviewStore opens the
     # same DB file. Best-effort: if dedup_db_path is missing, fall back to a
     # local review-only DB path so the poller can still open a store.
-    db_path = config.get("dedup_db_path") or "state/applied_jobs.db"
+    #
+    # Resolve via _resolve_db_path so relative paths anchor at REPO ROOT (not
+    # CWD) — prevents split-brain DB between DedupDB and ReviewStore when the
+    # process is invoked from an unexpected working directory.
+    from src.apply.dedup import _resolve_db_path
+    db_path = _resolve_db_path(config)
     try:
         from src.apply.dedup import DedupDB
         DedupDB(db_path)
@@ -272,8 +277,11 @@ def run_for_job(
         # soon as H4 delivered a real page.
         dedup = None
         try:
-            from src.apply.dedup import DedupDB as _DedupDB
-            db_path = apply_config.get("dedup_db_path") or "state/applied_jobs.db"
+            from src.apply.dedup import DedupDB as _DedupDB, _resolve_db_path
+            # Anchor at repo root — otherwise the ApplyContext DedupDB and the
+            # review-loop DedupDB would land on different SQLite files if the
+            # process's CWD isn't the repo root.
+            db_path = _resolve_db_path(apply_config)
             dedup = _DedupDB(db_path)
         except Exception:  # noqa: BLE001 — seam never blocks on dedup init
             dedup = None
