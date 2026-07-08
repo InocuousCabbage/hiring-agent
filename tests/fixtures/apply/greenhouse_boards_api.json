@@ -1,0 +1,79 @@
+{
+  "id": 4123456,
+  "internal_job_id": 999999,
+  "title": "Software Engineer",
+  "location": {"name": "Remote"},
+  "absolute_url": "https://boards.greenhouse.io/acme/jobs/4123456",
+  "questions": [
+    {
+      "label": "First Name",
+      "required": true,
+      "fields": [
+        {"name": "job_application[first_name]", "type": "input_text"}
+      ]
+    },
+    {
+      "label": "Last Name",
+      "required": true,
+      "fields": [
+        {"name": "job_application[last_name]", "type": "input_text"}
+      ]
+    },
+    {
+      "label": "Email",
+      "required": true,
+      "fields": [
+        {"name": "job_application[email]", "type": "input_text"}
+      ]
+    },
+    {
+      "label": "Phone",
+      "required": false,
+      "fields": [
+        {"name": "job_application[phone]", "type": "input_text"}
+      ]
+    },
+    {
+      "label": "Resume/CV",
+      "required": true,
+      "fields": [
+        {"name": "job_application[resume]", "type": "input_file"}
+      ]
+    },
+    {
+      "label": "LinkedIn Profile",
+      "required": false,
+      "fields": [
+        {"name": "job_application[urls_attributes][0][value]", "type": "input_text"}
+      ]
+    },
+    {
+      "label": "Are you authorized to work in the US?",
+      "required": true,
+      "fields": [
+        {
+          "name": "job_application[answers_attributes][0][answer]",
+          "type": "multi_value_single_select",
+          "values": [
+            {"label": "Yes", "value": "7734001"},
+            {"label": "No", "value": "7734002"}
+          ]
+        }
+      ]
+    },
+    {
+      "label": "Do you require visa sponsorship?",
+      "required": true,
+      "fields": [
+        {
+          "name": "job_application[answers_attributes][1][answer]",
+          "type": "multi_value_single_select",
+          "values": [
+            {"label": "Yes", "value": "8811001"},
+            {"label": "No", "value": "8811002"}
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+# candidate_profile.REPLACE_ME.yaml
+#
+# Copy this scaffold to templates/candidate_profile.yaml (which is gitignored),
+# then replace every REPLACE_ME with your real values.
+#
+# The 7-field shape mirrors src/apply/profile.py CandidateProfile dataclass
+# (S1). The loader is strict — REPLACE_ME strings are only placeholders and
+# will cause bootstrap to abort with a clear "unfilled placeholder" error.
+#
+# Field-by-field notes below explain purpose, required-ness, and enum values
+# where applicable. Enum comments match what most ATS forms (Greenhouse /
+# Lever / Ashby) present as their radio/select options.
+
+# ── 1. name ───────────────────────────────────────────────────────────────────
+# Purpose: fills the "First Name", "Last Name", and "Full Name" ATS fields.
+# The `full` field is what most ATSes show back on the review screen.
+# All three sub-fields are REQUIRED.
+name:
+  first: "REPLACE_ME (First Name)"
+  last: "REPLACE_ME (Last Name)"
+  full: "REPLACE_ME (Full Legal Name — matches how you sign documents)"
+
+# ── 2. contact ────────────────────────────────────────────────────────────────
+# Purpose: primary contact info. `email` is REQUIRED; others OPTIONAL.
+# Phone format: whatever your ATS accepts. E.164 (+15551234567) is safest.
+# URLs must include the scheme (https://).
+contact:
+  email: "REPLACE_ME (primary email — e.g. jane.doe@example.com)"
+  phone: "REPLACE_ME (+1XXXXXXXXXX or null to omit)"
+  linkedin_url: "REPLACE_ME (https://www.linkedin.com/in/... or null)"
+  portfolio_url: "REPLACE_ME (https://... or null)"
+  github_url: "REPLACE_ME (https://github.com/... or null)"
+
+# ── 3. address ────────────────────────────────────────────────────────────────
+# Purpose: fills address fields on Greenhouse/Lever/Workday forms.
+# All sub-fields OPTIONAL — set to null if the field doesn't apply.
+# US format shown; use your country's convention.
+address:
+  line1: "REPLACE_ME (Street address — e.g. 123 Main St Apt 4B)"
+  city: "REPLACE_ME (City)"
+  state: "REPLACE_ME (Two-letter US state code — e.g. CA, NY, ME)"
+  postal: "REPLACE_ME (ZIP or postal code — e.g. 04101)"
+  country: "REPLACE_ME (Country name or ISO code — e.g. United States or US)"
+
+# ── 4. work_authorization ─────────────────────────────────────────────────────
+# Purpose: the two universal work-auth questions every US ATS asks.
+# Both OPTIONAL but strongly recommended — omitting them means the adapter
+# will surface these forms as review-required rather than auto-filling.
+# Use booleans (true / false), not strings.
+work_authorization:
+  us_authorized: null           # true if you are authorized to work in the US
+  requires_sponsorship: null    # true if you need visa sponsorship (H-1B etc.)
+
+# ── 5. eeo ────────────────────────────────────────────────────────────────────
+# Purpose: Equal Employment Opportunity self-identification section.
+# ALL fields OPTIONAL. Leave any value null to have the adapter surface it
+# for manual review (review-mode) or skip it entirely (auto-mode).
+#
+# The exact string values below are the most common ATS enum options.
+# If your ATS uses different labels, the adapter's label-scan will still
+# match on close variants (e.g. "Prefer not to say" ~ "Decline to state").
+eeo:
+  # Options: "Male", "Female", "Non-binary", "Prefer not to say"
+  gender: null
+
+  # Options (US Greenhouse/Lever standard):
+  #   "American Indian or Alaska Native"
+  #   "Asian"
+  #   "Black or African American"
+  #   "Hispanic or Latino"
+  #   "Native Hawaiian or Other Pacific Islander"
+  #   "White"
+  #   "Two or more races"
+  #   "Prefer not to say"
+  race_ethnicity: null
+
+  # Options: "I am not a protected veteran"
+  #          "I identify as one or more of the classifications of a protected veteran"
+  #          "I don't wish to answer"
+  veteran_status: null
+
+  # Options: "Yes, I have a disability (or previously had one)"
+  #          "No, I don't have a disability"
+  #          "I don't wish to answer"
+  disability_status: null
+
+  # Free-form. Common: "he/him", "she/her", "they/them", or omit.
+  pronouns: null
+
+# ── 6. compensation ───────────────────────────────────────────────────────────
+# Purpose: salary + availability. All OPTIONAL — but ATSes with a required
+# "desired salary" field will surface as review-required if unset.
+compensation:
+  # Integer USD (annual base), or null. Example: 150000
+  desired_salary_usd: null
+
+  # ISO date (YYYY-MM-DD) or a free-form phrase most ATSes accept.
+  # Example: "2026-08-01" or "2 weeks after offer" — the adapter passes
+  # this through verbatim.
+  earliest_start_date: null
+
+  # Boolean. true = open to relocation, false = local only, null = surface for review.
+  willing_to_relocate: null
+
+# ── 7. references ─────────────────────────────────────────────────────────────
+# Purpose: list of professional references. OPTIONAL — most ATSes only
+# collect references at offer stage, but a few request them on the initial
+# application. Leave as empty list [] if you don't want to auto-fill.
+#
+# Each reference: `name` REQUIRED, others OPTIONAL.
+references: []
+# Example — uncomment and edit to include:
+# references:
+#   - name: "Reference Name Here"
+#     relationship: "Manager at Previous Company"
+#     email: "reference@example.com"
+#     phone: null
+#   - name: "Second Reference"
+#     relationship: "Colleague"
+#     email: null
+#     phone: "+15551234567"

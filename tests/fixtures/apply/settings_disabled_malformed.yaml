@@ -1,0 +1,12 @@
+# S3 soft-fail proof fixture — apply.enabled: false with intentionally
+# garbage sub-keys. Validator MUST return None without inspecting these,
+# so the pre-Phase-3 pipeline is unaffected by the new gate.
+apply:
+  enabled: false
+  mode: not-a-real-mode
+  allowed_ats: not-even-a-list
+  timeout_seconds: -999
+  review_timeout_hours: "seventy-two"
+  review_reping_hours: [96]
+  bogus_key: this-would-fail-when-enabled
+  browserbase: also_not_a_dict

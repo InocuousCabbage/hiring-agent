@@ -1,0 +1,49 @@
+# Candidate profile — auto-apply input schema (Shard S1).
+#
+# Placeholder values ONLY. Real PII lives in an untracked candidate_profile.yaml
+# alongside this file, ignored via .gitignore. Every field below must validate
+# via CandidateProfile.load() (src/apply/profile.py). Any unknown top-level or
+# sub-key raises ProfileValidationError — no silent drops.
+#
+# Field reference: master-plan §4.4 (schema contract shared by S2, S8, S17, S18).
+
+name:
+  first: Jane
+  last: Doe
+  # `full` is optional — synthesized as "{first} {last}" if omitted.
+  # Provide verbatim only for edge cases (Dr., suffixes, single-name candidates).
+  # full: "Jane Doe"
+
+contact:
+  email: jane@example.com
+  phone: "+1-555-0100"
+  linkedin_url: "https://www.linkedin.com/in/jane-doe-example"
+  portfolio_url: null
+  github_url: "https://github.com/jane-doe-example"
+
+address:
+  line1: "123 Example St"
+  city: "Portland"
+  state: "ME"
+  postal: "04101"
+  country: "US"
+
+work_authorization:
+  us_authorized: true
+  requires_sponsorship: false
+
+# EEO fields are ALWAYS nullable; leave null to skip on forms that ask.
+eeo:
+  gender: null
+  race_ethnicity: null
+  veteran_status: null
+  disability_status: null
+  pronouns: null
+
+compensation:
+  desired_salary_usd: 120000
+  earliest_start_date: "2026-08-01"
+  willing_to_relocate: false
+
+# 0 or more; each item requires `name`, other fields optional.
+references: []

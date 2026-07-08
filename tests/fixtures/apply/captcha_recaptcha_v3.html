@@ -1,0 +1,17 @@
+<html>
+<head>
+  <title>Application - reCAPTCHA v3</title>
+  <!-- reCAPTCHA v3: script tag with render key + invisible div -->
+  <script src="https://www.google.com/recaptcha/api.js?render=6Lfxxxxxxxxxxxxxxxxxxxxxxxxxxxxv3FakeKey"></script>
+</head>
+<body>
+  <form id="application_form" action="/apply" method="post">
+    <label for="first_name">First name</label>
+    <input id="first_name" name="first_name" type="text"/>
+
+    <div class="g-recaptcha" data-sitekey="6Lfxxxxxxxxxxxxxxxxxxxxxxxxxxxxv3FakeKey" data-size="invisible"></div>
+
+    <button type="submit">Submit Application</button>
+  </form>
+</body>
+</html>

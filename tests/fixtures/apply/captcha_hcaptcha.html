@@ -1,0 +1,15 @@
+<html>
+<head><title>Application - hCaptcha</title></head>
+<body>
+  <form id="application_form" action="/apply" method="post">
+    <label for="first_name">First name</label>
+    <input id="first_name" name="first_name" type="text"/>
+
+    <!-- hCaptcha widget -->
+    <div class="h-captcha" data-sitekey="10000000-ffff-ffff-ffff-000000000001" data-hcaptcha-widget-id="hc-widget-abc"></div>
+    <iframe src="https://newassets.hcaptcha.com/captcha/v1/xxxx/static/hcaptcha.html" title="hCaptcha challenge"></iframe>
+
+    <button type="submit">Submit Application</button>
+  </form>
+</body>
+</html>

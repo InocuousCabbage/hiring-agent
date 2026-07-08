@@ -76,9 +76,12 @@ def get_jd() -> tuple[dict, str]:
             continue
 
         print(f"  → Resolved: {resolved}")
-        jd_text = fetch_job_description(resolved, timeout=30, min_length=200)
-        if jd_text:
+        jd_result = fetch_job_description(resolved, timeout=30, min_length=200)
+        if jd_result:
+            jd_text = jd_result.text
             job["resolved_url"] = resolved
+            job["ats_apply_url"] = jd_result.ats_apply_url
+            job["ats"] = jd_result.ats
             print(f"  → JD fetched ({len(jd_text):,} chars) — saving to {SAVED_JD}")
             SAVED_JD.write_text(json.dumps({"job": job, "jd_text": jd_text}, indent=2))
             return job, jd_text

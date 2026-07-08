@@ -11,6 +11,7 @@ Flow:
 
 import re
 import time
+from dataclasses import dataclass
 import httpx
 import structlog
 from urllib.parse import quote_plus
@@ -19,6 +20,25 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from parser.email_parser import resolve_sendgrid_url
 
 log = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class JDFetchResult:
+    """
+    Job-description fetch result.
+
+    text          — cleaned JD text (always populated on success)
+    ats_apply_url — discovered ATS "Apply Now" URL (Greenhouse, Lever, Ashby,
+                    Workday, iCIMS, SmartRecruiters, etc.) or None if the JD
+                    came from a non-ATS source (e.g. pure hiring.cafe).
+    ats           — canonical ATS name matching ats_apply_url, or None.
+
+    Consumed by Phase 3 auto-apply to route submissions to the correct ATS
+    endpoint instead of the SendGrid tracking URL in job['url'].
+    """
+    text: str
+    ats_apply_url: str | None = None
+    ats: str | None = None
 
 HEADERS = {
     "User-Agent": (
@@ -38,21 +58,41 @@ JD_SECTION_PATTERNS = [
     r"(?i)(about us|about the company|about \w+)",
 ]
 
-# Known ATS domains where external job postings live
-ATS_DOMAINS = [
-    "greenhouse.io",
-    "lever.co",
-    "myworkdayjobs.com",
-    "icims.com",
-    "brassring.com",
-    "smartrecruiters.com",
-    "jobvite.com",
-    "taleo.net",
-    "successfactors.com",
-    "bamboohr.com",
-    "ashbyhq.com",
-    "rippling.com",
-]
+# Known ATS domains where external job postings live, mapped to their canonical
+# vendor names. Order matters — first match wins in _infer_ats_name, so more
+# specific patterns (e.g. myworkdayjobs.com before ashbyhq.com) are fine here
+# because domains are non-overlapping.
+_ATS_DOMAIN_TO_NAME: dict[str, str] = {
+    "greenhouse.io": "Greenhouse",
+    "lever.co": "Lever",
+    "myworkdayjobs.com": "Workday",
+    "icims.com": "iCIMS",
+    "brassring.com": "BrassRing",
+    "smartrecruiters.com": "SmartRecruiters",
+    "jobvite.com": "Jobvite",
+    "taleo.net": "Taleo",
+    "successfactors.com": "SuccessFactors",
+    "bamboohr.com": "BambooHR",
+    "ashbyhq.com": "Ashby",
+    "rippling.com": "Rippling",
+}
+# Preserved as a list for existing filter_domains callers.
+ATS_DOMAINS: list[str] = list(_ATS_DOMAIN_TO_NAME.keys())
+
+
+def _infer_ats_name(url: str | None) -> str | None:
+    """
+    Map an ATS apply URL to its canonical vendor name.
+
+    Returns None when the URL is None or not from a recognized ATS. Used by
+    fetch_job_description to populate JDFetchResult.ats alongside the URL.
+    """
+    if not url:
+        return None
+    for domain, name in _ATS_DOMAIN_TO_NAME.items():
+        if domain in url:
+            return name
+    return None
 
 
 def fetch_job_description(
@@ -61,14 +101,28 @@ def fetch_job_description(
     min_length: int = 200,
     job_title: str = "",
     company: str = "",
-) -> str | None:
+) -> JDFetchResult | None:
     """
-    Fetch and return cleaned JD text for a job URL, or None on failure.
+    Fetch and return a JDFetchResult for a job URL, or None on failure.
+
+    The returned dataclass carries:
+      - text          : cleaned JD content
+      - ats_apply_url : discovered ATS "Apply Now" URL (Greenhouse, Lever,
+                        Ashby, Workday, iCIMS, SmartRecruiters, ...) or None
+      - ats           : canonical ATS vendor name or None
+
+    Downstream code (Phase 3 auto-apply) uses ats_apply_url to route form
+    submissions to the correct ATS endpoint rather than falling back to the
+    SendGrid tracking URL in job['url'].
 
     Strategy (in order):
-      1. Google search for ATS posting using job_title + company
-      2. If ATS URL found, scrape it directly
-      3. Fall back to hiring.cafe URL via Playwright
+      1. Google search for ATS posting using job_title + company (populates
+         ats_apply_url when successful)
+      2. Broader Google search — if the hit is on an ATS domain it also
+         populates ats_apply_url
+      3. Fall back to hiring.cafe URL via Playwright — its outbound "Apply"
+         link, if any, populates ats_apply_url when we use it as the fetch
+         source
       4. Return None if everything fails
 
     Returns None if:
@@ -84,7 +138,11 @@ def fetch_job_description(
             ats_text = _fetch_ats_page(ats_url, timeout)
             if ats_text and len(ats_text) >= min_length and _has_jd_sections(ats_text):
                 log.info("jd_fetcher.success", url=ats_url, chars=len(ats_text), source="google_ats")
-                return _clean_text(ats_text)
+                return JDFetchResult(
+                    text=_clean_text(ats_text),
+                    ats_apply_url=ats_url,
+                    ats=_infer_ats_name(ats_url),
+                )
             log.debug("jd_fetcher.google_ats_insufficient", chars=len(ats_text) if ats_text else 0)
 
         # Step 1b: Broader Google search
@@ -94,7 +152,15 @@ def fetch_job_description(
             broad_text = _fetch_ats_page(broad_url, timeout)
             if broad_text and len(broad_text) >= min_length and _has_jd_sections(broad_text):
                 log.info("jd_fetcher.success", url=broad_url, chars=len(broad_text), source="google_broad")
-                return _clean_text(broad_text)
+                # broad_url is an ATS URL only when _infer_ats_name recognizes
+                # the domain — a company careers page returns ats=None so
+                # Phase 3 knows it can't auto-apply through a vendor form.
+                inferred = _infer_ats_name(broad_url)
+                return JDFetchResult(
+                    text=_clean_text(broad_text),
+                    ats_apply_url=broad_url if inferred else None,
+                    ats=inferred,
+                )
             log.debug("jd_fetcher.google_broad_insufficient", chars=len(broad_text) if broad_text else 0)
 
     # Step 2: Fall back to hiring.cafe URL via Playwright
@@ -106,7 +172,15 @@ def fetch_job_description(
         # Check if hiring.cafe rendered valid content
         if text and len(text) >= min_length and _has_jd_sections(text):
             log.info("jd_fetcher.success", url=resolved, chars=len(text), source="hiring.cafe")
-            return _clean_text(text)
+            # If the hiring.cafe page carried an outbound ATS link we surface
+            # it even when the JD text itself came from hiring.cafe — Phase 3
+            # still wants the ATS submission target when available.
+            inferred = _infer_ats_name(hiring_cafe_ats_url)
+            return JDFetchResult(
+                text=_clean_text(text),
+                ats_apply_url=hiring_cafe_ats_url if inferred else None,
+                ats=inferred,
+            )
 
         log.debug(
             "jd_fetcher.hiring_cafe_insufficient",
@@ -120,7 +194,17 @@ def fetch_job_description(
             ats_text = _fetch_ats_page(hiring_cafe_ats_url, timeout)
             if ats_text and len(ats_text) >= min_length and _has_jd_sections(ats_text):
                 log.info("jd_fetcher.success", url=hiring_cafe_ats_url, chars=len(ats_text), source="hiring_cafe_ats")
-                return _clean_text(ats_text)
+                # _find_ats_link may return a non-ATS "Apply" URL (any off-site
+                # anchor whose text contains "apply", see line 437). Mirror the
+                # guard used in the google_broad and pure-hiring.cafe paths so
+                # Phase 3 auto-apply never sees ats_apply_url set with ats=None
+                # (a URL with no vendor is unroutable).
+                inferred = _infer_ats_name(hiring_cafe_ats_url)
+                return JDFetchResult(
+                    text=_clean_text(ats_text),
+                    ats_apply_url=hiring_cafe_ats_url if inferred else None,
+                    ats=inferred,
+                )
     else:
         log.warning("jd_fetcher.resolve_failed", url=url[:80])
 

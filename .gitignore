@@ -7,6 +7,12 @@ token.json
 templates/resumes/*.docx
 templates/cover_letter.docx
 
+# Personal data files (not shipped with repo)
+templates/candidate_profile.yaml
+
+# Local state (dedup DB, run history)
+state/
+
 # Python
 __pycache__/
 *.pyc
@@ -25,3 +31,6 @@ test_data/*.eml
 
 # OBF/m2c1 planning artifacts (local working docs, not part of repo)
 .agent/
+
+# Local code-review + planning scratch (per-run reviewer outputs, not shipped)
+reviews/

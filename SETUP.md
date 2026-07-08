@@ -14,7 +14,7 @@ This is an automated job application pipeline. It:
 5. Writes a custom cover letter for each job
 6. Runs quality checks (no fabricated claims, one page max, etc.)
 7. Converts everything to PDF
-8. Emails you a digest with all the tailored documents attached — **both PDF (for direct submission) and editable DOCX (for last-minute edits in Word / Google Docs / LibreOffice)**
+8. Emails you a digest with all the tailored documents attached
 
 You set it up once, then it runs automatically.
 
@@ -287,6 +287,62 @@ This runs at 9 AM every other day.
 ```bash
 crontab -l
 ```
+
+---
+
+## Auto-apply setup
+
+Phase 3 adds an opt-in auto-apply stage for Greenhouse. It ships off; you flip
+it on only after this section is complete. Nothing is submitted until the
+review-mode YES/NO loop confirms each application and the
+`dry_run: false` success criteria in
+[docs/apply-flow.md](docs/apply-flow.md#success-criteria-for-enabling-dry_run-false)
+are green.
+
+### Prerequisites
+
+Auto-apply reuses everything you already installed above. No new pip
+dependencies are needed — `pip install -r requirements.txt` already covers it.
+If you skipped the Playwright step earlier, run it now:
+
+```bash
+python -m playwright install chromium
+```
+
+### Environment variables
+
+- `MY_EMAIL` (existing) — the fast-path CAPTCHA-escalation address. Already
+  set in Step 7.
+- `HIRING_AGENT_LIVE_ATS` (optional, opt-in) — set to `1` only when running
+  the gated live-ATS test suite. Never set in production.
+- `HIRING_AGENT_APPLY_CANNED_LLM` (optional, test-only) — a canned-LLM
+  toggle for offline tests. Use only the exact literal `1`, `true`, or `yes`;
+  every other value keeps the real LLM path.
+
+### Bootstrap a Greenhouse session
+
+Run this once per ATS. Chromium opens headed; log in with your real
+Greenhouse account (including MFA); the script snapshots the browser session
+and stores it in your OS keyring.
+
+```bash
+python -m src.apply.bootstrap greenhouse
+```
+
+Verify:
+
+```bash
+python -m src.apply.bootstrap --status
+```
+
+Expected output: `greenhouse: bootstrapped`.
+
+### Enable in config
+
+Edit `config/settings.yaml` and set `apply.enabled: true`. Leave
+`apply.dry_run: true` — that stays on until the six success-criteria checks
+in `docs/apply-flow.md` are green. With `dry_run: true`, the pipeline fills
+forms and screenshots but never clicks submit even when you reply YES.
 
 ---
 

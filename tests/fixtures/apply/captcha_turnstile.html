@@ -1,0 +1,17 @@
+<html>
+<head><title>Application - Cloudflare Turnstile</title></head>
+<body>
+  <form id="application_form" action="/apply" method="post">
+    <label for="first_name">First name</label>
+    <input id="first_name" name="first_name" type="text"/>
+    <label for="last_name">Last name</label>
+    <input id="last_name" name="last_name" type="text"/>
+
+    <!-- Cloudflare Turnstile widget -->
+    <div class="cf-turnstile" data-sitekey="0x4AAAAAAAxxxTurnstileFake" data-callback="onTurnstileSolve"></div>
+    <iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" title="Widget containing a Cloudflare security challenge"></iframe>
+
+    <button type="submit">Submit Application</button>
+  </form>
+</body>
+</html>

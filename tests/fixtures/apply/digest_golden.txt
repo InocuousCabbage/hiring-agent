@@ -1,0 +1,23 @@
+Processed (2)
+========================================
+  Senior Software Engineer — Acme Corp (Remote)
+  Lane: linkedin_search
+  URL: https://boards.greenhouse.io/acme/jobs/1
+
+  Staff Engineer — Beta LLC (Portland, ME)
+  Lane: company_page
+  URL: https://jobs.beta.com/staff-engineer
+  Hiring Manager: Jane Doe — VP Engineering (high)
+  LinkedIn: https://linkedin.com/in/janedoe
+  Email: jane@beta.com
+  Outreach: Referred by peer.
+
+
+Skipped (1)
+========================================
+  Junior Dev — Gamma Inc
+  URL: https://jobs.gamma.com/junior
+  Reason: below_threshold
+
+
+— Hiring Agent (automated)

@@ -1,0 +1,15 @@
+<html>
+<head><title>Application - reCAPTCHA v2</title></head>
+<body>
+  <form id="application_form" action="/apply" method="post">
+    <label for="first_name">First name</label>
+    <input id="first_name" name="first_name" type="text"/>
+
+    <!-- reCAPTCHA v2 checkbox -->
+    <div class="g-recaptcha" data-sitekey="6Lfxxxxxxxxxxxxxxxxxxxxxxxxxxxxv2FakeKey"></div>
+    <iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&amp;k=6Lfxxxxxxxxxxxxxxxxxxxxxxxxxxxxv2FakeKey" title="reCAPTCHA"></iframe>
+
+    <button type="submit">Submit Application</button>
+  </form>
+</body>
+</html>

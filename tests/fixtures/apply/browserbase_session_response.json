@@ -1,0 +1,8 @@
+{
+  "id": "sess_abc123def456",
+  "connect_url": "wss://connect.browserbase.com/session/abc123def456",
+  "replay_url": "https://browserbase.com/replay/abc123def456",
+  "status": "RUNNING",
+  "project_id": "proj_fixture_only",
+  "region": "us-east-1"
+}

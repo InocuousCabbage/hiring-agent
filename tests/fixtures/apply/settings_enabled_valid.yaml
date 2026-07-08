@@ -1,0 +1,30 @@
+# S3 fixture — a fully-shaped valid apply block. Path keys are placeholders
+# and are overridden by tests to point at pytest `tmp_path`; the shape
+# (22 keys under `apply:`, 4 under `apply.browserbase:`) is what this
+# fixture pins down.
+apply:
+  enabled: true
+  mode: review
+  allowed_ats: [greenhouse]
+  long_tail: none
+  dry_run: false
+  timeout_seconds: 90
+  navigation_retries: 2
+  rate_limit_per_ats_per_day: 10
+  review_timeout_hours: 72
+  review_reping_hours: 24
+  retention_days: 30
+  screenshot_dir: state/screenshots
+  trace_dir: state/traces
+  storage_state_dir: config/credentials/apply
+  dedup_db_path: state/applied_jobs.db
+  captcha_action: escalate
+  captcha_transport: browserbase
+  profile_path: templates/candidate_profile.yaml
+  gmail_label_prefix: "hiring-agent/apply"
+  fast_path_recipient: env:MY_EMAIL
+  browserbase:
+    enabled: true
+    solve_captchas: true
+    proxies: true
+    block_ads: true

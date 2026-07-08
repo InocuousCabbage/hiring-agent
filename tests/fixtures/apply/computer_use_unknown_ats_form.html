@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head><title>Unknown ATS Application Form</title></head>
+<body>
+  <h1>Apply</h1>
+  <!-- Intentionally NO ATS-identifying markers (no greenhouse_iframe,
+       no data-testid="ApplicationConfirmation", no postings-confirmation).
+       This represents a long-tail ATS the domain-matched adapters miss. -->
+  <form id="application_form">
+    <label for="fname">First name</label>
+    <input type="text" id="fname" name="first_name" />
+
+    <label for="lname">Last name</label>
+    <input type="text" id="lname" name="last_name" />
+
+    <label for="email">Email</label>
+    <input type="text" id="email" name="email" />
+
+    <label for="resume">Resume (PDF)</label>
+    <input type="file" id="resume" name="resume" />
+
+    <label for="cover">Cover letter (PDF)</label>
+    <input type="file" id="cover" name="cover_letter" />
+
+    <label for="why">Why do you want this job?</label>
+    <textarea id="why" name="why"></textarea>
+
+    <button type="submit">Submit Application</button>
+  </form>
+</body>
+</html>

@@ -63,11 +63,14 @@ def main() -> None:
 
         # Step 2: Fetch JD via Playwright
         print("  Fetching JD (Playwright)…", flush=True)
-        jd = fetch_job_description(resolved, timeout=30, min_length=200)
+        jd_result = fetch_job_description(resolved, timeout=30, min_length=200)
 
-        if jd:
+        if jd_result:
+            jd = jd_result.text
             print(f"  Status  : OK")
             print(f"  Chars   : {len(jd)}")
+            if jd_result.ats_apply_url:
+                print(f"  ATS     : {jd_result.ats}  → {jd_result.ats_apply_url}")
             preview = jd[:300].replace("\n", "\n            ")
             print(f"  Preview :\n            {preview}")
             results.append((job["title"], True, len(jd)))

@@ -1,8 +1,14 @@
 # Hiring.cafe Job Alert Agent
 
 Automated job application pipeline: ingests Hiring.cafe email alerts, fetches JDs,
-classifies into marketing lanes, tailors resumes + cover letters, generates PDFs
-**and editable DOCX files**, and sends a digest email — all hands-off.
+classifies into marketing lanes, tailors resumes + cover letters, generates PDFs,
+and sends a digest email — all hands-off.
+
+Phase 3 adds an opt-in, review-mode default auto-apply stage — Greenhouse only in
+the MVP, config-gated, and held behind a Gmail YES/NO reply loop before anything
+is submitted. See [docs/apply-flow.md](docs/apply-flow.md) for the operator
+manual and [SETUP.md](SETUP.md) for the bootstrap runbook. Enable via
+config/settings.yaml apply.enabled=true; default is OFF.
 
 ## Architecture
 
@@ -109,7 +115,48 @@ python src/main.py
 ## Key Design Decisions
 
 - **DOCX templates → PDF** (not HTML→PDF) for maximum style fidelity to your base resumes
-- **Dual output** — the digest email attaches BOTH the PDF (for direct submission) and the editable DOCX (for last-minute edits in Word / Google Docs / LibreOffice)
 - **Claude API** for all LLM reasoning (lane classification, tailoring, QA validation)
 - **Idempotent** via Gmail labels + stored message IDs
 - **Retry-with-fix** QA loop (max 2 retries) before skipping a job
+
+## Auto-Apply (Phase 3 MVP)
+
+Auto-apply is an opt-in stage that submits Greenhouse-hosted applications on
+your behalf, gated on a Gmail YES/NO reply from you. Default posture: off,
+review-mode, dry-run held closed. Nothing gets submitted until you explicitly
+approve every application and the six checks in `docs/apply-flow.md` pass.
+
+**Safety posture**
+
+- Master switch off by default (`apply.enabled: false`).
+- Review mode is the shipped default: the pipeline fills the form,
+  screenshots, and stages a Gmail email under
+  `hiring-agent/apply/pending`. Only a first-line `YES` re-opens the browser
+  and submits. `NO` skips. Ambiguous replies get an auto-clarify.
+- 24-hour re-ping, 72-hour auto-decline if no reply.
+- `apply.dry_run: true` until the success-criteria checks are green — even
+  with `enabled: true`, no submit runs.
+- Dedup DB blocks re-applies on the same `(company, ats_domain, ats_job_id)`
+  and soft-warns on normalized `(company, role)`.
+- Rate cap: 10 applies per ATS per UTC day.
+- Computer Use fallback (opt-in) is hard-coded to `review_required` and
+  cannot auto-submit.
+
+**Supported ATSes**
+
+- MVP (Phase 3): Greenhouse only.
+- Phase 3.5: Lever and Ashby.
+- Phase 3.6: Workday and iCIMS (after a Turnstile solve-rate spike).
+
+**Out of scope**
+
+LinkedIn Easy Apply, full-auto default mode, post-submit lifecycle
+(screener replies, offers, scheduling), a dashboard over
+`state/applied_jobs.db`, and cortextOS Telegram push are all out of scope for
+Phase 3.
+
+**Quick start**
+
+See [SETUP.md](SETUP.md#auto-apply-setup) for the two-command bootstrap
+runbook and [docs/apply-flow.md](docs/apply-flow.md) for the full pipeline
+manual.
