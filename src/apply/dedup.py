@@ -216,17 +216,21 @@ _MIGRATION_SQL_PATH = Path(__file__).parent / "migrations" / "001_init.sql"
 _MIGRATION_002_SQL_PATH = Path(__file__).parent / "migrations" / "002_review_pending_paths.sql"
 
 
-def _load_schema_sql() -> str:
-    parts: list[str] = [_MIGRATION_SQL_PATH.read_text(encoding="utf-8")]
-    # 002 uses ALTER TABLE ADD COLUMN which sqlite has no IF NOT EXISTS for.
-    # Split into individual statements and swallow duplicate-column errors so
-    # the migration is safe on both a fresh DB (columns get added) AND an
-    # already-migrated DB (each ADD raises OperationalError — logged and
-    # ignored below in the caller via a per-statement try). The `_load` step
-    # here just concatenates; the caller `DedupDB.__init__` handles the guard.
-    if _MIGRATION_002_SQL_PATH.exists():
-        parts.append(_MIGRATION_002_SQL_PATH.read_text(encoding="utf-8"))
-    return "\n".join(parts)
+def _strip_sql_comments(raw: str) -> str:
+    """Strip `--` line comments from a SQL script so per-statement parsing
+    can safely split on `;` without a leading comment block masquerading as
+    part of the first statement (SD1 audit fix).
+
+    Only handles line comments — the migrations don't use `/* */` block
+    comments, and this stays a simple filter (no need for a full SQL parser).
+    """
+    kept: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("--") or not stripped:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _execute_migrations(conn: sqlite3.Connection) -> None:
@@ -239,16 +243,27 @@ def _execute_migrations(conn: sqlite3.Connection) -> None:
     if not _MIGRATION_002_SQL_PATH.exists():
         return
     raw = _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8")
-    for stmt in [s.strip() for s in raw.split(";") if s.strip()]:
-        # Skip comment-only lines (executescript would tolerate them; single
-        # execute() does too — this filter is just for the split artifact).
-        if stmt.startswith("--") or not stmt:
+    # SD1 fix: strip `--` comments BEFORE splitting on `;`. The pre-fix code
+    # split first and used `stmt.startswith("--")` as a skip-guard — but the
+    # split delivered a chunk that contained the file's header comments
+    # PLUS the first ALTER, whose first character was `-`. That skipped
+    # `ADD COLUMN resume_path` entirely; only warm starts saw the column
+    # (because ReviewStore.__init__ also ALTERed via its own path).
+    stripped = _strip_sql_comments(raw)
+    for stmt in (s.strip() for s in stripped.split(";")):
+        if not stmt:
             continue
         try:
             conn.execute(stmt)
-        except sqlite3.OperationalError:
-            # Column already exists (warm start) — expected + safe.
-            pass
+        except sqlite3.OperationalError as exc:
+            # Duplicate column on a warm start — expected + safe. Any other
+            # OperationalError (locked DB, no such table, disk I/O, malformed
+            # DB) is a real fault we DO want to see: re-raise so the caller
+            # doesn't silently continue against a partially-migrated schema.
+            msg = str(exc).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                continue
+            raise
 
 
 # ── DedupDB ──────────────────────────────────────────────────────────────────

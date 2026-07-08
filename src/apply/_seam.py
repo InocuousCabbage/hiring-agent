@@ -338,35 +338,37 @@ def run_for_job(
         # review_pending row + send the review email. Previously stage_review
         # was defined but had zero production callers → every review-required
         # application silently dead-ended.
+        #
+        # SC5 fix (Phase 1 xhigh): also gate on `dry_run`. `--test` mode
+        # passes a Noop gmail client that returns constant stub ids, so
+        # stage_review would silently accumulate rows in the shared state
+        # DB across every test run. Under dry_run we log-only.
         _STAGE_STATUSES = {"review_required", "soft_dup_warn", "captcha_escalated"}
-        if (
-            result is not None
-            and getattr(result, "status", None) in _STAGE_STATUSES
-            and gmail_client is not None
-        ):
-            try:
-                _call_stage_review(
-                    result=result,
-                    ctx=ctx,
-                    gmail=gmail_client,
-                    config=apply_config,
-                )
-            except Exception as stage_exc:  # noqa: BLE001 — never-blocking
-                job_log.warning(
-                    "apply.review.stage_failed",
-                    error=str(stage_exc),
+        if result is not None and getattr(result, "status", None) in _STAGE_STATUSES:
+            if apply_config.get("dry_run", False):
+                job_log.info(
+                    "apply.review.stage_skipped_dry_run",
                     status=getattr(result, "status", None),
                 )
-        elif (
-            result is not None
-            and getattr(result, "status", None) in _STAGE_STATUSES
-            and gmail_client is None
-        ):
-            # No gmail client available (e.g. --test mode) — log and continue.
-            job_log.info(
-                "apply.review.stage_skipped_no_gmail_client",
-                status=getattr(result, "status", None),
-            )
+            elif gmail_client is None:
+                job_log.info(
+                    "apply.review.stage_skipped_no_gmail_client",
+                    status=getattr(result, "status", None),
+                )
+            else:
+                try:
+                    _call_stage_review(
+                        result=result,
+                        ctx=ctx,
+                        gmail=gmail_client,
+                        config=apply_config,
+                    )
+                except Exception as stage_exc:  # noqa: BLE001 — never-blocking
+                    job_log.warning(
+                        "apply.review.stage_failed",
+                        error=str(stage_exc),
+                        status=getattr(result, "status", None),
+                    )
 
         return result
     except SessionExpiredError as exc:

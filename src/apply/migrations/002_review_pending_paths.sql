@@ -21,3 +21,8 @@ ALTER TABLE review_pending ADD COLUMN resume_path       TEXT;
 ALTER TABLE review_pending ADD COLUMN cover_letter_path TEXT;
 ALTER TABLE review_pending ADD COLUMN applicant         TEXT;
 ALTER TABLE review_pending ADD COLUMN clarified_at      TEXT;
+-- SE3 fix (Phase 1 xhigh review): store the exact msg_id of the review
+-- email at stage time so poll_pending_reviews can exact-match filter the
+-- review email itself out of the thread (replaces the fragile body-prefix
+-- + In-Reply-To heuristic in _is_review_own_message).
+ALTER TABLE review_pending ADD COLUMN initial_msg_id    TEXT;

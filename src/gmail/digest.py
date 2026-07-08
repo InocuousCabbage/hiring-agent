@@ -320,8 +320,13 @@ def _stringify_path(v: Any) -> Any:
 def _render_submitted(rows: list[dict]) -> str:
     lines = ["## Submitted"]
     for row in rows:
-        ats = row.get("ats", "unknown")
-        app_id = row.get("application_id", "unknown")
+        # L2-class fix (Phase 1 xhigh, angles A + C): `dict.get(k, default)`
+        # only fires the default when the key is MISSING — not when the
+        # key is present with value None. Decision→row helpers explicitly
+        # set application_id/ats to None for events without them, so the
+        # digest previously rendered '- Submitted to None — application_id None'.
+        ats = row.get("ats") or "unknown"
+        app_id = row.get("application_id") or "unknown"
         lines.append(f"- Submitted to {ats} — application_id {app_id}")
     return "\n".join(lines)
 
@@ -357,7 +362,9 @@ def _render_review_required(rows: list[dict]) -> tuple[str, list[Path]]:
 def _render_auto_declined(rows: list[dict]) -> str:
     lines = ["## Auto-declined"]
     for row in rows:
-        review_id = row.get("review_id", "<unknown>")
+        # L2-class fix — see _render_submitted comment. `or` fallback so a
+        # None value from the Decision-shape row still renders '<unknown>'.
+        review_id = row.get("review_id") or "<unknown>"
         lines.append(f"- Auto-declined — no reply in 72 h (review_id {review_id})")
     return "\n".join(lines)
 
@@ -365,8 +372,9 @@ def _render_auto_declined(rows: list[dict]) -> str:
 def _render_soft_dup(rows: list[dict]) -> str:
     lines = ["## Blocked (soft-dup)"]
     for row in rows:
-        company = row.get("company", "<company>")
-        review_id = row.get("review_id", "<unknown>")
+        # L2-class fix — see _render_submitted comment.
+        company = row.get("company") or "<company>"
+        review_id = row.get("review_id") or "<unknown>"
         lines.append(
             f"- Blocked (soft-dup) — similar role at {company}: "
             f"reply YES {review_id} to override"

@@ -35,42 +35,11 @@ from typing import Iterable
 
 # ── Schema (must stay byte-identical to ``migrations/001_init.sql``) ────────
 
-_CREATE_REVIEW_PENDING = """
-CREATE TABLE IF NOT EXISTS review_pending (
-    review_id           TEXT PRIMARY KEY,
-    job_url             TEXT NOT NULL,
-    apply_url           TEXT NOT NULL,
-    company             TEXT NOT NULL,
-    role_title          TEXT NOT NULL,
-    ats                 TEXT NOT NULL,
-    filled_at           TEXT NOT NULL,
-    screenshot_path     TEXT NOT NULL,
-    trace_path          TEXT,
-    first_sent_at       TEXT NOT NULL,
-    last_repinged_at    TEXT,
-    repings_sent        INTEGER NOT NULL DEFAULT 0,
-    gmail_thread_id     TEXT,
-    resolution          TEXT,
-    resolved_at         TEXT,
-    resume_path         TEXT,
-    cover_letter_path   TEXT,
-    applicant           TEXT,
-    clarified_at        TEXT
-)
-"""
-
-# H4/M1/M12 additive columns: resume_path, cover_letter_path, applicant,
-# clarified_at. Older DBs (created by migration 001) predate these columns —
-# we ALTER them in on-open so both fresh CREATEs and old CREATEs converge on
-# the same shape. ADDs are idempotent-ish: sqlite raises on duplicate columns,
-# which we catch and ignore.
-_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("resume_path", "TEXT"),
-    ("cover_letter_path", "TEXT"),
-    ("applicant", "TEXT"),
-    ("clarified_at", "TEXT"),
-)
-
+# NOTE: the review_pending schema is owned by ``src/apply/migrations/``
+# (001_init.sql + 002_review_pending_paths.sql) — see ``_ensure_schema``
+# below which delegates to ``dedup._execute_migrations`` so this module and
+# DedupDB stay byte-consistent by construction (Phase 1 audit finding SG1/SG7:
+# split-brain schemas cause hard-to-debug column-missing errors).
 
 _INSERT_COLUMNS: tuple[str, ...] = (
     "review_id",
@@ -92,6 +61,7 @@ _INSERT_COLUMNS: tuple[str, ...] = (
     "cover_letter_path",
     "applicant",
     "clarified_at",
+    "initial_msg_id",
 )
 
 
@@ -123,19 +93,16 @@ class ReviewStore:
             pass
 
     def _ensure_schema(self) -> None:
+        # SG1/SG7 fix: delegate to the canonical migration runner so this
+        # module and DedupDB stay byte-consistent by construction. Applies
+        # 001_init.sql (creates review_pending) + 002_review_pending_paths.sql
+        # (H4/M1/M12 additive columns) + 003_review_pending_initial_msg_id.sql
+        # (SE3 exact-msg-id self-filter anchor). Idempotent across cold + warm
+        # starts — see ``dedup._execute_migrations`` for the duplicate-column
+        # OperationalError handling.
+        from src.apply.dedup import _execute_migrations
         with self._conn:
-            self._conn.execute(_CREATE_REVIEW_PENDING)
-            # Idempotent add of the H4/M1/M12 additive columns for DBs that
-            # were created by an earlier CREATE (pre-Phase 1). Each ALTER
-            # raises on duplicate — we catch and continue.
-            for col, sqltype in _ADDITIVE_COLUMNS:
-                try:
-                    self._conn.execute(
-                        f"ALTER TABLE review_pending ADD COLUMN {col} {sqltype}"
-                    )
-                except sqlite3.OperationalError:
-                    # Column already exists — expected on Phase 1 fresh CREATEs.
-                    pass
+            _execute_migrations(self._conn)
 
     # ── CRUD ───────────────────────────────────────────────────────
 

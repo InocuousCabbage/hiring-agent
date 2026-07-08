@@ -382,15 +382,14 @@ def stage_review(
     # Then insert the row with a live thread_id (post-review addition:
     # resume/cover paths + applicant persist so the YES branch can hydrate).
     # H4/M1: pull resume/cover paths off ctx; pull applicant off ctx or
-    # config (falling back to bootstrap's getpass.getuser to unify the key).
-    import getpass
-
+    # config (falling back to _safe_getuser to unify the key convention
+    # with bootstrap.py; SD2 fix wraps `getpass.getuser` in a try/except).
     resume_path = getattr(ctx, "resume_path", None)
     cover_letter_path = getattr(ctx, "cover_letter_path", None)
     applicant = (
         getattr(ctx, "applicant", None)
         or wrapped_config.get("apply", {}).get("user")
-        or getpass.getuser()
+        or _safe_getuser()
     )
 
     store.insert(
@@ -418,6 +417,11 @@ def stage_review(
             "resume_path": str(resume_path) if resume_path else None,
             "cover_letter_path": str(cover_letter_path) if cover_letter_path else None,
             "applicant": applicant,
+            # SE3 addition (Phase 1 xhigh): store the review email's OWN msg_id
+            # so poll_pending_reviews can exact-match filter it out of the
+            # thread, replacing the fragile body-prefix + In-Reply-To heuristic
+            # in `_is_review_own_message`.
+            "initial_msg_id": msg_id,
         }
     )
 
@@ -557,16 +561,23 @@ def execute_confirmed_submit(
     state = load_state_fn(decision.ats, decision.applicant) if load_state_fn else None
     if state is not None:
         # Envelope form → unwrap; already-flat state → pass through.
-        try:
-            from src.apply.bootstrap import unwrap_state  # noqa: E402
-            if isinstance(state, dict) and "state" in state and "last_verified" in state:
+        #
+        # SD5 fix (Phase 1 xhigh): on unwrap failure we DROP the state
+        # entirely (state = None) rather than falling through with the
+        # wrapped envelope still bound — the pre-fix `state` variable
+        # remained the wrapper and was verbatim json.dump'd to the temp
+        # file, reintroducing the exact M2 bug we're supposed to fix.
+        if isinstance(state, dict) and "state" in state and "last_verified" in state:
+            try:
+                from src.apply.bootstrap import unwrap_state  # noqa: E402
                 inner, _lv, _u = unwrap_state(state)
                 state = inner
-        except Exception:  # noqa: BLE001 — malformed envelope shouldn't kill submit
-            log.warning(
-                "apply.review.storage_state_unwrap_failed",
-                review_id=decision.review_id,
-            )
+            except Exception:  # noqa: BLE001 — malformed envelope
+                log.warning(
+                    "apply.review.storage_state_unwrap_failed",
+                    review_id=decision.review_id,
+                )
+                state = None
     tmp_path: Path | None = None
     if state:
         fd, name = tempfile.mkstemp(suffix=".storage_state.json")
@@ -770,37 +781,28 @@ def _extract_msg_id(msg: dict) -> str | None:
     return msg.get("id") or msg.get("msg_id")
 
 
-def _is_review_own_message(msg: dict) -> bool:
+def _is_review_own_message(msg: dict, *, own_msg_ids: set[str] | None = None) -> bool:
     """H3: return True when ``msg`` is the review email itself, not a reply.
 
-    Heuristics (any one match — no false positives in the ambiguous body-first-
-    token space):
-      1. Explicit `is_own` / `own` boolean set by the fake client / caller.
-      2. Absence of an ``In-Reply-To`` header (originals lack it; replies
-         carry it).
-      3. Body starts with the review email's structural signature ``Application to``
-         (rendered by ``_render_review_email`` — L7-safe since candidate PII
-         never appears in that body).
+    SE3 fix (Phase 1 xhigh): now takes the SET of msg_ids we sent from
+    stage_review (persisted per row as `initial_msg_id`) and does an
+    EXACT match instead of the pre-fix body-prefix + In-Reply-To heuristic.
+    The old heuristic silently dropped legitimate operator YES replies
+    whose body top-quoted the original text (iOS Mail, Outlook top-quote,
+    etc.). The exact-msg-id match has zero false positives and zero false
+    negatives on the self-vs-reply question.
+
+    ``own_msg_ids`` is optional so a caller with an incomplete view
+    (e.g. a test fake without the persisted anchor) can still opt into
+    the older fallback heuristics.
     """
+    # Explicit override — used by test fakes to pre-tag their sent messages.
     if msg.get("is_own") or msg.get("own"):
         return True
-    headers = msg.get("headers") or {}
-    if isinstance(headers, dict):
-        # Case-insensitive lookup: Gmail returns 'In-Reply-To' but callers
-        # sometimes normalize to lowercase.
-        in_reply_to = None
-        for k, v in headers.items():
-            if k.lower() == "in-reply-to":
-                in_reply_to = v
-                break
-        if in_reply_to is None:
-            body = msg.get("body_text") or msg.get("text") or msg.get("body") or ""
-            if body.lstrip().startswith("Application to "):
-                return True
-    else:
-        # No headers at all — fall back to body prefix test only.
-        body = msg.get("body_text") or msg.get("text") or msg.get("body") or ""
-        if body.lstrip().startswith("Application to "):
+    # SE3 primary path: exact msg_id match against the persisted anchor set.
+    if own_msg_ids:
+        mid = msg.get("id") or msg.get("msg_id")
+        if mid and mid in own_msg_ids:
             return True
     return False
 
@@ -809,15 +811,65 @@ def _msg_sort_key(msg: dict) -> tuple:
     """Return a sort key for latest-wins thread selection.
 
     Prefers ``internal_date`` (Gmail's ms-precision int) then falls back to
-    numeric portion of the message id. All missing → ``(0, "")`` so an
-    id-less/date-less message loses to any other.
+    an integer id tiebreaker. All missing → ``(0, 0, "")`` so an id-less/
+    date-less message loses to any other.
+
+    SD4 fix (Phase 1 xhigh): the pre-fix tiebreaker used a raw string
+    compare on the id (``str(msg.get("id"))``), so 'MSG_10' sorted BEFORE
+    'MSG_2' lexicographically — the poller silently picked the older
+    reply. Now we extract the trailing integer digits so numeric ids sort
+    correctly, and fall back to string comparison last.
     """
     idate = msg.get("internal_date") or msg.get("internalDate") or 0
     try:
         idate = int(idate)
     except (TypeError, ValueError):
         idate = 0
-    return (idate, str(msg.get("id") or msg.get("msg_id") or ""))
+    raw_id = str(msg.get("id") or msg.get("msg_id") or "")
+    # Extract trailing digits for numeric tiebreak (SD4).
+    digits = ""
+    for ch in reversed(raw_id):
+        if ch.isdigit():
+            digits = ch + digits
+        else:
+            break
+    try:
+        int_id = int(digits) if digits else 0
+    except ValueError:
+        int_id = 0
+    return (idate, int_id, raw_id)
+
+
+def _safe_getuser() -> str:
+    """SD2 fix (Phase 1 xhigh): sandboxed hosting environments (systemd,
+    Lambda, containers with stripped LOGNAME) can raise ``OSError`` /
+    ``KeyError`` from ``getpass.getuser()``. Guard so stage_review never
+    dies on the applicant fallback path — 'single' matches bootstrap.py's
+    Q7 single-user default.
+    """
+    import getpass  # noqa: E402 — stdlib, lazy for import cost
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):
+        return "single"
+
+
+def _bare_address(raw: str | None) -> str | None:
+    """Return the canonical bare-address form of ``raw``: strip display name,
+    quoted comments, angle brackets — then lowercase.
+
+    Uses ``email.utils.parseaddr`` so RFC 5322 forms (quoted display name,
+    embedded angle brackets, comments) are handled correctly. Returns
+    ``None`` when ``raw`` is empty/None or when parseaddr returns an empty
+    address slot.
+    """
+    if not raw:
+        return None
+    from email.utils import parseaddr  # noqa: E402 — stdlib, lazy for import cost
+    _display, addr = parseaddr(raw)
+    if not addr:
+        return None
+    return addr.strip().lower() or None
 
 
 def _extract_from(msg: dict) -> str | None:
@@ -825,17 +877,13 @@ def _extract_from(msg: dict) -> str | None:
     the poller can drop messages that did NOT come from the authorized replier.
 
     Returns a bare address without the ``Name <addr>`` decoration when possible.
+    SE5 fix (Phase 1 xhigh): RFC 5322 parsing via `email.utils.parseaddr`
+    instead of the pre-fix `raw.index('<')` / `raw.index('>')` heuristic which
+    misparsed quoted display names containing angle brackets.
     """
-    raw = msg.get("from") or msg.get("from_addr") or msg.get("sender") or ""
-    if not raw:
-        return None
-    # Handle "Display Name <addr@example.com>" — take the address inside <>.
-    if "<" in raw and ">" in raw:
-        try:
-            return raw[raw.index("<") + 1 : raw.index(">")].strip().lower()
-        except ValueError:
-            pass
-    return raw.strip().lower()
+    return _bare_address(
+        msg.get("from") or msg.get("from_addr") or msg.get("sender") or ""
+    )
 
 
 def _authorized_replier(config: dict) -> str | None:
@@ -851,14 +899,7 @@ def _authorized_replier(config: dict) -> str | None:
     except Exception:  # pragma: no cover — defensive
         return None
     val = _resolve_recipient(config)
-    if not val:
-        return None
-    if "<" in val and ">" in val:
-        try:
-            val = val[val.index("<") + 1 : val.index(">")]
-        except ValueError:
-            pass
-    return val.strip().lower()
+    return _bare_address(val)
 
 
 def poll_pending_reviews(
@@ -889,10 +930,19 @@ def poll_pending_reviews(
     timeout_hours = int(config["apply"].get("review_timeout_hours", 72))
 
     # H1: resolve the authorized replier ONCE per tick. Messages whose From
-    # header does NOT match are ignored (not parsed as YES/NO). Fail closed
-    # if MY_EMAIL is unresolvable — no messages are trusted, the row waits
-    # for auto-decline instead of being spoofed into submission.
+    # header does NOT match are ignored (not parsed as YES/NO). SE1/SE2/SE8
+    # fix (Phase 1 xhigh): FAIL CLOSED — if MY_EMAIL is unresolvable or the
+    # message carries no From header, drop it. The pre-fix `if sender is
+    # not None and sender != authorized` guard fell OPEN on either failure
+    # mode, which meant that in production (where GmailClient.search never
+    # surfaced the From header) every reply passed the filter regardless
+    # of who sent it.
     authorized = _authorized_replier(config)
+    if authorized is None:
+        log.warning(
+            "apply.review.poll_fail_closed",
+            reason="authorized_replier_unresolved",
+        )
 
     # H3: identify the review email's own thread-anchor message. Under the
     # single-account default (review sent to self) the first-in-thread
@@ -913,6 +963,16 @@ def poll_pending_reviews(
     query = f'label:"{pending_label_full}" in:inbox newer_than:4d'
     inbound = gmail.search(query)
 
+    # SE3 anchor set — collect every review email's own msg_id (persisted at
+    # stage time as `initial_msg_id`). H3 self-filter uses exact-match on
+    # this set, replacing the fragile body-prefix + In-Reply-To heuristic.
+    open_rows = store.list_open()
+    own_msg_ids: set[str] = set()
+    for r in open_rows:
+        anchor = r.get("initial_msg_id")
+        if anchor:
+            own_msg_ids.add(anchor)
+
     # Index inbound messages by thread_id, keeping the LATEST non-self,
     # authorized reply per thread. The pre-fix code stored first-message-wins
     # which meant the review email's OWN body drove parsing (H3).
@@ -922,18 +982,25 @@ def poll_pending_reviews(
         if not tid:
             continue
 
-        # H1: skip messages whose From is not the authorized replier.
-        if authorized is not None:
-            sender = _extract_from(msg)
-            if sender is not None and sender != authorized:
-                log.info(
-                    "apply.review.reply_ignored_unauthorized",
-                    thread_id=tid,
-                )
-                continue
+        # H1: FAIL CLOSED on both unresolved-authorized AND missing-From.
+        # Only the authorized replier's messages advance to parsing; anything
+        # else waits for auto-decline. This closes the SE1 production leak
+        # (search() didn't surface From → sender was None → filter fell
+        # through) and the SE2/SE8 unresolved-env leak (authorized was None
+        # → filter block was skipped entirely).
+        sender = _extract_from(msg)
+        if authorized is None or sender is None or sender != authorized:
+            log.info(
+                "apply.review.reply_ignored_unauthorized",
+                thread_id=tid,
+                reason=("authorized_unresolved" if authorized is None
+                        else "sender_missing" if sender is None
+                        else "sender_mismatch"),
+            )
+            continue
 
-        # H3: skip messages that ARE the review email itself.
-        if _is_review_own_message(msg):
+        # H3: skip messages that ARE the review email itself (SE3 exact match).
+        if _is_review_own_message(msg, own_msg_ids=own_msg_ids):
             continue
 
         # Latest-wins: prefer higher internal_date (or int-convertible id).
@@ -942,21 +1009,32 @@ def poll_pending_reviews(
             inbound_by_thread[tid] = msg
 
     decisions: list[Decision] = []
-    open_rows = store.list_open()
 
     for row in open_rows:
-        decision = _resolve_one(
-            row=row,
-            inbound_by_thread=inbound_by_thread,
-            gmail=gmail,
-            store=store,
-            now=now,
-            reping_hours=reping_hours,
-            timeout_hours=timeout_hours,
-            label_ids=label_ids,
-            adapter=adapter,
-            config=config,
-        )
+        # SA5/SC4 fix (Phase 1 xhigh): per-row try/except so a Gmail failure
+        # on ONE row (transient reply_to_thread 5xx, empty-thread-metadata,
+        # label API error) doesn't abort the whole poll sweep and starve
+        # every other pending row's YES/NO resolution this tick.
+        try:
+            decision = _resolve_one(
+                row=row,
+                inbound_by_thread=inbound_by_thread,
+                gmail=gmail,
+                store=store,
+                now=now,
+                reping_hours=reping_hours,
+                timeout_hours=timeout_hours,
+                label_ids=label_ids,
+                adapter=adapter,
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001 — per-row isolation
+            log.warning(
+                "apply.review.row_resolve_failed",
+                review_id=row.get("review_id"),
+                error=str(exc),
+            )
+            continue
         if decision is not None:
             decisions.append(decision)
 
