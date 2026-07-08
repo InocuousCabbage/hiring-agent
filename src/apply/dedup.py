@@ -422,6 +422,16 @@ class DedupDB:
         ats_domain = _extract_ats_domain(apply_url)
         ats_job_id = _extract_ats_job_id(apply_url)
 
+        # B2 fix: coerce Path values to str before binding. ``ApplyResult``
+        # types these as ``Path | None``; sqlite3 raises
+        # ``ProgrammingError: type PosixPath is not supported`` at bind time
+        # (parameters 14 + 15). Idempotent when the caller already passes a
+        # str; ``None`` and falsy values collapse to ``None``.
+        confirmation_screenshot_str = (
+            str(confirmation_screenshot) if confirmation_screenshot else None
+        )
+        trace_path_str = str(trace_path) if trace_path else None
+
         row = (
             applicant,
             company,
@@ -436,8 +446,8 @@ class DedupDB:
             application_id,
             status,
             review_id,
-            confirmation_screenshot,
-            trace_path,
+            confirmation_screenshot_str,
+            trace_path_str,
             _utcnow_iso(),
             submitted_at,
         )
