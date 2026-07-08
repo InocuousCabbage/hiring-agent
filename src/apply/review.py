@@ -528,16 +528,36 @@ def execute_confirmed_submit(
 
     # Belt-and-suspenders: check dedup BEFORE re-running the adapter. If a
     # background task recorded this app during the review window, short-circuit.
+    #
+    # xhigh-H7/H13: pass REAL ats_domain + ats_job_id extracted from
+    # decision.apply_url so the query matches the (ats_domain, ats_job_id)
+    # UNIQUE index shape, NOT the fallback job_url-only branch which was a
+    # cross-user leak (applicant A's YES on the same job_url matched
+    # applicant B's row). Also filter by applicant to close the same leak
+    # even when the pair is known.
+    from src.apply.dedup import _extract_ats_domain, _extract_ats_job_id  # noqa: E402
+    _ats_domain = _extract_ats_domain(decision.apply_url)
+    _ats_job_id = _extract_ats_job_id(decision.apply_url)
     try:
         already = dedup_db.was_applied(
             company=decision.company,
-            ats_domain=None,
-            ats_job_id=None,
+            ats_domain=_ats_domain,
+            ats_job_id=_ats_job_id,
             job_url=decision.apply_url,
+            applicant=decision.applicant or None,
         )
     except TypeError:
-        # Support DedupDB.was_applied signatures that differ slightly.
-        already = dedup_db.was_applied(decision.apply_url)
+        # Support DedupDB.was_applied signatures that differ slightly
+        # (e.g. test doubles without the applicant kwarg).
+        try:
+            already = dedup_db.was_applied(
+                company=decision.company,
+                ats_domain=_ats_domain,
+                ats_job_id=_ats_job_id,
+                job_url=decision.apply_url,
+            )
+        except TypeError:
+            already = dedup_db.was_applied(decision.apply_url)
     if already:
         log.info(
             "apply.review.already_recorded",
@@ -652,6 +672,29 @@ def execute_confirmed_submit(
                 "already_applied",
                 ats=decision.ats,
                 apply_url=decision.apply_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # xhigh-BLOCKING: record failed for a non-uniqueness reason
+            # (locked DB, disk I/O, permissions, etc.). The ATS DID accept
+            # the submission (status=='submitted' proved by the adapter's
+            # DOM-verified confirm). Escalate to submitted_unrecorded so
+            # the YES-branch caller (_handle_yes) marks the review row
+            # resolved (not stuck pending → auto_decline for a real submit)
+            # and the digest bucket surfaces the double-submit risk.
+            log.error(
+                "apply.review.record_failed.escalated",
+                review_id=decision.review_id,
+                exc_type=type(exc).__name__,
+            )
+            return _fake_apply_result(
+                "submitted_unrecorded",
+                ats=decision.ats,
+                apply_url=decision.apply_url,
+                application_id=getattr(result, "application_id", None),
+                confirmation_screenshot=getattr(result, "confirmation_screenshot", None),
+                submitted_at=getattr(result, "submitted_at", None),
+                trace_path=getattr(result, "trace_path", None),
+                reason=f"record_failed: {type(exc).__name__}",
             )
     else:
         log.warning(
@@ -1076,7 +1119,17 @@ def _resolve_one(
     # but was never parsed as YES/NO within the window.
     if age >= timedelta(hours=timeout_hours):
         resolved_at = _iso(now)
-        store.mark_resolved(review_id, "auto_declined", resolved_at)
+        # xhigh-H12: guarded CAS. Only auto-decline if the row is still
+        # open. If a concurrent YES/NO handler resolved it during this
+        # tick, do NOT clobber with 'auto_declined'.
+        won = store.mark_resolved_from_open(review_id, "auto_declined", resolved_at)
+        if not won:
+            log.info(
+                "apply.review.auto_decline_cas_lost",
+                review_id=review_id,
+                reason="row already resolved (YES/NO)",
+            )
+            return None
         # Label move: pending → declined. Target the message id when the row
         # has a Gmail thread — a reply message id is preferred (a reply is
         # present in ``inbound_by_thread`` even for the auto-decline branch
@@ -1241,19 +1294,59 @@ def _handle_yes(
     # (dedup.record landed in applied_jobs) and mark_resolved (review_pending)
     # on a prior tick. The real application IS out at the ATS — reconcile as
     # submitted rather than leaving the row pending to be auto_declined for
-    # a real submission. The `store.mark_resolved` call below (single write
-    # path per L3) overwrites the interim 'claiming' resolution with
-    # 'submitted' as the final state.
-    submit_ok = status in ("submitted", "already_applied")
+    # a real submission. The `store.mark_resolved_from_claiming` call below
+    # (single write path per L3) overwrites the interim 'claiming' resolution
+    # with the final resolution.
+    #
+    # xhigh-BLOCKING/H2: include 'submitted_unrecorded' — the ATS DID accept
+    # the submission, only the DB record failed. Leaving the row pending
+    # would guarantee a real double-submit on the next tick (this adapter
+    # re-run would fire again and hit the same posting). Distinct resolution
+    # value so the digest bucket and any compliance query can tell it apart.
+    if status == "submitted":
+        submit_ok = True
+        final_resolution = "submitted"
+    elif status == "already_applied":
+        submit_ok = True
+        final_resolution = "submitted"  # M4: reconcile as submitted.
+    elif status == "submitted_unrecorded":
+        submit_ok = True
+        final_resolution = "submitted_unrecorded"  # xhigh-BLOCKING/H2
+    else:
+        submit_ok = False
+        final_resolution = None  # unused
 
     if submit_ok:
         resolved_at = _iso(now)
-        # mark_resolved overwrites the interim 'claiming' resolution set by
-        # try_claim above with the final 'submitted' resolution.
-        store.mark_resolved(review_id, "submitted", resolved_at)
+        # xhigh-H5: guarded CAS from 'claiming' → final_resolution so a
+        # concurrent handler that already resolved the row (via mark_resolved
+        # or auto_decline) cannot be clobbered. Falls back to unguarded only
+        # if the CAS misses (e.g. the row was reset via release_claim by a
+        # test double).
+        won = store.mark_resolved_from_claiming(
+            review_id, final_resolution, resolved_at
+        )
+        if not won:
+            log.info(
+                "apply.review.resolve_cas_lost",
+                review_id=review_id,
+                intended_resolution=final_resolution,
+                reason="row not in 'claiming' state at CAS time",
+            )
         gmail.apply_label(msg_id, label_ids["submitted"])
         gmail.remove_label(msg_id, label_ids["pending"])
-        return decision
+        # xhigh-BLOCKING/H2: return a decision carrying the actual status so
+        # the digest bucket surfaces the submitted_unrecorded warning.
+        return Decision(
+            review_id=review_id,
+            status=status if status == "submitted_unrecorded" else "submitted",
+            apply_url=row["apply_url"],
+            ats=row["ats"],
+            company=row["company"],
+            role_title=row["role_title"],
+            applicant=row.get("applicant") or "",
+            thread_id=row.get("gmail_thread_id") or "",
+        )
 
     # Submit failed — release the 'claiming' interim claim so a retry can
     # happen on the next tick. Do NOT move the label; do NOT resolve; keep
@@ -1289,7 +1382,17 @@ def _handle_no(
 ) -> Decision:
     review_id = row["review_id"]
     resolved_at = _iso(now)
-    store.mark_resolved(review_id, "declined", resolved_at)
+    # xhigh-H12: guarded CAS. Only resolve if the row is still open — if a
+    # concurrent YES handler already marked it 'submitted' (or the row was
+    # already claimed via try_claim), do NOT clobber. Falls back to logging
+    # the CAS miss so the operator can trace the race.
+    won = store.mark_resolved_from_open(review_id, "declined", resolved_at)
+    if not won:
+        log.info(
+            "apply.review.no_resolve_cas_lost",
+            review_id=review_id,
+            reason="row already resolved by another handler (YES/auto_decline)",
+        )
     gmail.apply_label(msg_id, label_ids["declined"])
     gmail.remove_label(msg_id, label_ids["pending"])
     log.info(
