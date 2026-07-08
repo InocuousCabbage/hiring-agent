@@ -493,6 +493,57 @@ def test_gmail_client_retry_call_removed():
         )
 
 
+def test_gmail_client_uses_canonical_src_apply_retries_prefix():
+    """Regression guard: gmail client must import via ``src.apply.retries``,
+    not bare ``apply.retries``.
+
+    The bare-``apply.`` prefix works at runtime ONLY because ``main.py``
+    inserts ``src/`` on ``sys.path``. In any other bootstrap (adapter code
+    importing ``src.gmail.client`` directly, plain ``python3 -c`` context,
+    or a future test that skips the shim) the two prefixes resolve to
+    DIFFERENT ``sys.modules`` entries — the ``@navigation_retry`` bound
+    inside gmail/client.py becomes a different function object than the
+    one adapters get via ``from src.apply.retries``. Any identity check
+    (``is``, ``.retry`` attribute lookup on a shared instance, etc.)
+    silently fails downstream.
+
+    Grep-based lint keeps the file surface honest: the source must contain
+    zero bare ``from apply.X`` imports.
+    """
+    import re
+
+    client_path = ROOT / "src" / "gmail" / "client.py"
+    source = client_path.read_text()
+    bare_imports = re.findall(r"^\s*from\s+apply\.", source, re.MULTILINE)
+    assert not bare_imports, (
+        f"src/gmail/client.py contains {len(bare_imports)} bare "
+        f"'from apply.X' import(s) — must use 'from src.apply.X' to match "
+        f"the src/ convention and preserve module identity across bootstraps."
+    )
+
+
+def test_gmail_client_navigation_retry_identity_matches_canonical():
+    """The ``navigation_retry`` bound inside gmail.client must be the SAME
+    object as ``src.apply.retries.navigation_retry``.
+
+    When client.py imports via bare-prefix ``from apply.retries``, Python
+    registers the module under the ``apply.retries`` key in ``sys.modules``.
+    When adapters import via ``from src.apply.retries``, the module is
+    registered under the ``src.apply.retries`` key. Same file, two module
+    objects — decorators bound in each are not ``is``-equal. This test
+    fails on the bare-prefix state and passes once the client normalizes
+    to ``src.apply.retries``.
+    """
+    import src.gmail.client as gmail_client
+    import src.apply.retries as canonical_retries
+
+    assert gmail_client.navigation_retry is canonical_retries.navigation_retry, (
+        "gmail.client.navigation_retry is NOT the same object as "
+        "src.apply.retries.navigation_retry — client is importing via a "
+        "different sys.modules entry (probably bare 'apply.retries')."
+    )
+
+
 # ── before_sleep hook robustness ─────────────────────────────────
 
 
