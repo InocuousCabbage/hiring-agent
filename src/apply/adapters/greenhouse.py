@@ -681,7 +681,20 @@ def _record_or_escalate(
         the same DOM-verified evidence (apply_url, application_id,
         screenshot, trace, submitted_at) plus a ``reason`` string that
         names the underlying exception type.
+
+    xhigh-BLOCKING/H1: when ``dedup`` is ``None`` (the YES-branch replay
+    path via ``review._AutoModeCtx`` which explicitly sets ``ctx.dedup =
+    None`` so the outer ``execute_confirmed_submit`` owns the record()
+    call), this helper returns ``result`` unchanged. Pre-fix, the blanket
+    ``except Exception`` swallowed the ``AttributeError`` from ``None.record``
+    and returned ``submitted_unrecorded`` with a bogus 'AttributeError'
+    reason — both mislabeling the outcome AND double-taxing the record
+    responsibility (execute_confirmed_submit also calls dedup_db.record()).
     """
+    if dedup is None:
+        # YES-branch replay — the caller (execute_confirmed_submit) owns
+        # the record() call. Return the DOM-verified success unchanged.
+        return result
     try:
         dedup.record(
             result,
@@ -743,16 +756,34 @@ def _soft_warn_lookup(dedup: Any, company: str, role_title: str) -> list[dict]:
 
     Post-fix: this helper normalizes inputs with the exact same functions
     `record()` uses, then calls `soft_warn_check(company_norm, role_norm)`.
-    Returns an empty list on any exception (never blocks the apply path).
+
+    xhigh-H8: FAIL CLOSED on any exception. Pre-fix returned ``[]`` which
+    disabled the soft-warn gate silently — a broken DB would open the
+    auto-submit path. Post-fix returns a synthetic sentinel hit so
+    ``soft_warn_active=True`` at the call site routes to review.
+    ``dedup=None`` is treated the same way — the caller (adapter) has no
+    dedup surface, safest default is to route to review.
     """
     from src.apply.dedup import normalize_company, normalize_role
+    if dedup is None:
+        # xhigh-H8: no dedup surface → fail closed to review.
+        return [{"reason": "soft_warn_lookup_no_dedup", "synthetic": True}]
     try:
         return dedup.soft_warn_check(
             normalize_company(company or ""),
             normalize_role(role_title or ""),
         ) or []
-    except Exception:
-        return []
+    except Exception as exc:  # noqa: BLE001 — fail-CLOSED per xhigh-H8
+        log.warning(
+            "apply.soft_warn_lookup_failed",
+            extra={
+                "ats": _ADAPTER_NAME,
+                "exc_type": type(exc).__name__,
+                "company": company,
+            },
+        )
+        # Synthetic hit → soft_warn_active=True at the call site → review.
+        return [{"reason": "soft_warn_lookup_failed", "synthetic": True}]
 
 
 # ── Adapter class ────────────────────────────────────────────────────────────
