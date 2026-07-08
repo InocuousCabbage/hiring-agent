@@ -531,6 +531,16 @@ class DedupDB:
 _DEFAULT_DB_RELATIVE = Path("state") / "applied_jobs.db"
 
 
+def _is_sqlite_special_path(raw: str) -> bool:
+    """True if ``raw`` is a SQLite non-filesystem path spec that must pass
+    through unchanged: ``":memory:"`` (in-memory DB) or a ``file:...`` URI
+    (see sqlite3.connect docs). Anchoring these at repo root would break
+    SQLite's special-path handling — e.g. turn ``":memory:"`` into a real
+    file literally named ``:memory:`` under the repo.
+    """
+    return raw == ":memory:" or raw.startswith("file:")
+
+
 def _anchor_at_repo_root(raw: str | os.PathLike[str]) -> Path:
     """Return an absolute Path for ``raw``, anchoring relative values at repo
     root (never CWD). Absolute inputs pass through unchanged. Home-relative
@@ -540,8 +550,16 @@ def _anchor_at_repo_root(raw: str | os.PathLike[str]) -> Path:
     same repo invoked from two working directories would create TWO separate
     SQLite DBs, causing split-brain dedup state and silent double-applies.
     Anchoring at repo root ensures every invocation sees the same DB.
+
+    SQLite special paths (``":memory:"``, ``"file:..."``) pass through — see
+    ``_is_sqlite_special_path``.
     """
-    p = Path(raw).expanduser()
+    raw_str = os.fspath(raw)
+    if _is_sqlite_special_path(raw_str):
+        # Return a bare Path around the spec — SQLite consumes this via
+        # ``sqlite3.connect(str(path))`` which preserves the special spec.
+        return Path(raw_str)
+    p = Path(raw_str).expanduser()
     if p.is_absolute():
         return p
     return _REPO_ROOT / p

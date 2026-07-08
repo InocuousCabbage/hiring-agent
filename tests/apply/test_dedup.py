@@ -572,3 +572,29 @@ def test_dedup_db_path_config_relative_value_anchored_to_repo_root(tmp_path, mon
     )
     assert resolved.name == "dedup.db"
     assert resolved.parent.name == "var"
+
+
+def test_dedup_db_path_preserves_sqlite_memory_special_path(tmp_path, monkeypatch):
+    """SQLite's ``:memory:`` in-memory-DB spec must NOT be treated as a relative
+    filesystem path. Anchoring it at repo root would create a real file
+    literally named ``:memory:`` and silently kill the in-memory semantics.
+    """
+    from src.apply.dedup import _resolve_db_path
+
+    monkeypatch.chdir(tmp_path)
+    resolved = _resolve_db_path({"apply": {"dedup_db_path": ":memory:"}})
+    assert str(resolved) == ":memory:", (
+        f"expected ':memory:' passthrough; got {resolved!r} — would create a "
+        f"real file and lose in-memory SQLite semantics"
+    )
+
+
+def test_dedup_db_path_preserves_sqlite_file_uri(tmp_path, monkeypatch):
+    """SQLite ``file:...`` URI form (e.g. shared-cache in-memory DB) must
+    pass through unchanged — anchoring it would corrupt the URI."""
+    from src.apply.dedup import _resolve_db_path
+
+    monkeypatch.chdir(tmp_path)
+    uri = "file::memory:?cache=shared"
+    resolved = _resolve_db_path({"apply": {"dedup_db_path": uri}})
+    assert str(resolved) == uri
