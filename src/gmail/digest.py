@@ -34,8 +34,13 @@ _log = logging.getLogger(__name__)
 DigestPayload = namedtuple("DigestPayload", ["body", "attachments"])
 
 # Fixed order for the rollup blocks (spec §Acceptance criterion #3, #4).
+#
+# xhigh-BLOCKING/H3: `submitted_unrecorded` renders BETWEEN Submitted and
+# Review-required so operators see the double-submit-risk warning right
+# after the successful submissions — high visibility for the escalation.
 _BLOCK_ORDER: tuple[str, ...] = (
     "submitted",
+    "submitted_unrecorded",
     "review_required",
     "auto_declined",
     "soft_dup",
@@ -196,6 +201,9 @@ def _render_apply_rollup(
         row = _apply_result_to_row(ar)
         if status == "submitted":
             buckets["submitted"].append(row)
+        elif status == "submitted_unrecorded":
+            # xhigh-BLOCKING/H3
+            buckets["submitted_unrecorded"].append(row)
         elif status == "review_required":
             buckets["review_required"].append(row)
         elif status == "auto_declined":
@@ -210,6 +218,9 @@ def _render_apply_rollup(
 
     if buckets["submitted"]:
         parts.append(_render_submitted(buckets["submitted"]))
+    if buckets["submitted_unrecorded"]:
+        # xhigh-BLOCKING/H3
+        parts.append(_render_submitted_unrecorded(buckets["submitted_unrecorded"]))
     if buckets["review_required"]:
         block, atts = _render_review_required(buckets["review_required"])
         parts.append(block)
@@ -244,6 +255,9 @@ def _decision_status_to_bucket(status: Any) -> str | None:
     """H11: map a `Decision.status` string to the digest bucket kind."""
     if status == "submitted":
         return "submitted"
+    if status == "submitted_unrecorded":
+        # xhigh-BLOCKING/H3
+        return "submitted_unrecorded"
     if status == "review_required":
         return "review_required"
     if status == "auto_declined":
@@ -328,6 +342,25 @@ def _render_submitted(rows: list[dict]) -> str:
         ats = row.get("ats") or "unknown"
         app_id = row.get("application_id") or "unknown"
         lines.append(f"- Submitted to {ats} — application_id {app_id}")
+    return "\n".join(lines)
+
+
+def _render_submitted_unrecorded(rows: list[dict]) -> str:
+    """xhigh-BLOCKING/H3 renderer. Surfaces DOM-verified submissions whose
+    ``DedupDB.record()`` call failed — the ATS accepted the submission but
+    the applied_jobs row never landed. Operators MUST see this because the
+    next run's ``was_applied`` precheck will miss and the agent could
+    silently double-apply if the DB glitch persists.
+    """
+    lines = ["## Submitted (not recorded — double-submit risk)"]
+    for row in rows:
+        ats = row.get("ats") or "unknown"
+        app_id = row.get("application_id") or "unknown"
+        reason = row.get("reason") or "unknown_record_error"
+        lines.append(
+            f"- Submitted_unrecorded to {ats} — application_id {app_id} "
+            f"(record failed: {reason})"
+        )
     return "\n".join(lines)
 
 
