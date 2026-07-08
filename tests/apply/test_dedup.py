@@ -468,40 +468,6 @@ def test_no_naive_datetime_utcnow_in_module():
     )
 
 
-# ── review_pending roundtrip ────────────────────────────────────────────────
-
-def test_review_pending_roundtrip(tmp_path):
-    db = DedupDB(_db_path(tmp_path))
-
-    review_id = "019078e0-abcd-7890-1234-56789abcdef0"
-    db.insert_review_pending(
-        review_id=review_id,
-        job_url="https://boards.greenhouse.io/acme/jobs/99",
-        apply_url="https://boards.greenhouse.io/acme/jobs/99/application",
-        company="Acme",
-        role_title="Staff Engineer",
-        ats="boards.greenhouse.io",
-        screenshot_path="/tmp/foo.png",
-        trace_path=None,
-        gmail_thread_id="thread_abc",
-    )
-
-    row = db.get_review_pending(review_id)
-    assert row is not None, "get_review_pending returned None after insert"
-    for key in (
-        "review_id",
-        "job_url",
-        "apply_url",
-        "company",
-        "role_title",
-        "ats",
-        "screenshot_path",
-    ):
-        assert key in row, f"expected key {key!r} in review_pending row; got {row!r}"
-    assert row["review_id"] == review_id
-    assert row["job_url"] == "https://boards.greenhouse.io/acme/jobs/99"
-
-
 # ── db_path resolution (CWD split-brain guard) ──────────────────────────────
 
 

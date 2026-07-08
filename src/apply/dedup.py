@@ -1,10 +1,14 @@
 """src/apply/dedup.py — S5 SQLite-backed dedup DB.
 
 Owns:
-    * `DedupDB` class — hard-dedup + soft-warn + rate-limit surface + review_pending.
+    * `DedupDB` class — hard-dedup + soft-warn + rate-limit surface.
     * `AlreadyAppliedError` — raised on hard-dup insert.
     * `normalize_company` / `normalize_role` — pure normalizers (importable by S8/S12).
     * CLI: `python -m src.apply.dedup --unblock <job_url>`.
+
+Note: the ``review_pending`` table is CREATED by the 001 migration in this
+module, but its Python-side CRUD lives in ``src/apply/state_store.ReviewStore``
+— a single write-path avoids two drifting layers over one table (L3 audit).
 
 Consumed by S8 (adapters), S12 (review loop), S14 (digest), S17 (seam-wiring).
 See master-plan §4.6 (schema), §4.7 (config keys), §12 success criteria #4-5.
@@ -270,7 +274,12 @@ def _execute_migrations(conn: sqlite3.Connection) -> None:
 
 
 class DedupDB:
-    """SQLite-backed dedup + rate-limit + review-pending store.
+    """SQLite-backed dedup + rate-limit surface.
+
+    Owns hard-dedup (``applied_jobs`` UNIQUE index), soft-warn, and per-ATS
+    rate-limit counts. The ``review_pending`` table lives in the same DB file
+    but is written through ``src/apply/state_store.ReviewStore`` (L3 audit:
+    two write paths for one table is a landmine).
 
     The class is intentionally small: each method opens its own connection via
     `with self._connect() as conn, conn:`. If the S8 fill loop shows this hot,
@@ -483,107 +492,6 @@ class DedupDB:
                 (job_url,),
             )
             return int(cur.rowcount)
-
-    # ── review_pending ──
-
-    def insert_review_pending(
-        self,
-        *,
-        review_id: str,
-        job_url: str,
-        apply_url: str,
-        company: str,
-        role_title: str,
-        ats: str,
-        screenshot_path: str,
-        trace_path: str | None,
-        gmail_thread_id: str | None,
-    ) -> None:
-        """Insert a row into ``review_pending``. The Gmail review loop (S12)
-        calls this when an apply requires human review.
-
-        H1 fix: the reconciled schema uses ``filled_at`` and ``first_sent_at``
-        in place of the old ``created_at``. Both fall to _utcnow_iso() here
-        since the row is inserted immediately after the review email is sent.
-        """
-        now = _utcnow_iso()
-        with self._connect() as conn, conn:
-            conn.execute(
-                "INSERT INTO review_pending ("
-                "review_id, job_url, apply_url, company, role_title, ats, "
-                "filled_at, screenshot_path, trace_path, "
-                "first_sent_at, last_repinged_at, repings_sent, "
-                "gmail_thread_id, resolution, resolved_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    review_id,
-                    job_url,
-                    apply_url,
-                    company,
-                    role_title,
-                    ats,
-                    now,
-                    screenshot_path,
-                    trace_path,
-                    now,
-                    None,
-                    0,
-                    gmail_thread_id,
-                    None,
-                    None,
-                ),
-            )
-
-    def get_review_pending(self, review_id: str) -> dict | None:
-        """Return the ``review_pending`` row for ``review_id`` as a dict, or None."""
-        with self._connect() as conn, conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT * FROM review_pending WHERE review_id = ?",
-                (review_id,),
-            )
-            row = cur.fetchone()
-        return dict(row) if row is not None else None
-
-    def list_pending_reviews(self) -> list[dict]:
-        """Return all rows where ``resolution IS NULL``, oldest first.
-
-        H1 fix: ordering uses ``first_sent_at`` (post-reconciliation column
-        name) instead of the retired ``created_at``.
-        """
-        with self._connect() as conn, conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT * FROM review_pending "
-                "WHERE resolution IS NULL "
-                "ORDER BY first_sent_at ASC"
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-    def update_review_resolution(
-        self,
-        review_id: str,
-        resolution: str,
-        last_repinged_at: str | None = None,
-    ) -> None:
-        """Set the resolution (and optionally the last-repinged timestamp) for
-        the given ``review_id``."""
-        with self._connect() as conn, conn:
-            if last_repinged_at is not None:
-                conn.execute(
-                    "UPDATE review_pending "
-                    "SET resolution = ?, last_repinged_at = ? "
-                    "WHERE review_id = ?",
-                    (resolution, last_repinged_at, review_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE review_pending "
-                    "SET resolution = ? "
-                    "WHERE review_id = ?",
-                    (resolution, review_id),
-                )
-
 
 # ── CLI: `python -m src.apply.dedup --unblock <job_url>` ─────────────────────
 
