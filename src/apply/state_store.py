@@ -79,6 +79,13 @@ class ReviewStore:
     def __init__(self, db_path: str | Path):
         # ``sqlite3.connect`` accepts ":memory:" as-is; Path gets str-ified.
         self.db_path = str(db_path) if not isinstance(db_path, str) else db_path
+        # Match DedupDB's behavior: mkdir the parent so callers can pass a
+        # nested path (e.g. ``tmp_path / "state" / "applied_jobs.db"``) even
+        # when DedupDB hasn't been instantiated first. Skip for ``:memory:``.
+        if self.db_path != ":memory:":
+            parent = Path(self.db_path).parent
+            if str(parent) and str(parent) != ".":
+                parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._ensure_schema()
@@ -157,6 +164,44 @@ class ReviewStore:
                 "SET resolution = ?, resolved_at = ? "
                 "WHERE review_id = ?",
                 (resolution, at, review_id),
+            )
+
+    def try_claim(self, review_id: str, at: str) -> bool:
+        """H10: atomically claim a review row for the YES-branch submit.
+
+        Sets ``resolution='claiming'`` and ``resolved_at=at`` iff the row's
+        current ``resolution`` is NULL. Returns True on success (this caller
+        won the race), False otherwise. Single UPDATE on a single connection —
+        the row-change count is the authoritative signal, no check-then-act
+        window between two SQLite transactions.
+
+        The interim 'claiming' resolution is a placeholder that must be
+        overwritten by ``mark_resolved`` on submit success, or cleared by
+        ``release_claim`` on submit failure so a retry can happen next tick.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE review_pending "
+                "SET resolution = 'claiming', resolved_at = ? "
+                "WHERE review_id = ? AND resolution IS NULL",
+                (at, review_id),
+            )
+            return cur.rowcount == 1
+
+    def release_claim(self, review_id: str) -> None:
+        """H10: release a 'claiming' interim claim so a retry can happen.
+
+        Clears ``resolution`` and ``resolved_at`` back to NULL. Called from
+        ``_handle_yes`` when the adapter re-run fails — without this the row
+        would stay stuck in 'claiming' forever and the operator would see a
+        phantom half-resolved review row.
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE review_pending "
+                "SET resolution = NULL, resolved_at = NULL "
+                "WHERE review_id = ? AND resolution = 'claiming'",
+                (review_id,),
             )
 
     def set_thread_id(self, review_id: str, thread_id: str) -> None:

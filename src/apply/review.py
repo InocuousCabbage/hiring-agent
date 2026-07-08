@@ -1189,7 +1189,7 @@ def _handle_yes(
     adapter: Any,
     config: dict,
     now: datetime,
-) -> Decision:
+) -> Decision | None:
     review_id = row["review_id"]
     decision = Decision(
         review_id=review_id,
@@ -1208,6 +1208,22 @@ def _handle_yes(
         thread_id=decision.thread_id,
     )
 
+    # H10: atomic claim BEFORE the real ATS submit. Two concurrent pollers
+    # (or a manual overlap with cron) picking up the same open row must
+    # resolve to exactly one adapter.apply call, not two. try_claim is a
+    # single UPDATE on a single connection — the row-change count is the
+    # authoritative signal. If we lose the race, short-circuit; the winning
+    # process will resolve the row.
+    claimed = store.try_claim(review_id, _iso(now))
+    if not claimed:
+        log.info(
+            "apply.review.claim_lost",
+            review_id=review_id,
+            reason="row already claimed or resolved by another process",
+        )
+        return None
+    log.info("apply.review.claim_won", review_id=review_id)
+
     # H4: hydrate persisted resume/cover paths from the row (previously the
     # YES branch always sent None/None to the adapter → `no_resume_available`).
     resume_path_str = row.get("resume_path")
@@ -1219,22 +1235,28 @@ def _handle_yes(
         resume_path=Path(resume_path_str) if resume_path_str else None,
         cover_letter_path=Path(cover_path_str) if cover_path_str else None,
     )
-    submit_ok = getattr(result, "status", None) == "submitted"
+    status = getattr(result, "status", None)
+    submit_ok = status == "submitted"
 
     if submit_ok:
         resolved_at = _iso(now)
+        # mark_resolved overwrites the interim 'claiming' resolution set by
+        # try_claim above with the final 'submitted' resolution.
         store.mark_resolved(review_id, "submitted", resolved_at)
         gmail.apply_label(msg_id, label_ids["submitted"])
         gmail.remove_label(msg_id, label_ids["pending"])
         return decision
 
-    # Submit failed — do NOT move the label; do NOT resolve; keep row pending.
-    # Fast-path email is S13's territory. We log the failure and return an
-    # unchanged pending decision so the caller sees the branch was walked.
+    # Submit failed — release the 'claiming' interim claim so a retry can
+    # happen on the next tick. Do NOT move the label; do NOT resolve; keep
+    # the row pending. Fast-path email is S13's territory. We log the
+    # failure and return an unchanged pending decision so the caller sees
+    # the branch was walked.
+    store.release_claim(review_id)
     log.warning(
         "apply.review.submit_failed",
         review_id=review_id,
-        status=getattr(result, "status", None),
+        status=status,
     )
     return Decision(
         review_id=review_id,
