@@ -418,8 +418,70 @@ class GmailClient:
     def reply_to_thread(self, thread_id: str, body: str) -> str:
         """Reply to an existing thread with a plain-text body. Returns the
         new message id. Uses ``threadId`` so the reply is RFC-threaded and
-        shows up under the same conversation in the operator's inbox."""
+        shows up under the same conversation in the operator's inbox.
+
+        H2 fix: Gmail requires the outgoing reply to carry a ``To`` header,
+        a ``Subject`` (``Re: ...``), and RFC 5322 ``In-Reply-To`` /
+        ``References`` for proper threading. Previously we sent a bare
+        MIMEText with no headers — Gmail returned HTTP 400 ``Recipient
+        address required``, which the ``@navigation_retry`` decorator
+        classified as transient and retried 3× before propagating; every
+        ambiguous-clarification and 24 h re-ping was silently dropped and
+        killed the whole poll sweep. Now we fetch the thread's most-recent
+        anchor once and hydrate the reply with headers derived from it.
+        """
+        # Look up the last message in the thread to derive To/Subject/
+        # Message-ID for header hydration. Fall through to a bare send if
+        # the metadata lookup itself fails — Gmail will still 400, but the
+        # error message will be honest.
+        to = None
+        subject = None
+        in_reply_to_id = None
+        references = None
+        try:
+            thread_meta = (
+                self.service.users()
+                .threads()
+                .get(userId="me", id=thread_id, format="metadata",
+                     metadataHeaders=["From", "To", "Subject", "Message-ID", "References"])
+                .execute()
+            )
+            messages = thread_meta.get("messages", []) or []
+            if messages:
+                anchor = messages[-1]  # last = most recent
+                headers = {
+                    h.get("name", "").lower(): h.get("value", "")
+                    for h in (anchor.get("payload", {}).get("headers") or [])
+                }
+                # Reply "To" is the anchor's "From" (reply to whoever sent it).
+                # Fall back to anchor's "To" if the anchor is our own outbound.
+                to = headers.get("from") or headers.get("to")
+                subject = headers.get("subject", "")
+                if subject and not subject.lower().startswith("re:"):
+                    subject = f"Re: {subject}"
+                in_reply_to_id = headers.get("message-id")
+                existing_refs = headers.get("references", "")
+                if existing_refs and in_reply_to_id:
+                    references = f"{existing_refs} {in_reply_to_id}"
+                else:
+                    references = in_reply_to_id
+        except Exception as exc:  # noqa: BLE001 — never block on metadata lookup
+            log.warning(
+                "gmail.reply_thread_metadata_failed",
+                thread_id=thread_id,
+                error=str(exc),
+            )
+
         mime = MIMEText(body, "plain")
+        if to:
+            mime["To"] = to
+        if subject:
+            mime["Subject"] = subject
+        if in_reply_to_id:
+            mime["In-Reply-To"] = in_reply_to_id
+        if references:
+            mime["References"] = references
+
         raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
         sent = (
             self.service.users()
