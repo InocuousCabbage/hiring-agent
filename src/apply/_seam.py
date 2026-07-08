@@ -308,6 +308,7 @@ def run_for_job(
         # from the frozen dataclass, which crashed every production apply as
         # soon as H4 delivered a real page.
         dedup = None
+        dedup_init_failed = False
         try:
             from src.apply.dedup import DedupDB as _DedupDB, _resolve_db_path
             # Anchor at repo root — otherwise the ApplyContext DedupDB and the
@@ -315,8 +316,27 @@ def run_for_job(
             # process's CWD isn't the repo root.
             db_path = _resolve_db_path(apply_config)
             dedup = _DedupDB(db_path)
-        except Exception:  # noqa: BLE001 — seam never blocks on dedup init
+        except Exception as exc:  # noqa: BLE001 — seam never blocks on dedup init
             dedup = None
+            dedup_init_failed = True
+            job_log.error("apply.seam.dedup_init_failed", error=str(exc))
+
+        # H7 (audit 2026-07-08): fail CLOSED when dedup is unavailable and
+        # mode='auto'. Otherwise the greenhouse adapter's blanket try/except
+        # around each dedup gate coerces None-attribute errors to "not
+        # applied"/count 0/no warning, so auto-mode would happily submit a
+        # posting already applied yesterday. Force mode='review' so the
+        # browser flow still fills + screenshots + emails a review, but the
+        # submit gate is closed.
+        effective_mode = apply_config.get("mode", "review")
+        if dedup_init_failed and effective_mode == "auto":
+            job_log.warning(
+                "apply.seam.dedup_init_fail_closed",
+                original_mode="auto",
+                forced_mode="review",
+            )
+            effective_mode = "review"
+
         ctx = ApplyContext(
             profile=profile,
             job=job,
@@ -325,7 +345,7 @@ def run_for_job(
             config=apply_config,
             applicant=str(apply_config.get("user", "single")),
             dry_run=bool(apply_config.get("dry_run", False)),
-            mode=apply_config.get("mode", "review"),
+            mode=effective_mode,
             resume_docx_path=resume_docx_path,
             cover_letter_docx_path=cover_letter_docx_path,
             dedup=dedup,
