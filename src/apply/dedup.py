@@ -218,6 +218,11 @@ _MIGRATION_SQL_PATH = Path(__file__).parent / "migrations" / "001_init.sql"
 # Phase 1 (H4/M1/M12) additive columns. Kept as a separate migration file so
 # `test_h1_schema_reconciliation.py`'s byte-shape of 001 remains stable.
 _MIGRATION_002_SQL_PATH = Path(__file__).parent / "migrations" / "002_review_pending_paths.sql"
+# Phase 2 (H9) normalized hard-dedup index. Drops raw company from the
+# UNIQUE key so spelling variance ('Acme' vs 'Acme, Inc.') at the same
+# (ats_domain, ats_job_id) posting can no longer slip through the hard
+# gate. Kept as a separate migration so 001's byte-shape stays stable.
+_MIGRATION_003_SQL_PATH = Path(__file__).parent / "migrations" / "003_normalized_hard_dedup.sql"
 
 
 def _strip_sql_comments(raw: str) -> str:
@@ -241,31 +246,62 @@ def _execute_migrations(conn: sqlite3.Connection) -> None:
     """Run 001 as a script (idempotent CREATE IF NOT EXISTS), then run each
     ADD COLUMN statement from 002 individually so we can swallow the
     duplicate-column OperationalError that sqlite raises on ALREADY-added
-    columns. Keeps the migration idempotent across cold + warm starts.
+    columns, then run 003 statement-by-statement (H9 hard-dedup index swap).
+    Keeps the migration idempotent across cold + warm starts.
     """
     conn.executescript(_MIGRATION_SQL_PATH.read_text(encoding="utf-8"))
-    if not _MIGRATION_002_SQL_PATH.exists():
+    if _MIGRATION_002_SQL_PATH.exists():
+        raw = _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8")
+        # SD1 fix: strip `--` comments BEFORE splitting on `;`. The pre-fix
+        # code split first and used `stmt.startswith("--")` as a skip-guard —
+        # but the split delivered a chunk that contained the file's header
+        # comments PLUS the first ALTER, whose first character was `-`. That
+        # skipped `ADD COLUMN resume_path` entirely; only warm starts saw the
+        # column (because ReviewStore.__init__ also ALTERed via its own path).
+        stripped = _strip_sql_comments(raw)
+        for stmt in (s.strip() for s in stripped.split(";")):
+            if not stmt:
+                continue
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                # Duplicate column on a warm start — expected + safe. Any
+                # other OperationalError (locked DB, no such table, disk I/O,
+                # malformed DB) is a real fault we DO want to see: re-raise
+                # so the caller doesn't silently continue against a partially-
+                # migrated schema.
+                msg = str(exc).lower()
+                if "duplicate column" in msg or "already exists" in msg:
+                    continue
+                raise
+
+    if not _MIGRATION_003_SQL_PATH.exists():
         return
-    raw = _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8")
-    # SD1 fix: strip `--` comments BEFORE splitting on `;`. The pre-fix code
-    # split first and used `stmt.startswith("--")` as a skip-guard — but the
-    # split delivered a chunk that contained the file's header comments
-    # PLUS the first ALTER, whose first character was `-`. That skipped
-    # `ADD COLUMN resume_path` entirely; only warm starts saw the column
-    # (because ReviewStore.__init__ also ALTERed via its own path).
-    stripped = _strip_sql_comments(raw)
-    for stmt in (s.strip() for s in stripped.split(";")):
+    # 003 is H9: swap the HARD UNIQUE index from (company, ats_domain,
+    # ats_job_id) to (ats_domain, ats_job_id). Statement-by-statement so
+    # idempotent DDL (CREATE ... IF NOT EXISTS re-run, DROP ... IF EXISTS on
+    # a fresh DB) is safe on both cold and warm starts. The DELETE step is a
+    # one-shot cleanup — on a warm start it's effectively a no-op because
+    # the new UNIQUE index (ux_applied_jobs_hard_v2) already prevents any
+    # further (ats_domain, ats_job_id) collisions.
+    raw_003 = _MIGRATION_003_SQL_PATH.read_text(encoding="utf-8")
+    stripped_003 = _strip_sql_comments(raw_003)
+    for stmt in (s.strip() for s in stripped_003.split(";")):
         if not stmt:
             continue
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError as exc:
-            # Duplicate column on a warm start — expected + safe. Any other
-            # OperationalError (locked DB, no such table, disk I/O, malformed
-            # DB) is a real fault we DO want to see: re-raise so the caller
-            # doesn't silently continue against a partially-migrated schema.
+            # Idempotent-DDL guard: index already exists, no such index (DROP
+            # on a fresh DB where old index never existed), or duplicate
+            # column. Anything else is a real fault — re-raise so we don't
+            # limp along with a broken schema.
             msg = str(exc).lower()
-            if "duplicate column" in msg or "already exists" in msg:
+            if (
+                "already exists" in msg
+                or "no such index" in msg
+                or "duplicate column" in msg
+            ):
                 continue
             raise
 
@@ -342,16 +378,27 @@ class DedupDB:
         ats_job_id: str | None,
         job_url: str,
     ) -> bool:
-        """True iff a prior row matches the HARD triple, OR (fallback) the
-        exact ``job_url`` when any part of the triple is None. Never raises."""
+        """True iff a prior row matches the HARD posting identity
+        ``(ats_domain, ats_job_id)``, OR (fallback) the exact ``job_url`` when
+        either part of the pair is None. Never raises.
+
+        H9: the raw ``company`` argument is kept in the signature for
+        backward-compat (all in-tree callers still pass it) but is NOT part
+        of the primary predicate. The ATS posting identity is
+        ``(ats_domain, ats_job_id)``; raw-company equality only weakens the
+        key, letting spelling variance ('Acme' vs 'Acme, Inc.') at the same
+        posting slip through the gate. The 003 UNIQUE index
+        ``ux_applied_jobs_hard_v2`` enforces the same shape at the write
+        site.
+        """
         try:
             with self._connect() as conn, conn:
-                if company and ats_domain and ats_job_id:
+                if ats_domain and ats_job_id:
                     cur = conn.execute(
                         "SELECT 1 FROM applied_jobs "
-                        "WHERE company = ? AND ats_domain = ? AND ats_job_id = ? "
+                        "WHERE ats_domain = ? AND ats_job_id = ? "
                         "LIMIT 1",
-                        (company, ats_domain, ats_job_id),
+                        (ats_domain, ats_job_id),
                     )
                 else:
                     cur = conn.execute(
