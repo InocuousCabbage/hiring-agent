@@ -732,6 +732,29 @@ def _record_or_escalate(
     return result
 
 
+def _soft_warn_lookup(dedup: Any, company: str, role_title: str) -> list[dict]:
+    """Soft-dup check that normalizes company/role the SAME way `record()` writes.
+
+    H8 audit finding (2026-07-08): the adapter used `.strip().lower()` at the
+    soft-warn check site, but `DedupDB.record()` writes `normalize_company` /
+    `normalize_role`. So a record of ``('Stripe, Inc.', 'Senior Data
+    Engineer')`` was never matched by a later check of the same posting — the
+    spec §13c soft-dup gate silently missed.
+
+    Post-fix: this helper normalizes inputs with the exact same functions
+    `record()` uses, then calls `soft_warn_check(company_norm, role_norm)`.
+    Returns an empty list on any exception (never blocks the apply path).
+    """
+    from src.apply.dedup import normalize_company, normalize_role
+    try:
+        return dedup.soft_warn_check(
+            normalize_company(company or ""),
+            normalize_role(role_title or ""),
+        ) or []
+    except Exception:
+        return []
+
+
 # ── Adapter class ────────────────────────────────────────────────────────────
 
 
@@ -839,13 +862,11 @@ class GreenhouseAdapter:
             )
 
         # ── Gate 3: soft-dup warn (does NOT short-circuit; just tags status) ──
-        try:
-            soft_warn = ctx.dedup.soft_warn_check(
-                (company or "").strip().lower(),
-                (role_title or "").strip().lower(),
-            ) or []
-        except Exception:
-            soft_warn = []
+        # H8 fix: route through `_soft_warn_lookup` so company/role are
+        # normalized with the SAME functions `DedupDB.record()` writes with.
+        # Previously `.strip().lower()` here missed rows recorded under the
+        # `normalize_company` / `normalize_role` shape.
+        soft_warn = _soft_warn_lookup(ctx.dedup, company or "", role_title or "")
         soft_warn_active = bool(soft_warn)
 
         # ── Browser lifecycle — L5 try/finally ──
