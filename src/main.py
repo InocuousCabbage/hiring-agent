@@ -10,6 +10,19 @@ Flags:
   --dry-run   Run the full pipeline but skip sending digest and marking processed.
 """
 
+# Ensure repo root is on sys.path when invoked as a script (`python src/main.py`).
+# Module mode (`python -m src.main`) already has this on sys.path via the
+# package structure. Idempotent: no-op if repo root already present.
+# Must run BEFORE any `from src.apply.*` import (see run_pipeline in this file).
+import os as _os_bootstrap
+import sys as _sys_bootstrap
+_REPO_ROOT_BOOTSTRAP = _os_bootstrap.path.dirname(
+    _os_bootstrap.path.dirname(_os_bootstrap.path.abspath(__file__))
+)
+if _REPO_ROOT_BOOTSTRAP not in _sys_bootstrap.path:
+    _sys_bootstrap.path.insert(0, _REPO_ROOT_BOOTSTRAP)
+del _os_bootstrap, _sys_bootstrap, _REPO_ROOT_BOOTSTRAP
+
 import argparse
 import logging
 import os
