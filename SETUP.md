@@ -319,6 +319,22 @@ python -m playwright install chromium
   toggle for offline tests. Use only the exact literal `1`, `true`, or `yes`;
   every other value keeps the real LLM path.
 
+### Create your candidate profile
+
+The auto-apply pipeline fills forms from `templates/candidate_profile.yaml`.
+This file holds your PII (name, contact, address, work authorization,
+optional EEO answers) and is gitignored. Config validation refuses to
+enable `apply.enabled: true` without it — a fresh clone hard-fails at
+startup until this step is complete.
+
+```bash
+cp templates/candidate_profile.yaml.example templates/candidate_profile.yaml
+```
+
+Open the copy in a text editor and replace every placeholder with your
+real values. See the comments in the example file for per-field notes;
+EEO fields are always optional (leave `null` to skip).
+
 ### Bootstrap a Greenhouse session
 
 Run this once per ATS. Chromium opens headed; log in with your real
