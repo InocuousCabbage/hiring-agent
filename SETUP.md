@@ -397,7 +397,7 @@ hiring-agent/
 ├── templates/
 │   ├── resumes/
 │   │   └── base_resume.docx    # YOUR base resume (you create this)
-│   ├── cover_letter.docx       # Cover letter template
+│   ├── candidate_profile.yaml  # YOUR PII for auto-apply (Phase 3, from example)
 │   └── project_bank.yaml       # YOUR projects and accomplishments
 ├── output/                     # Generated PDFs and DOCX files
 ├── logs/                       # Pipeline logs

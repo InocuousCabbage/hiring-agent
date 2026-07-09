@@ -72,11 +72,12 @@ resume:
   min_confidence_score: 30    # skip jobs where tailor scores fit below this (0–100)
 
 # ─── Cover Letter ─────────────────────────────────────────
+# Cover letters are built programmatically in src/pdf_gen/renderer.py
+# (`_create_cover_letter_docx`) — no DOCX template file is read or shipped.
 cover_letter:
   max_paragraphs: 4
   max_projects_referenced: 2
   tone: "neutral"             # neutral | warm | assertive
-  template: "templates/cover_letter.docx"
 
 # ─── QA ───────────────────────────────────────────────────
 qa:
