@@ -313,7 +313,7 @@ def test_m6_test_mode_dry_run_threads_into_apply_seam(monkeypatch):
         lambda **k: {"confidence_score": 100, "roles": [], "skills": []},
     )
     monkeypatch.setattr(main_mod, "write_cover_letter", lambda **k: {"paragraphs": []})
-    monkeypatch.setattr(main_mod, "run_qa", lambda **k: {"passed": True, "issues": []})
+    monkeypatch.setattr(main_mod, "run_qa", lambda **k: {"pass": True, "errors": []})
     monkeypatch.setattr(main_mod, "auto_fix", lambda **k: ({}, {}))
     monkeypatch.setattr(main_mod, "render_resume", lambda **k: (Path("/tmp/r.pdf"), Path("/tmp/r.docx")))
     monkeypatch.setattr(
