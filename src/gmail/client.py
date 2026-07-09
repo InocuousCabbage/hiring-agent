@@ -33,6 +33,7 @@ methods that need a mid-retry credential refresh use the factory form
 """
 
 import os
+import sys
 import base64
 from pathlib import Path
 from email.mime.text import MIMEText
@@ -84,6 +85,39 @@ SCOPES = [
 ]
 
 
+class AuthError(RuntimeError):
+    """Raised when interactive OAuth would be required but the current
+    process is headless (Phase 3 / B4).
+
+    An unattended cron has no TTY and no display server, so
+    ``InstalledAppFlow.run_local_server`` would hang forever holding the
+    entrypoint's flock — every subsequent tick would then exit 0 silently
+    with the agent effectively dead. Raising here instead gives operators
+    a grep-able, non-zero-exit failure.
+    """
+
+
+def _is_headless() -> bool:
+    """Best-effort headless-environment detection for the OAuth guard.
+
+    Headless if there's no controlling TTY on stdin AND neither an X11
+    nor a Wayland display is advertised, OR if the operator has set
+    ``HIRING_AGENT_HEADLESS`` to explicitly force the guard (e.g. from
+    the cron entrypoint, where isatty()/DISPLAY heuristics may not be
+    reliable).
+    """
+    if os.environ.get("HIRING_AGENT_HEADLESS"):
+        return True
+    try:
+        has_tty = sys.stdin.isatty()
+    except Exception:
+        has_tty = False
+    has_display = bool(os.environ.get("DISPLAY")) or bool(
+        os.environ.get("WAYLAND_DISPLAY")
+    )
+    return not has_tty and not has_display
+
+
 def _sanitize_query(value: str) -> str:
     """Strip characters that could alter Gmail search query semantics."""
     return value.replace('"', '').replace('\\', '').replace('\n', '').replace('\r', '')
@@ -109,12 +143,33 @@ class GmailClient:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
+                # B4: refuse to launch the interactive browser flow under a
+                # headless cron — it would hang `run_local_server` forever.
+                if _is_headless():
+                    raise AuthError(
+                        "Gmail OAuth requires an interactive browser login, "
+                        "but this process is headless (no TTY, no DISPLAY/"
+                        "WAYLAND_DISPLAY). Run authentication manually from "
+                        "an interactive session (e.g. `python -m "
+                        "src.gmail.client`) to (re)generate token.json, then "
+                        "let the cron reuse it."
+                    )
                 flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
                 creds = flow.run_local_server(port=0)
 
-            token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(token_path, "w") as f:
+            # H12: parent dir must be 0o700 — tighten it even if it already
+            # existed with a laxer mode from a prior run.
+            token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(token_path.parent, 0o700)
+
+            # L4: write via temp file + atomic os.replace (same dir, same
+            # filesystem) so a concurrent reader never observes a truncated
+            # JSON blob mid-write.
+            tmp_path = token_path.parent / f"{token_path.name}.tmp"
+            with open(tmp_path, "w") as f:
                 f.write(creds.to_json())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, token_path)
 
         return creds
 
@@ -611,7 +666,6 @@ class GmailClient:
             raise ValueError("MY_EMAIL is not set")
         return addr
 
-    @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
     def send_immediate(
         self,
         subject: str,
@@ -622,11 +676,15 @@ class GmailClient:
         """
         Send an urgent single-recipient alert.
 
-        Retries per S11's `@navigation_retry` policy (3 attempts, exponential
-        jitter backoff, credential refresh between attempts). On final
-        failure the ORIGINAL exception propagates to the caller. S13's
-        `notify.py` owns the swallow-and-log contract; this client stays
-        honest.
+        M11 fix: this method is intentionally UNDECORATED. It delegates to
+        `send_email`, which already carries `@navigation_retry` (3 attempts,
+        exponential jitter backoff, credential refresh between attempts).
+        Stacking a second `@navigation_retry` here composed into up to 3x3=9
+        real `messages.send` calls on a transient error — one URGENT
+        notification could fan out into 9 duplicate emails. Delegating keeps
+        a single retry budget. On final failure the ORIGINAL exception
+        propagates to the caller; S13's `notify.py` owns the swallow-and-log
+        contract, this client stays honest.
 
         `to` defaults to `self._me()` (i.e. `MY_EMAIL`); callers can override
         to honor a `apply.fast_path_recipient` config value that differs from
