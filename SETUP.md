@@ -324,9 +324,9 @@ python -m playwright install chromium
 
 The auto-apply pipeline fills forms from `templates/candidate_profile.yaml`.
 This file holds your PII (name, contact, address, work authorization,
-optional EEO answers) and is gitignored. Config validation refuses to
-enable `apply.enabled: true` without it — a fresh clone hard-fails at
-startup until this step is complete.
+optional EEO answers) and is gitignored. Config validation raises
+`ConfigError` the first time you flip `apply.enabled: true` without it,
+so complete this step before enabling auto-apply.
 
 ```bash
 cp templates/candidate_profile.yaml.example templates/candidate_profile.yaml
@@ -352,7 +352,9 @@ Verify:
 python -m src.apply.bootstrap --status
 ```
 
-Expected output: `greenhouse: bootstrapped, last_verified=<iso timestamp>`.
+Expected output: `greenhouse: bootstrapped, last_verified=<iso>`. If the stored
+timestamp is older than 30 days or unparseable the line ends with
+` (stale — re-bootstrap recommended)`; re-run the bootstrap when you see it.
 
 ### Enable in config
 
@@ -374,7 +376,7 @@ forms and screenshots but never clicks submit even when you reply YES.
 - Check `config/settings.yaml` — the `alert_sender` and `alert_subject_contains` must match your actual alert emails
 
 **"Gmail auth failed"**
-- Delete `config/credentials/token.json` and run `python -m src.gmail.client` again
+- Delete `config/credentials/token.json` and run `python -m src.gmail.client` again from the repo root
 
 **"LibreOffice not found"**
 - Make sure LibreOffice is installed and `libreoffice --version` works

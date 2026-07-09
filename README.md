@@ -83,7 +83,7 @@ pip install -r requirements.txt
 ### 4. Configure
 ```bash
 cp .env.example .env
-# Fill in ANTHROPIC_API_KEY and paths
+# Fill in ANTHROPIC_API_KEY (Option A) and MY_EMAIL
 ```
 
 ### 5. Prepare your content

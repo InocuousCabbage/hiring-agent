@@ -108,7 +108,8 @@ pdf:
 # ─── Auto-Apply (Phase 3) ─────────────────────────────────
 # DEFAULT OFF for safety. Set apply.enabled: true only after
 # `python -m src.apply.bootstrap greenhouse` completes.
-# Schema is frozen — master-plan §4.7 (22 keys, incl. 4 under browserbase).
+# Schema is frozen — master-plan §4.7 (21 top-level keys + 4 under browserbase;
+# _validate_apply_config in src/main.py is the source of truth).
 apply:
   enabled: false                       # master switch; default OFF (safety)
   mode: review                         # review | auto
