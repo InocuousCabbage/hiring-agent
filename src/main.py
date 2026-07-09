@@ -412,13 +412,20 @@ def run_pipeline(
     _validate_apply_config(config)
 
     # ── S17 auto-apply seam: initialize once per run_pipeline invocation.
-    # No-op + zero imports pulled when apply.enabled is false. When enabled,
-    # this installs the S16 PII scrubber (BEFORE any adapter log line),
-    # threads apply.storage_state_dir into the S6 credentials backend, and
+    # Called unconditionally (even when apply.enabled=false) so the S16 PII
+    # scrubber (M9) is guaranteed active before any log line — including
+    # contacts/hm_finder's raw-LLM-output warnings, which run regardless of
+    # apply.enabled. See _seam.initialize() for the enabled-gated steps.
+    # Threads apply.storage_state_dir into the S6 credentials backend, and
     # runs the S12 review poller once for the 24h/72h state machine.
     # Live-config guarantee (L14): apply_config is a REFERENCE, not a copy.
-    apply_config = config.get("apply", {})
     from src.apply import _seam as _apply_seam
+    apply_config = config.get("apply", {})
+    # M6: when the caller requests dry_run (e.g. `--test`), force it through
+    # to the apply seam by mutating the live apply-config dict in place —
+    # this preserves the L14 live-reference guarantee the seam relies on.
+    if dry_run and isinstance(apply_config, dict):
+        apply_config["dry_run"] = True
     apply_events = _apply_seam.initialize(config, gmail_client)
 
     processed = []
@@ -501,21 +508,27 @@ def run_pipeline(
                     lane=lane,
                     config=config,
                 )
-                if qa_result["pass"]:
+                # Accept either the canonical {"pass", "errors"} schema (real
+                # src/qa/checker.run_qa) or a {"passed", "issues"} caller stub
+                # (as used by some harness doubles) — defensive read only,
+                # canonical key always wins when both are present.
+                qa_ok = qa_result["pass"] if "pass" in qa_result else qa_result.get("passed", False)
+                qa_errors = qa_result["errors"] if "errors" in qa_result else qa_result.get("issues", [])
+                if qa_ok:
                     qa_passed = True
                     break
 
                 job_log.warning(
                     "step.qa",
                     attempt=attempt + 1,
-                    errors=qa_result["errors"],
+                    errors=qa_errors,
                 )
 
                 if attempt < config["qa"]["max_retries"]:
                     tailored_resume, cover_letter = auto_fix(
                         tailored_resume=tailored_resume,
                         cover_letter=cover_letter,
-                        issues=qa_result["errors"],
+                        issues=qa_errors,
                         jd_text=jd,
                         lane=lane,
                         project_bank=project_bank,

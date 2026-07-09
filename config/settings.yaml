@@ -113,7 +113,7 @@ apply:
   mode: review                         # review | auto
   allowed_ats: [greenhouse]            # Phase 3 MVP; 3.5 adds lever, ashby; 3.6 adds workday, icims
   long_tail: none                      # none | computer_use  (variation-C graft opt-in)
-  dry_run: false                       # if true, fill + screenshot + never click submit even on YES
+  dry_run: true                        # if true, fill + screenshot + never click submit even on YES
   timeout_seconds: 90
   navigation_retries: 2
   rate_limit_per_ats_per_day: 10

@@ -225,19 +225,26 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
     Returns the list of ``ApplyEvent`` from the review poller (empty when
     apply.enabled=false OR the poller raised). Never raises.
 
-    Side effects (only when apply.enabled=true):
+    Side effects:
       1. install_scrubber() — S16 PII redactor active before any log line.
+         Runs UNCONDITIONALLY, even when apply.enabled=false (M9): other
+         pipeline stages (e.g. contacts/hm_finder) log raw LLM output on a
+         path that does not depend on the apply gate.
       2. configure_storage_dir() — env-var injection so bare
          FernetFileBackend() calls see the config-driven storage dir.
-      3. poll_pending_reviews() — S12 review-loop tick.
+         (apply.enabled=true only.)
+      3. poll_pending_reviews() — S12 review-loop tick. (apply.enabled=true
+         only.)
     """
+    # 1. Scrubber MUST be installed before ANY adapter log line (L7), and
+    # unconditionally (M9) — even when apply.enabled=false, since other
+    # pipeline stages log raw LLM output regardless of the apply gate.
+    _call_install_scrubber()
+
     apply_config = _safe_apply_config(config)
     if not apply_config.get("enabled", False):
         _log.info("apply.seam.disabled")
         return []
-
-    # 1. Scrubber MUST be installed before ANY adapter log line (L7).
-    _call_install_scrubber()
 
     # 2. Wire the config-driven storage dir into the credentials backend.
     _call_configure_storage_dir(config)
