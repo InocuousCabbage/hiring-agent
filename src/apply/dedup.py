@@ -807,7 +807,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Override the DB path. Default: HIRING_AGENT_DEDUP_DB env var, "
-            "else ./state/applied_jobs.db"
+            "else state/applied_jobs.db anchored at the repo root "
+            "(never CWD — see _resolve_cli_db_path)."
         ),
     )
     return p
