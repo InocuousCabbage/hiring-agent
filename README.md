@@ -82,7 +82,7 @@ pip install -r requirements.txt
 1. Go to Google Cloud Console → APIs & Services → Credentials
 2. Create OAuth 2.0 Client ID (Desktop app)
 3. Download `credentials.json` → place in `config/credentials/`
-4. Run `python src/gmail/client.py` once to complete the OAuth flow
+4. Run `python -m src.gmail.client` once to complete the OAuth flow
 
 ### 4. Configure
 ```bash

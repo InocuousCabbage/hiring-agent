@@ -85,9 +85,9 @@ This lets the pipeline read your emails and send you the digest.
 12. Move it to the project: `mv ~/Downloads/credentials.json config/credentials/`
 13. Run the first-time auth:
     ```bash
-    python src/gmail/client.py
+    python -m src.gmail.client
     ```
-    This opens a browser window. Log in with the Gmail account you want alerts sent to. Click "Allow". The terminal will say "Authentication successful" and create a `token.json` file.
+    Run from the repo root. This opens a browser window. Log in with the Gmail account you want alerts sent to. Click "Allow". The terminal will say "Authentication successful" and create a `token.json` file.
 
 ---
 
@@ -357,7 +357,7 @@ forms and screenshots but never clicks submit even when you reply YES.
 - Check `config/settings.yaml` — the `alert_sender` and `alert_subject_contains` must match your actual alert emails
 
 **"Gmail auth failed"**
-- Delete `config/credentials/token.json` and run `python src/gmail/client.py` again
+- Delete `config/credentials/token.json` and run `python -m src.gmail.client` again
 
 **"LibreOffice not found"**
 - Make sure LibreOffice is installed and `libreoffice --version` works
