@@ -547,7 +547,13 @@ def load_and_unwrap_state(ats: str, user: str) -> dict | None:
         logger.warning(
             "apply.storage_state.backend_error ats=%s user=%s", ats, user
         )
-        raise TransientBackendError(f"backend blip for {ats}/{user}")
+        # Iter-3 F5 (Phase 3 xhigh iter-3): TransientBackendError message
+        # MUST NOT carry `user` (Gmail address = PII). If a future caller
+        # does `except TransientBackendError as e: log.warning(..., error=str(e))`
+        # — the exact SD1 anti-pattern iter-1 hunted down — the user email
+        # would leak. Store `ats` only; consumers get the (ats, user) tuple
+        # from their own call-site context, not from str(exc).
+        raise TransientBackendError(f"transient backend blip (ats={ats})")
     except Exception as e:  # noqa: BLE001 — belt-and-braces
         # SD1: exception message may carry decrypted payload bytes from
         # Fernet InvalidToken unwrap. Log only exception type name.

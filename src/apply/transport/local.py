@@ -53,6 +53,12 @@ class LocalTransport:
         storage_state_path: str | None = None
         tmp_path: Path | None = None
         if isinstance(storage_state, dict) and storage_state:
+            # Iter-3 F1 (Phase 3 xhigh iter-3): don't null out tmp_path on
+            # failure — mkstemp already created the file; failure of the
+            # subsequent write/chmod would otherwise ORPHAN the file with
+            # partial or full state contents on disk. The outer finally
+            # uses tmp_path to unlink; leaving it bound ensures cleanup
+            # fires on every code path.
             try:
                 fd, name = tempfile.mkstemp(suffix=".storage_state.json")
                 os.close(fd)
@@ -70,7 +76,10 @@ class LocalTransport:
                     exc_type=type(exc).__name__,
                 )
                 storage_state_path = None
-                tmp_path = None
+                # tmp_path INTENTIONALLY LEFT BOUND: the outer finally's
+                # unlink will clean up any file mkstemp created (including
+                # a partial-write orphan). Setting it to None here would
+                # skip cleanup and leak the tmp file to disk.
 
         try:
             cm = browser.session(headless=True, storage_state_path=storage_state_path)

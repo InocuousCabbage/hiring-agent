@@ -210,6 +210,102 @@ def test_i2b3_local_transport_materializes_storage_state_dict(monkeypatch, tmp_p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Iter-3 F1 — LocalTransport tmp cleaned up on materialize failure
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_iter3_f1_local_transport_tmp_cleaned_up_on_write_failure(monkeypatch):
+    """LocalTransport's storage_state materialize path MUST clean up the
+    mkstemp'd tempfile even when write_text/json.dumps/chmod raise.
+    Pre-iter-3-fix: except handler set tmp_path=None → outer finally
+    skipped unlink → orphan file with partial/full cookie contents leaks
+    to disk on every failure.
+    """
+    from src.apply.transport import local as local_mod
+
+    # Force json.dumps to raise so the write_text call inside the try/except
+    # fails AFTER mkstemp has already created the file.
+    def _boom_dumps(*a, **k):
+        raise ValueError("simulated non-serializable")
+
+    monkeypatch.setattr(local_mod.json, "dumps", _boom_dumps)
+
+    # Track tmp files created during the call.
+    created_tmps: list[Path] = []
+    real_mkstemp = local_mod.tempfile.mkstemp
+
+    def _spy_mkstemp(*a, **k):
+        fd, name = real_mkstemp(*a, **k)
+        created_tmps.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(local_mod.tempfile, "mkstemp", _spy_mkstemp)
+
+    # Fake browser.session so we don't hit real playwright.
+    class _FakePage:
+        def goto(self, url):
+            pass
+
+    class _FakeCM:
+        def __enter__(self):
+            return (_FakePage(), None)
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeBrowser:
+        def session(self, headless=True, storage_state_path=None):
+            return _FakeCM()
+
+    monkeypatch.setitem(sys.modules, "browser", _FakeBrowser())
+
+    transport = local_mod.LocalTransport()
+    state_dict = {"cookies": [{"name": "s", "value": "v"}], "origins": []}
+    with transport.open("https://example.com", storage_state=state_dict):
+        pass
+
+    # After the block, no created tmp files should remain on disk.
+    remaining = [p for p in created_tmps if p.exists()]
+    assert not remaining, (
+        f"Iter-3 F1: LocalTransport left orphan tmp file(s) after "
+        f"materialize failure: {remaining}. except handler must NOT null "
+        "tmp_path — leave it bound so the outer finally cleans up."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iter-3 F5 — TransientBackendError message must not carry user PII
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_iter3_f5_transient_backend_error_message_omits_user_pii():
+    """str(TransientBackendError) MUST NOT include the `user` (Gmail
+    address = PII per L7). A future maintainer catching this exception
+    and doing `log.warning(..., error=str(e))` (the SD1 anti-pattern)
+    would otherwise leak the user email.
+    """
+    from src.apply.credentials import TransientBackendError, load_and_unwrap_state, StorageStateBackendError
+    import src.apply.credentials as creds_mod
+
+    # Force load_state to raise the transient class.
+    def _boom(ats, user):
+        raise StorageStateBackendError("backend blip")
+
+    import unittest.mock as _mock
+    with _mock.patch.object(creds_mod, "load_state", _boom):
+        try:
+            load_and_unwrap_state("greenhouse", "leaky_user@example.com")
+        except TransientBackendError as exc:
+            msg = str(exc)
+            assert "leaky_user@example.com" not in msg, (
+                f"Iter-3 F5: TransientBackendError message leaked user PII: "
+                f"{msg!r}. Fix must omit `user` from the exception message."
+            )
+            return
+    assert False, "Expected TransientBackendError to be raised"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # I2-B4 — notify.py distinguishes AuthError from generic send_failed
 # ─────────────────────────────────────────────────────────────────────────────
 
