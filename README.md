@@ -25,10 +25,8 @@ hiring-agent/
 │   └── credentials/           # Gmail OAuth creds (gitignored)
 ├── templates/
 │   ├── resumes/
-│   │   ├── base_pmm.docx      # Product Marketing base resume
-│   │   ├── base_content.docx  # Content Marketing base resume
-│   │   └── base_mops.docx     # Marketing Ops base resume
-│   ├── cover_letter.docx      # Cover letter template
+│   │   └── base_resume.docx   # Your base resume (all lanes point here by default)
+│   ├── candidate_profile.yaml.example  # Auto-apply profile schema (Phase 3)
 │   └── project_bank.yaml      # Your real projects + metrics
 ├── src/
 │   ├── main.py                # Orchestrator — runs the full pipeline
@@ -91,8 +89,10 @@ cp .env.example .env
 ```
 
 ### 5. Prepare your content
-- Place your 3 base resume .docx files in `templates/resumes/`
-- Fill out `templates/project_bank.yaml` with your real projects + metrics
+- Place your base resume at `templates/resumes/base_resume.docx` (all lanes
+  point here by default; see SETUP §Step 8 for optional per-lane variants
+  like `base_pmm.docx`, `base_content.docx`, `base_mops.docx`).
+- Fill out `templates/project_bank.yaml` with your real projects + metrics.
 - Edit `config/settings.yaml` for alert sender, labels, etc.
 
 ### 6. Run
