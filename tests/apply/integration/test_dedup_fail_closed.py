@@ -640,7 +640,7 @@ def test_h10_atomic_claim_prevents_concurrent_yes_double_submit(tmp_path, monkey
     # Spy execute_confirmed_submit to count invocations.
     submits = {"count": 0}
 
-    def _spy_execute(decision, adapter, config, *, resume_path=None, cover_letter_path=None):
+    def _spy_execute(decision, adapter, config, *, resume_path=None, cover_letter_path=None, dry_run=False):
         submits["count"] += 1
         # Simulate the "competing poller wins the race" scenario: BEFORE we
         # return, another process has already claimed and resolved.

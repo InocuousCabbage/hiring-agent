@@ -26,7 +26,7 @@ def test_seam_poll_passes_store_and_adapter(tmp_path: Path, monkeypatch):
 
     calls = {}
 
-    def fake_poll(gmail, store, now, config, *, adapter=None):
+    def fake_poll(gmail, store, now, config, *, adapter=None, dry_run=False):
         # Capture whether the real signature received both the positional
         # `store` and the `adapter` kwarg.
         calls["gmail"] = gmail
@@ -79,7 +79,7 @@ def test_seam_poll_receives_wrapped_config(tmp_path: Path, monkeypatch):
 
     received_config = {}
 
-    def fake_poll(gmail, store, now, config, *, adapter=None):
+    def fake_poll(gmail, store, now, config, *, adapter=None, dry_run=False):
         # Simulate the real poller's access pattern.
         received_config["config"] = config
         received_config["reping_hours"] = int(

@@ -114,6 +114,15 @@ class StorageStateBackendError(Exception):
     `keyring.errors.*` exception leaks past the public API."""
 
 
+class TransientBackendError(Exception):
+    """I2-B8: signals a transient backend failure (keyring blip, DBus
+    reload) — the CALLER (dispatcher cache) must NOT cache the None
+    result on this path. Retry next call. Never raised past
+    `_cached_load_and_unwrap_state` — the dispatcher catches it and
+    returns None (once) without populating the cache.
+    """
+
+
 class StorageStateTooLargeError(Exception):
     """Raised when the JSON-serialized state exceeds `_MAX_STATE_BYTES`."""
 
@@ -314,6 +323,11 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.rename/chmod could leave `.tmp` on disk containing the newly-written
     (potentially secret) payload indefinitely.
     """
+    # I2-B5 (Phase 3 xhigh iter-2): use os.replace (not os.rename) — cross-
+    # platform atomic swap that overwrites an existing target on Windows.
+    # Also keeps parity with the pre-I2-B5 gmail/client.py path (now
+    # delegates here) that used os.replace so the SE4 orphan-cleanup test
+    # continues to intercept the correct call.
     tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -323,8 +337,8 @@ def _atomic_write(path: Path, data: bytes) -> None:
         finally:
             os.close(fd)
         os.chmod(tmp, 0o600)
-        os.rename(tmp, path)
-        # Rename does not always preserve mode across all filesystems.
+        os.replace(tmp, path)
+        # Replace does not always preserve mode across all filesystems.
         os.chmod(path, 0o600)
     except Exception:
         # Best-effort cleanup — never mask the original error.
@@ -523,11 +537,17 @@ def load_and_unwrap_state(ats: str, user: str) -> dict | None:
     try:
         raw = load_state(ats, user)
     except StorageStateBackendError:
-        # Backend hard-failure — log structural fields ONLY (SD1).
+        # I2-B8 (Phase 3 xhigh iter-2): raise a distinct transient marker
+        # exception so the dispatcher's cache can distinguish "no state
+        # stored" (True None, safe to cache) from "backend hit a blip"
+        # (do NOT cache; retry next call). Pre-fix collapsed both to None
+        # and the dispatcher cached the None for the rest of the pipeline
+        # — every subsequent apply degraded to unauthenticated after a
+        # single transient keyring blip.
         logger.warning(
             "apply.storage_state.backend_error ats=%s user=%s", ats, user
         )
-        return None
+        raise TransientBackendError(f"backend blip for {ats}/{user}")
     except Exception as e:  # noqa: BLE001 — belt-and-braces
         # SD1: exception message may carry decrypted payload bytes from
         # Fernet InvalidToken unwrap. Log only exception type name.

@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from src.gmail.client import GmailClient
+from src.gmail.client import AuthError, GmailClient
 
 if TYPE_CHECKING:
     from src.apply.captcha import CaptchaKind
@@ -169,6 +169,18 @@ def notify_captcha_escalation(
 
     try:
         _send(subject, body, recipient)
+    except AuthError:
+        # I2-B4 (Phase 3 xhigh iter-2): distinct signal for auth-required.
+        # Pre-fix the AuthError from GmailClient() was folded into the
+        # generic `notify.send_failed` event, so an operator watching for
+        # URGENT captcha email failures could not distinguish "gmail send
+        # failed" from "gmail auth is DEAD". Post-fix: dedicated event.
+        _log.warning(
+            "notify.auth_required",
+            ats=ats,
+            kind=kind,
+        )
+        return None
     except Exception as exc:  # noqa: BLE001 — never-blocking by contract
         http_status = _extract_http_status(exc)
         _log.info(
@@ -228,6 +240,14 @@ def notify_session_expired(
 
     try:
         _send(subject, body, recipient)
+    except AuthError:
+        # I2-B4 (Phase 3 xhigh iter-2): distinct signal — see captcha path.
+        _log.warning(
+            "notify.auth_required",
+            ats=ats,
+            kind="session_expired",
+        )
+        return None
     except Exception as exc:  # noqa: BLE001 — never-blocking by contract
         http_status = _extract_http_status(exc)
         _log.info(

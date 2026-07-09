@@ -438,7 +438,10 @@ def run_pipeline(
     # silently stay in dry_run forever on every subsequent call. Instead we
     # thread `dry_run` as an explicit kwarg to run_for_job; the seam OR's it
     # with the config-supplied value.
-    apply_events = _apply_seam.initialize(config, gmail_client)
+    # I2-B1: thread per-call dry_run into initialize so the review-loop
+    # YES branch (execute_confirmed_submit → _AutoModeCtx) honors CLI
+    # --dry-run even when config's apply.dry_run is false.
+    apply_events = _apply_seam.initialize(config, gmail_client, dry_run=dry_run)
 
     processed = []
     skipped = []
@@ -741,10 +744,20 @@ def main() -> None:
     # (raised by the B4 headless guard) propagated as an uncaught traceback
     # under a cron entrypoint — no structured event, no clear exit code,
     # operator only sees a stack trace in stderr.
+    # I2-B2 (Phase 3 xhigh iter-2): also catch google.auth RefreshError.
+    # SE5's original scope missed the "expired refresh grant" class — 60-day
+    # Google inactivity, security event, or scope change all raise
+    # RefreshError from creds.refresh(Request()), which the AuthError-only
+    # catch let propagate as an uncaught traceback (the exact SE5 failure
+    # mode).
+    from google.auth.exceptions import RefreshError as _GoogleRefreshError
     try:
         gmail = GmailClient()
-    except AuthError as exc:
-        log.error("gmail.auth_required", reason=str(exc))
+    except (AuthError, _GoogleRefreshError) as exc:
+        # I2-B9: SD1 pattern — log exc_type only. print() still surfaces
+        # str(exc) to stderr for operator diagnosis; only the structured
+        # log line drops the payload-carrying string.
+        log.error("gmail.auth_required", exc_type=type(exc).__name__)
         print(f"gmail auth required: {exc}", file=sys.stderr)
         sys.exit(2)
     log.info("step.gmail_intake", status="starting")

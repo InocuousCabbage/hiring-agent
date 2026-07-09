@@ -113,9 +113,16 @@ def _is_headless() -> bool:
     opt out of the guard (still gated on ``HIRING_AGENT_HEADLESS``
     override for symmetry with the cron entrypoint).
     """
-    if os.environ.get("HIRING_AGENT_HEADLESS"):
+    # I2-B7 (Phase 3 xhigh iter-2): strict allowlist on env-var truthiness.
+    # Pre-fix: bare `os.environ.get(NAME)` truthy on any non-empty string,
+    # so an operator setting `HIRING_AGENT_HEADLESS=0` intending to DISABLE
+    # the guard actually ENABLED it (returns True). Same trap for
+    # HIRING_AGENT_INTERACTIVE_OAUTH=0/false/no. Require one of the
+    # explicit truthy tokens.
+    _TRUTHY = {"1", "true", "yes", "on"}
+    if os.environ.get("HIRING_AGENT_HEADLESS", "").strip().lower() in _TRUTHY:
         return True
-    if os.environ.get("HIRING_AGENT_INTERACTIVE_OAUTH"):
+    if os.environ.get("HIRING_AGENT_INTERACTIVE_OAUTH", "").strip().lower() in _TRUTHY:
         return False
     try:
         has_tty = sys.stdin.isatty()
@@ -169,41 +176,16 @@ class GmailClient:
             token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(token_path.parent, 0o700)
 
-            # L4 + SB3 (Phase 3 xhigh iter-1): write via temp file +
-            # atomic os.replace so a concurrent reader never observes a
-            # truncated JSON blob. SB3 fix: create the .tmp file with
-            # mode 0o600 at creation time (os.open with the mode arg)
-            # rather than `open(path, 'w')` (which respects umask, so
-            # the token was world-readable during the write window
-            # before the follow-up chmod). SE3: fsync before rename so
-            # the token survives a power failure. SE4: try/finally
-            # cleans up the .tmp on failure so no orphan file with a
-            # valid token is left behind.
-            tmp_path = token_path.parent / f"{token_path.name}.tmp"
-            token_json = creds.to_json()
-            fd = os.open(
-                tmp_path,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o600,
-            )
-            try:
-                try:
-                    os.write(fd, token_json.encode("utf-8"))
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                # Belt-and-braces chmod in case umask or fs quirks stripped bits.
-                os.chmod(tmp_path, 0o600)
-                os.replace(tmp_path, token_path)
-                # Rename does not always preserve mode across all filesystems.
-                os.chmod(token_path, 0o600)
-            except Exception:
-                # SE4: never leave an orphan .tmp with a valid token behind.
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-                raise
+            # L4 + SB3 + I2-B5 (Phase 3 xhigh iter-2): delegate to the
+            # shared `credentials.atomic_write_text` helper. Pre-fix:
+            # this file inlined its own copy of the create-at-0o600 +
+            # fsync + atomic-rename + cleanup dance — SE3 introduced the
+            # helper explicitly to unify the two sites but the gmail
+            # path never actually delegated. Two copies of security-
+            # sensitive code drift; the helper is the single source of
+            # truth for atomic secret writes.
+            from src.apply.credentials import atomic_write_text
+            atomic_write_text(token_path, creds.to_json())
 
         return creds
 

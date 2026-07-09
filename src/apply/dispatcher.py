@@ -207,15 +207,24 @@ def _cached_load_and_unwrap_state(ats: str, user: str) -> dict | None:
     `credentials.load_and_unwrap_state` on first call. `None` results are
     also cached so a keyring probe doesn't rerun on a subsequent job that
     happens to hit the same (ats, user) tuple.
+
+    I2-B8 (Phase 3 xhigh iter-2): TransientBackendError from the underlying
+    load_state is NOT cached — a keyring blip on the first call must not
+    poison the whole pipeline with None. Return None (once), skip cache,
+    retry on the next call.
     """
     key = (ats, user)
     if key in _state_cache:
         return _state_cache[key]
     # Import from src.apply.credentials at call time so tests that monkeypatch
     # `credentials.load_state` see the fresh binding (mirrors L12 discipline).
-    from src.apply.credentials import load_and_unwrap_state
+    from src.apply.credentials import load_and_unwrap_state, TransientBackendError
 
-    result = load_and_unwrap_state(ats, user)
+    try:
+        result = load_and_unwrap_state(ats, user)
+    except TransientBackendError:
+        # I2-B8: transient — return None for this call, DO NOT cache.
+        return None
     _state_cache[key] = result
     return result
 

@@ -82,14 +82,24 @@ def _call_configure_storage_dir(config: dict) -> None:
     configure_storage_dir(config)
 
 
-def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> list:
+def _call_poll_pending_reviews(
+    *,
+    gmail: Any,
+    now: datetime,
+    config: dict,
+    dry_run: bool = False,
+) -> list:
     """H2 + H3 fix: build the ReviewStore + resolve an adapter, and pass the
     WRAPPED config shape poll_pending_reviews reads (`config["apply"]`).
 
     ``config`` here is the INNER apply_config (unwrapped by the caller in
     initialize()). poll_pending_reviews' real signature is
-    ``(gmail, store, now, config, *, adapter=None)`` and it reads
-    ``config["apply"].get(...)`` — so we re-wrap before passing.
+    ``(gmail, store, now, config, *, adapter=None, dry_run=False)`` and it
+    reads ``config["apply"].get(...)`` — so we re-wrap before passing.
+
+    I2-B1 (Phase 3 xhigh iter-2): threads per-call ``dry_run`` through so
+    the review-loop YES branch honors CLI --dry-run even when the config
+    file has ``dry_run: false``.
     """
     from src.apply.review import poll_pending_reviews
     from src.apply.state_store import ReviewStore
@@ -131,7 +141,7 @@ def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> li
     wrapped = {"apply": config}
     try:
         return poll_pending_reviews(
-            gmail, store, now, wrapped, adapter=adapter
+            gmail, store, now, wrapped, adapter=adapter, dry_run=dry_run
         ) or []
     finally:
         try:
@@ -219,7 +229,11 @@ def _safe_apply_config(config: dict) -> dict:
     return apply_cfg
 
 
-def initialize(config: dict, gmail_client: Any | None) -> list:
+def initialize(
+    config: dict,
+    gmail_client: Any | None,
+    dry_run: bool = False,
+) -> list:
     """Called ONCE per `run_pipeline` invocation BEFORE the per-job loop.
 
     Returns the list of ``ApplyEvent`` from the review poller (empty when
@@ -250,7 +264,15 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
     try:
         _call_install_scrubber()
     except Exception as exc:  # noqa: BLE001 — never-blocking on scrubber install
-        _log.warning("apply.scrubber_install_failed", error=str(exc))
+        # I2-B6/I2-B9 (Phase 3 xhigh iter-2): the scrubber is INACTIVE at
+        # this exact log line — that IS the failure being reported. Any
+        # dynamic content in str(exc) (paths, config values, credentials
+        # embedded in the underlying cause) would go through the log un-
+        # redacted. Log only the exception class name, per the SD1 pattern.
+        _log.warning(
+            "apply.scrubber_install_failed",
+            exc_type=type(exc).__name__,
+        )
 
     apply_config = _safe_apply_config(config)
     if not apply_config.get("enabled", False):
@@ -266,7 +288,11 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
         from src.apply.dispatcher import _reset_state_cache
         _reset_state_cache()
     except Exception as exc:  # noqa: BLE001 — cache reset must never block
-        _log.warning("apply.state_cache_reset_failed", error=str(exc))
+        # I2-B9: SD1 pattern — log exc_type only.
+        _log.warning(
+            "apply.state_cache_reset_failed",
+            exc_type=type(exc).__name__,
+        )
 
     # 2. Wire the config-driven storage dir into the credentials backend.
     _call_configure_storage_dir(config)
@@ -278,6 +304,7 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
             gmail=gmail_client,
             now=datetime.now(timezone.utc),
             config=apply_config,
+            dry_run=dry_run,  # I2-B1: propagate CLI --dry-run to review loop.
         )
         _log.info("apply.review.poll_started", n=len(events))
     except Exception as exc:  # noqa: BLE001 — pipeline never-blocking

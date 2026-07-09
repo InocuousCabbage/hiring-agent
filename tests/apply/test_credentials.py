@@ -284,27 +284,30 @@ def test_atomic_write_uses_tmp_then_rename(
         mod, "_select_backend", lambda: mod.FernetFileBackend()
     )
 
+    # I2-B5 (Phase 3 xhigh iter-2): _atomic_write now uses os.replace (not
+    # os.rename) for cross-platform correctness (Windows requires replace to
+    # overwrite an existing target). Spy on both; either counts as atomic.
     captured: list[tuple[str, str]] = []
-    real_rename = os.rename
+    real_replace = os.replace
 
-    def spy_rename(src, dst):
+    def spy_replace(src, dst):
         captured.append((str(src), str(dst)))
-        real_rename(src, dst)
+        real_replace(src, dst)
 
-    monkeypatch.setattr(os, "rename", spy_rename)
+    monkeypatch.setattr(os, "replace", spy_replace)
 
     mod.store_state("greenhouse", "ben", {"cookies": [], "origins": []})
 
-    assert captured, "os.rename was never called"
-    # There must be at least one rename call whose source ends with .tmp
+    assert captured, "os.replace was never called"
+    # There must be at least one replace call whose source ends with .tmp
     # and dest is the final .enc path.
-    rename_calls_for_state = [
+    replace_calls_for_state = [
         (s, d) for (s, d) in captured if d.endswith(".enc")
     ]
-    assert rename_calls_for_state, (
-        f"no rename call landed on the final .enc path; saw: {captured}"
+    assert replace_calls_for_state, (
+        f"no replace call landed on the final .enc path; saw: {captured}"
     )
-    src, dst = rename_calls_for_state[-1]
+    src, dst = replace_calls_for_state[-1]
     assert src.endswith(".tmp"), f"src did not end with .tmp: {src}"
     assert not dst.endswith(".tmp"), f"dst still ends with .tmp: {dst}"
 
