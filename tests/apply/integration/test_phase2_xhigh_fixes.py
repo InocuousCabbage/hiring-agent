@@ -190,7 +190,7 @@ def test_handle_yes_treats_submitted_unrecorded_as_resolved(tmp_path, monkeypatc
         "initial_msg_id": "MSG_1",
     })
 
-    def _spy_execute(decision, adapter, config, *, resume_path=None, cover_letter_path=None):
+    def _spy_execute(decision, adapter, config, *, resume_path=None, cover_letter_path=None, dry_run=False):
         from src.apply.types import ApplyResult
         return ApplyResult(
             status="submitted_unrecorded",

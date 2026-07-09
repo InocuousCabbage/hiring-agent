@@ -186,6 +186,75 @@ def dispatch(url: str, config: dict) -> "ATSAdapter | None":
     return None
 
 
+# ---------------------------------------------------------------------------
+# SG1 (Phase 3 xhigh iter-1): per-run storage_state cache
+#
+# Motivation: `credentials.load_state()` touches the OS keyring / Secret
+# Service on every call. A keyring hang here reintroduces the B4-class
+# failure mode we just closed in the Group J OAuth fix — every apply in
+# the pipeline would independently hit the same slow/hung endpoint.
+#
+# Solution: a module-level cache keyed on (ats, user). The cache lives for
+# the process's lifetime; the seam layer resets it once per run_pipeline
+# invocation to avoid staleness across long-lived processes.
+# ---------------------------------------------------------------------------
+
+_state_cache: dict[tuple[str, str], dict | None] = {}
+
+
+def _cached_load_and_unwrap_state(ats: str, user: str) -> dict | None:
+    """Return a cached storage_state for (ats, user), populating from
+    `credentials.load_and_unwrap_state` on first call. `None` results are
+    also cached so a keyring probe doesn't rerun on a subsequent job that
+    happens to hit the same (ats, user) tuple.
+
+    I2-B8 (Phase 3 xhigh iter-2): TransientBackendError from the underlying
+    load_state is NOT cached — a keyring blip on the first call must not
+    poison the whole pipeline with None. Return None (once), skip cache,
+    retry on the next call.
+    """
+    key = (ats, user)
+    if key in _state_cache:
+        return _state_cache[key]
+    # Import from src.apply.credentials at call time so tests that monkeypatch
+    # `credentials.load_state` see the fresh binding (mirrors L12 discipline).
+    from src.apply.credentials import load_and_unwrap_state, TransientBackendError
+
+    try:
+        result = load_and_unwrap_state(ats, user)
+    except TransientBackendError:
+        # I2-B8: transient — return None for this call, DO NOT cache.
+        return None
+    _state_cache[key] = result
+    return result
+
+
+def _reset_state_cache() -> None:
+    """Clear the per-run storage_state cache. Called by the seam layer at
+    pipeline entry so long-lived processes never observe stale keyring data.
+    Also used by tests to force a fresh probe.
+    """
+    _state_cache.clear()
+
+
+def get_transport(config: dict, kind: str | None = None):
+    """Module-level re-export of `src.apply.transport.get_transport`.
+
+    Kept as a thin call-through (rather than a plain `from ... import
+    get_transport` at module scope) so BOTH patch surfaces used by tests
+    keep working:
+      - `monkeypatch.setattr(dispatcher, "get_transport", ...)` replaces
+        this name outright (M5's RED test patches the dispatcher module
+        directly).
+      - `monkeypatch.setattr(src.apply.transport, "get_transport", ...)`
+        is picked up too, because the import below is resolved fresh on
+        every call (existing H4 wiring tests patch the transport module).
+    """
+    from src.apply.transport import get_transport as _get_transport
+
+    return _get_transport(config, kind)
+
+
 def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult:
     """Public entry point called from `src/main.py:172` (S17 seam).
 
@@ -214,8 +283,6 @@ def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult
     # For the initial gate here we pass kind=None (no CAPTCHA detected yet);
     # if an adapter escalates a CAPTCHA it will surface via its own
     # captcha_escalated status.
-    from src.apply.transport import get_transport
-
     try:
         transport = get_transport(config, kind=None)
     except Exception as exc:  # noqa: BLE001 — H12 covers graceful fallback; still soft-fail here.
@@ -235,8 +302,38 @@ def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult
     # soft-failed here so apply_to_job's `never raises` contract holds.
     from src.apply.base import SessionExpiredError
 
+    # M5 + SG1/SG2/SE2/SD1 (Phase 3 xhigh iter-1):
+    # Load bootstrapped storage_state via the shared credentials helper
+    # (SE2 dedups the envelope-unwrap logic between here and review.py).
+    # SG1: cache the per-(ats, user) result across a single pipeline run so
+    # we don't touch the OS keyring on every apply — a keyring hang would
+    # reintroduce the B4-class failure the Group J OAuth fix was written
+    # to close.
+    # SG2: helper does strict shape validation — malformed dicts never
+    # reach transport.open() (returned as None instead).
+    # SD1: helper's log lines carry only structural fields (`ats`, `user`,
+    # `exc_type`) — never the exception message (which could carry
+    # decrypted payload bytes from Fernet InvalidToken).
+    storage_state = None
+    ats_name = getattr(adapter, "name", None)
+    if ats_name:
+        user = getattr(ctx, "applicant", None) or config.get("apply", {}).get(
+            "user", "single"
+        )
+        try:
+            storage_state = _cached_load_and_unwrap_state(ats_name, user)
+        except Exception as exc:  # noqa: BLE001 — never abort apply on lookup failure
+            # SD1: log ONLY the exception type name, never `_exc_repr(exc)`
+            # (which includes str(exc) and can carry decrypted payload bytes).
+            log.warning(
+                "apply.storage_state_load_failed",
+                ats=ats_name,
+                exc_type=type(exc).__name__,
+            )
+            storage_state = None
+
     try:
-        with transport.open(job_url, storage_state=None) as session:
+        with transport.open(job_url, storage_state=storage_state) as session:
             page = getattr(session, "page", None)
             try:
                 result = adapter.apply(page=page, ctx=ctx)  # type: ignore[arg-type]

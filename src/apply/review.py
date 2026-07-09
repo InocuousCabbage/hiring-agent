@@ -502,6 +502,7 @@ def execute_confirmed_submit(
     dedup_db: Any | None = None,
     resume_path: "Path | None" = None,
     cover_letter_path: "Path | None" = None,
+    dry_run: bool = False,
 ) -> Any:
     """Re-open the browser via S4, re-run the adapter, and record dedup ONLY
     on DOM-verified confirmation.
@@ -579,32 +580,43 @@ def execute_confirmed_submit(
     # json-dumped the envelope verbatim, and Playwright either restored zero
     # cookies or raised — the bootstrapped session was effectively unused.
     state = load_state_fn(decision.ats, decision.applicant) if load_state_fn else None
+    # SE2 (Phase 3 xhigh iter-1): delegate envelope-unwrap + shape validation
+    # to the shared credentials helper. Pre-fix: this file had its own
+    # inline envelope-detect + unwrap block that drifted independently
+    # from the dispatcher's copy. `unwrap_state_if_envelope` accepts a raw
+    # value (already loaded via `load_state_fn`, since this file supports
+    # injecting the load function for testability) and returns either the
+    # unwrapped inner state OR None on malformed shape / unwrap failure.
     if state is not None:
-        # Envelope form → unwrap; already-flat state → pass through.
-        #
-        # SD5 fix (Phase 1 xhigh): on unwrap failure we DROP the state
-        # entirely (state = None) rather than falling through with the
-        # wrapped envelope still bound — the pre-fix `state` variable
-        # remained the wrapper and was verbatim json.dump'd to the temp
-        # file, reintroducing the exact M2 bug we're supposed to fix.
-        if isinstance(state, dict) and "state" in state and "last_verified" in state:
-            try:
-                from src.apply.bootstrap import unwrap_state  # noqa: E402
-                inner, _lv, _u = unwrap_state(state)
-                state = inner
-            except Exception:  # noqa: BLE001 — malformed envelope
-                log.warning(
-                    "apply.review.storage_state_unwrap_failed",
-                    review_id=decision.review_id,
-                )
-                state = None
+        try:
+            from src.apply.credentials import unwrap_state_if_envelope  # noqa: E402
+            state = unwrap_state_if_envelope(state)
+        except Exception:  # noqa: BLE001 — defensive: helper never raises but be safe
+            log.warning(
+                "apply.review.storage_state_unwrap_failed",
+                review_id=decision.review_id,
+            )
+            state = None
     tmp_path: Path | None = None
     if state:
+        # Iter-4 (Phase 3 xhigh iter-4): symmetric with the LocalTransport
+        # iter-3 F1 fix — mkstemp creates the file BEFORE write_text/chmod
+        # runs. If either subsequent step raises, the tempfile carries
+        # partial-or-full session cookie contents and would orphan on disk
+        # (this block sits OUTSIDE the outer try/finally below). Wrap in
+        # a local try/except that unlinks on failure BEFORE re-raising.
         fd, name = tempfile.mkstemp(suffix=".storage_state.json")
         os.close(fd)
         tmp_path = Path(name)
-        tmp_path.write_text(json.dumps(state))
-        os.chmod(tmp_path, 0o600)
+        try:
+            tmp_path.write_text(json.dumps(state))
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
 
     result: Any
     try:
@@ -624,6 +636,10 @@ def execute_confirmed_submit(
             # NEVER retry adapter.apply (L13). Called exactly once.
             # H4/M3: pass persisted resume/cover paths + unwrapped config so
             # the adapter can actually complete the upload and honor rate limits.
+            # I2-B1 (Phase 3 xhigh iter-2): thread per-call dry_run into the
+            # ctx so `--dry-run` at the CLI reaches the review-loop YES
+            # branch. Pre-fix (post-SB2), removing the config-mutation ratchet
+            # left this path reading `apply_config['dry_run']` verbatim.
             result = adapter.apply(
                 page,
                 _AutoModeCtx(
@@ -631,6 +647,7 @@ def execute_confirmed_submit(
                     config,
                     resume_path=resume_path,
                     cover_letter_path=cover_letter_path,
+                    dry_run_override=dry_run,
                 ),
             )
     finally:
@@ -747,6 +764,7 @@ class _AutoModeCtx:
         *,
         resume_path: "Path | None" = None,
         cover_letter_path: "Path | None" = None,
+        dry_run_override: bool = False,
     ):
         # M3: hand the adapter the INNER apply-config dict, unwrapping the
         # ``{"apply": ...}`` envelope if present (defensive — some callers
@@ -755,7 +773,10 @@ class _AutoModeCtx:
         if not isinstance(inner, dict):
             inner = {}
         self.mode = "auto"
-        self.dry_run = inner.get("dry_run", False)
+        # I2-B1 (Phase 3 xhigh iter-2): OR per-call dry_run with config.
+        # Pre-fix, only read config → --dry-run/`--test` at the CLI never
+        # reached this ctx after SB2 removed the config-mutation ratchet.
+        self.dry_run = bool(dry_run_override) or bool(inner.get("dry_run", False))
         self.config = inner
         self.applicant = decision.applicant
         self.job = {
@@ -952,6 +973,7 @@ def poll_pending_reviews(
     config: dict,
     *,
     adapter: Any = None,
+    dry_run: bool = False,
 ) -> list[Decision]:
     """Sweep open ``review_pending`` rows; resolve each per Q4/Q5 rules.
 
@@ -1070,6 +1092,8 @@ def poll_pending_reviews(
                 label_ids=label_ids,
                 adapter=adapter,
                 config=config,
+                # I2-B1: propagate CLI --dry-run into per-row resolution.
+                dry_run=dry_run,
             )
         except Exception as exc:  # noqa: BLE001 — per-row isolation
             log.warning(
@@ -1109,6 +1133,7 @@ def _resolve_one(
     label_ids: dict[str, str],
     adapter: Any,
     config: dict,
+    dry_run: bool = False,
 ) -> Decision | None:
     review_id = row["review_id"]
     thread_id = row.get("gmail_thread_id")
@@ -1173,6 +1198,8 @@ def _resolve_one(
                 adapter=adapter,
                 config=config,
                 now=now,
+                # I2-B1: thread dry_run for the review-loop YES branch.
+                dry_run=dry_run,
             )
         if parsed == "NO":
             return _handle_no(
@@ -1242,6 +1269,7 @@ def _handle_yes(
     adapter: Any,
     config: dict,
     now: datetime,
+    dry_run: bool = False,
 ) -> Decision | None:
     review_id = row["review_id"]
     decision = Decision(
@@ -1295,6 +1323,9 @@ def _handle_yes(
             config,
             resume_path=Path(resume_path_str) if resume_path_str else None,
             cover_letter_path=Path(cover_path_str) if cover_path_str else None,
+            # I2-B1: thread per-tick dry_run through the YES branch so the
+            # CLI --dry-run reaches _AutoModeCtx.dry_run.
+            dry_run=dry_run,
         )
     except Exception:
         # iter2-H7: unexpected exception path — release the claim so the

@@ -33,6 +33,7 @@ methods that need a mid-retry credential refresh use the factory form
 """
 
 import os
+import sys
 import base64
 from pathlib import Path
 from email.mime.text import MIMEText
@@ -84,6 +85,53 @@ SCOPES = [
 ]
 
 
+class AuthError(RuntimeError):
+    """Raised when interactive OAuth would be required but the current
+    process is headless (Phase 3 / B4).
+
+    An unattended cron has no TTY and no display server, so
+    ``InstalledAppFlow.run_local_server`` would hang forever holding the
+    entrypoint's flock — every subsequent tick would then exit 0 silently
+    with the agent effectively dead. Raising here instead gives operators
+    a grep-able, non-zero-exit failure.
+    """
+
+
+def _is_headless() -> bool:
+    """Best-effort headless-environment detection for the OAuth guard.
+
+    Post-SB4 (Phase 3 xhigh iter-1): default to TTY-only signal. Under a
+    tmux/launchd/always-on machine, a stale ``DISPLAY`` from the parent
+    process gets inherited into the cron worker even though no X server
+    is actually reachable. The pre-fix guard (``not has_tty AND
+    not has_display``) then flipped to False and let ``run_local_server``
+    hang forever.
+
+    Post-fix policy: if stdin is not a TTY, treat the process as headless.
+    Operators explicitly needing an interactive OAuth flow from a
+    non-TTY entrypoint can set ``HIRING_AGENT_INTERACTIVE_OAUTH=1`` to
+    opt out of the guard (still gated on ``HIRING_AGENT_HEADLESS``
+    override for symmetry with the cron entrypoint).
+    """
+    # I2-B7 (Phase 3 xhigh iter-2): strict allowlist on env-var truthiness.
+    # Pre-fix: bare `os.environ.get(NAME)` truthy on any non-empty string,
+    # so an operator setting `HIRING_AGENT_HEADLESS=0` intending to DISABLE
+    # the guard actually ENABLED it (returns True). Same trap for
+    # HIRING_AGENT_INTERACTIVE_OAUTH=0/false/no. Require one of the
+    # explicit truthy tokens.
+    _TRUTHY = {"1", "true", "yes", "on"}
+    if os.environ.get("HIRING_AGENT_HEADLESS", "").strip().lower() in _TRUTHY:
+        return True
+    if os.environ.get("HIRING_AGENT_INTERACTIVE_OAUTH", "").strip().lower() in _TRUTHY:
+        return False
+    try:
+        has_tty = sys.stdin.isatty()
+    except Exception:
+        has_tty = False
+    # SB4: TTY-only. Stale DISPLAY inheritance no longer bypasses the guard.
+    return not has_tty
+
+
 def _sanitize_query(value: str) -> str:
     """Strip characters that could alter Gmail search query semantics."""
     return value.replace('"', '').replace('\\', '').replace('\n', '').replace('\r', '')
@@ -109,12 +157,35 @@ class GmailClient:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
+                # B4: refuse to launch the interactive browser flow under a
+                # headless cron — it would hang `run_local_server` forever.
+                if _is_headless():
+                    raise AuthError(
+                        "Gmail OAuth requires an interactive browser login, "
+                        "but this process is headless (no TTY, no DISPLAY/"
+                        "WAYLAND_DISPLAY). Run authentication manually from "
+                        "an interactive session (e.g. `python -m "
+                        "src.gmail.client`) to (re)generate token.json, then "
+                        "let the cron reuse it."
+                    )
                 flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
                 creds = flow.run_local_server(port=0)
 
-            token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(token_path, "w") as f:
-                f.write(creds.to_json())
+            # H12: parent dir must be 0o700 — tighten it even if it already
+            # existed with a laxer mode from a prior run.
+            token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(token_path.parent, 0o700)
+
+            # L4 + SB3 + I2-B5 (Phase 3 xhigh iter-2): delegate to the
+            # shared `credentials.atomic_write_text` helper. Pre-fix:
+            # this file inlined its own copy of the create-at-0o600 +
+            # fsync + atomic-rename + cleanup dance — SE3 introduced the
+            # helper explicitly to unify the two sites but the gmail
+            # path never actually delegated. Two copies of security-
+            # sensitive code drift; the helper is the single source of
+            # truth for atomic secret writes.
+            from src.apply.credentials import atomic_write_text
+            atomic_write_text(token_path, creds.to_json())
 
         return creds
 
@@ -611,7 +682,6 @@ class GmailClient:
             raise ValueError("MY_EMAIL is not set")
         return addr
 
-    @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
     def send_immediate(
         self,
         subject: str,
@@ -622,11 +692,15 @@ class GmailClient:
         """
         Send an urgent single-recipient alert.
 
-        Retries per S11's `@navigation_retry` policy (3 attempts, exponential
-        jitter backoff, credential refresh between attempts). On final
-        failure the ORIGINAL exception propagates to the caller. S13's
-        `notify.py` owns the swallow-and-log contract; this client stays
-        honest.
+        M11 fix: this method is intentionally UNDECORATED. It delegates to
+        `send_email`, which already carries `@navigation_retry` (3 attempts,
+        exponential jitter backoff, credential refresh between attempts).
+        Stacking a second `@navigation_retry` here composed into up to 3x3=9
+        real `messages.send` calls on a transient error — one URGENT
+        notification could fan out into 9 duplicate emails. Delegating keeps
+        a single retry budget. On final failure the ORIGINAL exception
+        propagates to the caller; S13's `notify.py` owns the swallow-and-log
+        contract, this client stays honest.
 
         `to` defaults to `self._me()` (i.e. `MY_EMAIL`); callers can override
         to honor a `apply.fast_path_recipient` config value that differs from

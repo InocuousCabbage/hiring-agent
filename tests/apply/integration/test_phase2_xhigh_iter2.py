@@ -368,7 +368,7 @@ def test_handle_yes_does_not_apply_submitted_label_on_cas_loss(tmp_path, monkeyp
         "initial_msg_id": "M",
     })
 
-    def _spy_execute(decision, adapter, config, *, resume_path=None, cover_letter_path=None):
+    def _spy_execute(decision, adapter, config, *, resume_path=None, cover_letter_path=None, dry_run=False):
         # Simulate a concurrent handler that RELEASED the claim mid-flight.
         with store._conn:
             store._conn.execute(

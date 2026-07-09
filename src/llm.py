@@ -11,7 +11,6 @@ Otherwise, ensure `claude` CLI is installed and authenticated (`claude login`).
 import json
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 
 import structlog
@@ -89,26 +88,26 @@ def _call_via_cli(prompt: str, model: str, system: str | None, timeout: int) -> 
 
     log.debug("llm.call_cli", model=model, prompt_len=len(full_prompt))
 
-    # For long prompts, write to temp file to avoid OS argument length limits
-    # and CLI parsing issues. Threshold: 8000 chars (~safe ARG_MAX margin).
+    # For long prompts, feed the prompt via stdin so we don't hit OS
+    # argument length limits (ARG_MAX). Threshold: 8000 chars.
+    #
+    # SE6 (Phase 3 xhigh iter-1): pass `input=full_prompt` directly.
+    # Pre-fix (post-M10) still round-tripped through a NamedTemporaryFile
+    # — write to /tmp, then reopen and pipe as stdin. Once M10 removed the
+    # shell=True wrapper, the tempfile serves no purpose: subprocess.run
+    # already handles stdin plumbing when `input=` is passed. Collapsing
+    # the two branches also eliminates the leftover /tmp file on any error
+    # path where the finally clause races (e.g. host OOM, KeyboardInterrupt
+    # between write and unlink).
     try:
         if len(full_prompt) > 8000:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", delete=False, prefix="claude_prompt_"
-            ) as f:
-                f.write(full_prompt)
-                tmp_path = f.name
-            try:
-                # Read prompt from file via shell redirection
-                result = subprocess.run(
-                    f'cat "{tmp_path}" | claude -p',
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    shell=True,
-                )
-            finally:
-                os.unlink(tmp_path)
+            result = subprocess.run(
+                ["claude", "-p"],
+                input=full_prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
         else:
             result = subprocess.run(
                 ["claude", "-p", full_prompt],

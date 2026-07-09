@@ -82,14 +82,24 @@ def _call_configure_storage_dir(config: dict) -> None:
     configure_storage_dir(config)
 
 
-def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> list:
+def _call_poll_pending_reviews(
+    *,
+    gmail: Any,
+    now: datetime,
+    config: dict,
+    dry_run: bool = False,
+) -> list:
     """H2 + H3 fix: build the ReviewStore + resolve an adapter, and pass the
     WRAPPED config shape poll_pending_reviews reads (`config["apply"]`).
 
     ``config`` here is the INNER apply_config (unwrapped by the caller in
     initialize()). poll_pending_reviews' real signature is
-    ``(gmail, store, now, config, *, adapter=None)`` and it reads
-    ``config["apply"].get(...)`` — so we re-wrap before passing.
+    ``(gmail, store, now, config, *, adapter=None, dry_run=False)`` and it
+    reads ``config["apply"].get(...)`` — so we re-wrap before passing.
+
+    I2-B1 (Phase 3 xhigh iter-2): threads per-call ``dry_run`` through so
+    the review-loop YES branch honors CLI --dry-run even when the config
+    file has ``dry_run: false``.
     """
     from src.apply.review import poll_pending_reviews
     from src.apply.state_store import ReviewStore
@@ -131,7 +141,7 @@ def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> li
     wrapped = {"apply": config}
     try:
         return poll_pending_reviews(
-            gmail, store, now, wrapped, adapter=adapter
+            gmail, store, now, wrapped, adapter=adapter, dry_run=dry_run
         ) or []
     finally:
         try:
@@ -219,25 +229,70 @@ def _safe_apply_config(config: dict) -> dict:
     return apply_cfg
 
 
-def initialize(config: dict, gmail_client: Any | None) -> list:
+def initialize(
+    config: dict,
+    gmail_client: Any | None,
+    dry_run: bool = False,
+) -> list:
     """Called ONCE per `run_pipeline` invocation BEFORE the per-job loop.
 
     Returns the list of ``ApplyEvent`` from the review poller (empty when
     apply.enabled=false OR the poller raised). Never raises.
 
-    Side effects (only when apply.enabled=true):
+    Side effects:
       1. install_scrubber() — S16 PII redactor active before any log line.
+         Runs UNCONDITIONALLY, even when apply.enabled=false (M9): other
+         pipeline stages (e.g. contacts/hm_finder) log raw LLM output on a
+         path that does not depend on the apply gate.
       2. configure_storage_dir() — env-var injection so bare
          FernetFileBackend() calls see the config-driven storage dir.
-      3. poll_pending_reviews() — S12 review-loop tick.
+         (apply.enabled=true only.)
+      3. poll_pending_reviews() — S12 review-loop tick. (apply.enabled=true
+         only.)
     """
+    # 1. Scrubber MUST be installed before ANY adapter log line (L7), and
+    # unconditionally (M9) — even when apply.enabled=false, since other
+    # pipeline stages log raw LLM output regardless of the apply gate.
+    #
+    # SB1 (Phase 3 xhigh iter-1): the scrubber install is best-effort. A
+    # structlog.configure() failure (or any exception raised inside
+    # install_scrubber) MUST NOT propagate past initialize — every
+    # run_pipeline call would crash at pipeline entry, including calls
+    # with apply.enabled=false where the scrubber failure is irrelevant to
+    # the caller's intent. Log the failure structurally and continue; the
+    # PII-scrub is a defense-in-depth layer, not a hard gate.
+    try:
+        _call_install_scrubber()
+    except Exception as exc:  # noqa: BLE001 — never-blocking on scrubber install
+        # I2-B6/I2-B9 (Phase 3 xhigh iter-2): the scrubber is INACTIVE at
+        # this exact log line — that IS the failure being reported. Any
+        # dynamic content in str(exc) (paths, config values, credentials
+        # embedded in the underlying cause) would go through the log un-
+        # redacted. Log only the exception class name, per the SD1 pattern.
+        _log.warning(
+            "apply.scrubber_install_failed",
+            exc_type=type(exc).__name__,
+        )
+
     apply_config = _safe_apply_config(config)
     if not apply_config.get("enabled", False):
         _log.info("apply.seam.disabled")
         return []
 
-    # 1. Scrubber MUST be installed before ANY adapter log line (L7).
-    _call_install_scrubber()
+    # SG1 (Phase 3 xhigh iter-1): reset the dispatcher's per-run
+    # storage_state cache. The cache prevents a keyring hang from firing
+    # on every apply (B4-class regression class), but long-lived processes
+    # need a fresh probe once per pipeline invocation to pick up newly
+    # bootstrapped credentials without a restart.
+    try:
+        from src.apply.dispatcher import _reset_state_cache
+        _reset_state_cache()
+    except Exception as exc:  # noqa: BLE001 — cache reset must never block
+        # I2-B9: SD1 pattern — log exc_type only.
+        _log.warning(
+            "apply.state_cache_reset_failed",
+            exc_type=type(exc).__name__,
+        )
 
     # 2. Wire the config-driven storage dir into the credentials backend.
     _call_configure_storage_dir(config)
@@ -249,6 +304,7 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
             gmail=gmail_client,
             now=datetime.now(timezone.utc),
             config=apply_config,
+            dry_run=dry_run,  # I2-B1: propagate CLI --dry-run to review loop.
         )
         _log.info("apply.review.poll_started", n=len(events))
     except Exception as exc:  # noqa: BLE001 — pipeline never-blocking
@@ -271,6 +327,7 @@ def run_for_job(
     resume_docx_path: Path | None = None,
     cover_letter_docx_path: Path | None = None,
     gmail_client: Any | None = None,
+    dry_run: bool = False,
 ) -> "ApplyResult | None":
     """Called PER JOB after the HM-lookup block, before ``processed.append``.
 
@@ -294,6 +351,13 @@ def run_for_job(
     if not isinstance(apply_config, dict) or not apply_config.get("enabled", False):
         return None
 
+    # SB2 (Phase 3 xhigh iter-1): effective dry_run = per-call kwarg OR
+    # config value. The per-call flag flows in from run_pipeline; the config
+    # value is the operator-configured default (H17 ships `dry_run: true`).
+    # OR-ing preserves the safety property that dry_run=True anywhere in the
+    # decision chain stays dry_run.
+    effective_dry_run = bool(dry_run) or bool(apply_config.get("dry_run", False))
+
     from src.apply.base import SessionExpiredError
     from src.apply.profile import CandidateProfile
     from src.apply.types import ApplyContext, ApplyResult
@@ -302,6 +366,29 @@ def run_for_job(
     # YAML, storage-state can fail — every failure surfaces as
     # apply.seam.error and returns None.
     try:
+        # H6: wire the CAPTCHA detector into ApplyContext. Without this,
+        # ApplyContext's default (None) wins and every adapter's CAPTCHA
+        # gate (`callable(None)` -> False) is dead — Turnstile/reCAPTCHA
+        # gated pages get a blind submit-click instead of an escalation.
+        # Imported at function scope (not module scope) so the seam import
+        # stays cheap when apply.enabled=false.
+        #
+        # SG3 (Phase 3 xhigh iter-1): guard the captcha import — a broken
+        # playwright/import environment must not crash every per-job apply.
+        # Mirrors the dedup fail-open pattern: set captcha_detect=None on
+        # import failure so ApplyContext's default (None) wins gracefully
+        # and the adapter's CAPTCHA gate (`callable(None)` → False) skips
+        # detection rather than raising.
+        captcha_detect = None
+        try:
+            from src.apply.captcha import detect as _detect_impl
+            captcha_detect = _detect_impl
+        except Exception as _captcha_import_exc:  # noqa: BLE001
+            job_log.warning(
+                "apply.seam.captcha_import_failed",
+                exc_type=type(_captcha_import_exc).__name__,
+            )
+
         profile_path = apply_config.get(
             "profile_path", "templates/candidate_profile.yaml"
         )
@@ -358,11 +445,13 @@ def run_for_job(
             cover_letter_path=cover_letter_path,
             config=apply_config,
             applicant=str(apply_config.get("user", "single")),
-            dry_run=bool(apply_config.get("dry_run", False)),
+            # SB2: use the OR'd flag so per-call dry_run wins over config.
+            dry_run=effective_dry_run,
             mode=effective_mode,
             resume_docx_path=resume_docx_path,
             cover_letter_docx_path=cover_letter_docx_path,
             dedup=dedup,
+            captcha_detector=captcha_detect,
         )
         job_url = job.get("ats_apply_url") or job.get("url", "") or ""
         result = _call_apply_to_job(job_url=job_url, ctx=ctx, config=apply_config)
@@ -379,7 +468,8 @@ def run_for_job(
         # DB across every test run. Under dry_run we log-only.
         _STAGE_STATUSES = {"review_required", "soft_dup_warn", "captcha_escalated"}
         if result is not None and getattr(result, "status", None) in _STAGE_STATUSES:
-            if apply_config.get("dry_run", False):
+            if effective_dry_run:
+                # SB2: use the OR'd flag so per-call dry_run wins here too.
                 job_log.info(
                     "apply.review.stage_skipped_dry_run",
                     status=getattr(result, "status", None),
