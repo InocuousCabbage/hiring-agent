@@ -25,43 +25,39 @@ hiring-agent/
 │   └── credentials/           # Gmail OAuth creds (gitignored)
 ├── templates/
 │   ├── resumes/
-│   │   ├── base_pmm.docx      # Product Marketing base resume
-│   │   ├── base_content.docx  # Content Marketing base resume
-│   │   └── base_mops.docx     # Marketing Ops base resume
-│   ├── cover_letter.docx      # Cover letter template
+│   │   └── base_resume.docx   # Your base resume (all lanes point here by default)
+│   ├── candidate_profile.yaml.example  # Auto-apply profile schema (Phase 3)
 │   └── project_bank.yaml      # Your real projects + metrics
 ├── src/
 │   ├── main.py                # Orchestrator — runs the full pipeline
-│   ├── gmail/
-│   │   ├── __init__.py
-│   │   ├── client.py          # Gmail API auth + read/send/label
-│   │   └── digest.py          # Compose + send the digest email
-│   ├── parser/
-│   │   ├── __init__.py
-│   │   └── email_parser.py    # Extract job entries from alert HTML
-│   ├── scraper/
-│   │   ├── __init__.py
-│   │   └── jd_fetcher.py      # Fetch + clean job descriptions
-│   ├── classifier/
-│   │   ├── __init__.py
-│   │   └── lane_selector.py   # PMM vs Content vs MOps classification
-│   ├── tailor/
-│   │   ├── __init__.py
-│   │   ├── resume_tailor.py   # Resume tailoring via Claude API
-│   │   └── cover_letter.py    # Cover letter generation
-│   ├── pdf_gen/
-│   │   ├── __init__.py
-│   │   └── renderer.py        # DOCX template fill → PDF export
-│   └── qa/
-│       ├── __init__.py
-│       └── checker.py         # QA checklist + auto-fix loop
-├── tests/
-│   └── ...
+│   ├── llm.py                 # Claude API + Claude-CLI subprocess wrapper
+│   ├── gmail/                 # Gmail API auth + read/send/label + digest
+│   ├── parser/                # Extract job entries from alert HTML
+│   ├── scraper/               # Fetch + clean job descriptions
+│   ├── classifier/            # PMM vs Content vs MOps classification
+│   ├── tailor/                # Resume tailoring + cover letter generation
+│   ├── pdf_gen/               # DOCX build + LibreOffice PDF export
+│   ├── qa/                    # QA checklist + auto-fix loop
+│   ├── contacts/              # Hiring-manager finder (opt-in)
+│   ├── browser/               # Shared Playwright session (Phase 3)
+│   └── apply/                 # Auto-apply pipeline (Phase 3, opt-in)
+│       ├── adapters/          # Per-ATS adapters (greenhouse, computer_use)
+│       ├── migrations/        # SQLite schema (applied_jobs, review_pending)
+│       ├── transport/         # Local + Browserbase Playwright transport
+│       ├── bootstrap.py       # `python -m src.apply.bootstrap <ats>`
+│       ├── dedup.py           # applied_jobs + `--unblock` CLI
+│       ├── dispatcher.py      # URL → ATS routing
+│       ├── review.py          # YES/NO review loop + poller
+│       └── ...
+├── tests/                     # Offline unit + integration + apply/ live gates
+├── docs/
+│   └── apply-flow.md          # Auto-apply operator manual
 ├── requirements.txt
 ├── .env.example
+├── SETUP.md
 └── deploy/
     ├── Dockerfile
-    └── cron_entry.sh
+    └── cron_entry.sh          # Cron entrypoint (flock-guarded)
 ```
 
 ## Setup
@@ -82,17 +78,19 @@ pip install -r requirements.txt
 1. Go to Google Cloud Console → APIs & Services → Credentials
 2. Create OAuth 2.0 Client ID (Desktop app)
 3. Download `credentials.json` → place in `config/credentials/`
-4. Run `python src/gmail/client.py` once to complete the OAuth flow
+4. Run `python -m src.gmail.client` once to complete the OAuth flow
 
 ### 4. Configure
 ```bash
 cp .env.example .env
-# Fill in ANTHROPIC_API_KEY and paths
+# Fill in ANTHROPIC_API_KEY (Option A) and MY_EMAIL
 ```
 
 ### 5. Prepare your content
-- Place your 3 base resume .docx files in `templates/resumes/`
-- Fill out `templates/project_bank.yaml` with your real projects + metrics
+- Place your base resume at `templates/resumes/base_resume.docx` (all lanes
+  point here by default; see SETUP §Step 8 for optional per-lane variants
+  like `base_pmm.docx`, `base_content.docx`, `base_mops.docx`).
+- Fill out `templates/project_bank.yaml` with your real projects + metrics.
 - Edit `config/settings.yaml` for alert sender, labels, etc.
 
 ### 6. Run

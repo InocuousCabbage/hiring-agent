@@ -85,9 +85,9 @@ This lets the pipeline read your emails and send you the digest.
 12. Move it to the project: `mv ~/Downloads/credentials.json config/credentials/`
 13. Run the first-time auth:
     ```bash
-    python src/gmail/client.py
+    python -m src.gmail.client
     ```
-    This opens a browser window. Log in with the Gmail account you want alerts sent to. Click "Allow". The terminal will say "Authentication successful" and create a `token.json` file.
+    Run from the repo root. This opens a browser window. Log in with the Gmail account you want alerts sent to. Click "Allow". The terminal will say "Authentication successful" and create a `token.json` file.
 
 ---
 
@@ -144,11 +144,12 @@ Open `.env` in a text editor and fill in:
 
 # Your Gmail address (same one from Step 4)
 MY_EMAIL=your-email@gmail.com
-
-# These match hiring.cafe's email format — usually don't need to change
-ALERT_SENDER=ali@hiring.cafe
-ALERT_SUBJECT_CONTAINS=HiringCafe
 ```
+
+Alert matching (sender / subject / processed-label) is configured in
+`config/settings.yaml` under the `gmail:` block — not via env vars.
+Defaults match hiring.cafe's email format and usually don't need to
+change.
 
 ---
 
@@ -319,6 +320,22 @@ python -m playwright install chromium
   toggle for offline tests. Use only the exact literal `1`, `true`, or `yes`;
   every other value keeps the real LLM path.
 
+### Create your candidate profile
+
+The auto-apply pipeline fills forms from `templates/candidate_profile.yaml`.
+This file holds your PII (name, contact, address, work authorization,
+optional EEO answers) and is gitignored. Config validation raises
+`ConfigError` the first time you flip `apply.enabled: true` without it,
+so complete this step before enabling auto-apply.
+
+```bash
+cp templates/candidate_profile.yaml.example templates/candidate_profile.yaml
+```
+
+Open the copy in a text editor and replace every placeholder with your
+real values. See the comments in the example file for per-field notes;
+EEO fields are always optional (leave `null` to skip).
+
 ### Bootstrap a Greenhouse session
 
 Run this once per ATS. Chromium opens headed; log in with your real
@@ -335,7 +352,11 @@ Verify:
 python -m src.apply.bootstrap --status
 ```
 
-Expected output: `greenhouse: bootstrapped`.
+Expected output: `greenhouse: bootstrapped, last_verified=<iso>`. Any of
+these means re-bootstrap: the line ends with ` (stale — re-bootstrap
+recommended)` (timestamp older than 30 days, or the stored envelope is
+malformed), or the `last_verified=` value reads `unknown` instead of an
+ISO timestamp.
 
 ### Enable in config
 
@@ -357,7 +378,7 @@ forms and screenshots but never clicks submit even when you reply YES.
 - Check `config/settings.yaml` — the `alert_sender` and `alert_subject_contains` must match your actual alert emails
 
 **"Gmail auth failed"**
-- Delete `config/credentials/token.json` and run `python src/gmail/client.py` again
+- Delete `config/credentials/token.json` and run `python -m src.gmail.client` again from the repo root
 
 **"LibreOffice not found"**
 - Make sure LibreOffice is installed and `libreoffice --version` works
@@ -380,7 +401,7 @@ hiring-agent/
 ├── templates/
 │   ├── resumes/
 │   │   └── base_resume.docx    # YOUR base resume (you create this)
-│   ├── cover_letter.docx       # Cover letter template
+│   ├── candidate_profile.yaml  # YOUR PII for auto-apply (Phase 3, from example)
 │   └── project_bank.yaml       # YOUR projects and accomplishments
 ├── output/                     # Generated PDFs and DOCX files
 ├── logs/                       # Pipeline logs

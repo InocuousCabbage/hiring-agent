@@ -1,7 +1,8 @@
 # S3 fixture — a fully-shaped valid apply block. Path keys are placeholders
 # and are overridden by tests to point at pytest `tmp_path`; the shape
-# (22 keys under `apply:`, 4 under `apply.browserbase:`) is what this
-# fixture pins down.
+# (21 keys under `apply:`, 4 under `apply.browserbase:`) is what this
+# fixture pins down. Kept in sync with `_APPLY_TOP_LEVEL_KEYS` and
+# `_APPLY_BROWSERBASE_KEYS` in `src/main.py` — see `test_config_gate`.
 apply:
   enabled: true
   mode: review

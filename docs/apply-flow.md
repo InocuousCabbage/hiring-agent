@@ -39,19 +39,40 @@ says `Bootstrap needed`.
 Keys under `apply:` in `config/settings.yaml`; defaults are safe (master
 switch off, review mode, dry-run on, Greenhouse only).
 
+The schema is frozen: `_validate_apply_config` in `src/main.py` requires
+**all 21 top-level keys plus the 4 keys under `browserbase`** when
+`apply.enabled: true`. There are no per-key defaults for missing keys —
+omitting any one raises `ConfigError: apply: missing required key: <name>`
+at startup. The shipped `config/settings.yaml` already contains the full
+block; copy it verbatim if you regenerate.
+
 ```yaml
 apply:
-  enabled: false
-  mode: review              # review | auto (auto off in MVP)
-  allowed_ats: [greenhouse]
-  long_tail: none           # none | computer_use
-  dry_run: true
-  rate_limit_per_ats_per_day: 10
-  review_reping_hours: 24
+  enabled: false                       # master switch; default OFF (safety)
+  mode: review                         # review | auto (auto off in MVP)
+  allowed_ats: [greenhouse]            # Phase 3 MVP; 3.5 adds lever, ashby
+  long_tail: none                      # none | computer_use
+  dry_run: true                        # fill + screenshot, never click submit
+  timeout_seconds: 90
+  navigation_retries: 2
+  rate_limit_per_ats_per_day: 10       # int in (0, 100]
   review_timeout_hours: 72
+  review_reping_hours: 24              # must be < review_timeout_hours
   retention_days: 30
-  captcha_transport: browserbase   # browserbase | local
+  screenshot_dir: state/screenshots
+  trace_dir: state/traces
+  storage_state_dir: config/credentials/apply
   dedup_db_path: state/applied_jobs.db
+  captcha_action: escalate             # escalate | skip
+  captcha_transport: browserbase       # browserbase | local
+  profile_path: templates/candidate_profile.yaml
+  gmail_label_prefix: "hiring-agent/apply"
+  fast_path_recipient: env:MY_EMAIL    # env:<VAR> or literal address
+  browserbase:                         # all 4 sub-keys required
+    enabled: true
+    solve_captchas: true
+    proxies: true
+    block_ads: true
 ```
 
 ## Pipeline flow
