@@ -352,7 +352,7 @@ Verify:
 python -m src.apply.bootstrap --status
 ```
 
-Expected output: `greenhouse: bootstrapped`.
+Expected output: `greenhouse: bootstrapped, last_verified=<iso timestamp>`.
 
 ### Enable in config
 
