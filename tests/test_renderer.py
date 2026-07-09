@@ -375,8 +375,24 @@ def _docx_full_text(docx_path: Path) -> str:
     return "\n".join(parts)
 
 
+@pytest.fixture
+def _no_pdf_converter(monkeypatch):
+    """Phase 5 iter-2 (finding #12): stub the LibreOffice + docx2pdf paths
+    so renderer tests that only assert DOCX content don't spawn a real
+    LibreOffice subprocess (which can take up to 60s per call — see
+    _find_libreoffice's subprocess.TimeoutExpired handler). Same pattern
+    the pre-existing `test_render_resume_returns_none_pdf_on_fallback`
+    test uses; applied here to the M21 + M23 tests that call render_*
+    without stubbing.
+    """
+    import pdf_gen.renderer as renderer_mod
+    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
+    # Non-darwin platform skips the docx2pdf branch entirely.
+    monkeypatch.setattr(sys, "platform", "linux")
+
+
 @pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
-def test_render_resume_docx_contains_tailored_summary_and_bullets(tmp_path):
+def test_render_resume_docx_contains_tailored_summary_and_bullets(tmp_path, _no_pdf_converter):
     """M23: the rendered DOCX must contain the tailored summary + a
     signature phrase from at least one bullet. If the fill loop no-ops,
     the DOCX ships the base template and this test fails."""
@@ -407,7 +423,7 @@ def test_render_resume_docx_contains_tailored_summary_and_bullets(tmp_path):
     )
 
 
-def test_render_cover_letter_docx_contains_tailored_paragraphs(tmp_path):
+def test_render_cover_letter_docx_contains_tailored_paragraphs(tmp_path, _no_pdf_converter):
     """M23: cover letter DOCX must contain the tailored paragraph body,
     not just the applicant name header. If _create_cover_letter_docx
     silently dropped the paragraphs, this test fails."""
@@ -445,7 +461,7 @@ def test_render_cover_letter_docx_contains_tailored_paragraphs(tmp_path):
 
 
 @pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
-def test_render_resume_finds_template_from_arbitrary_cwd(tmp_path, monkeypatch):
+def test_render_resume_finds_template_from_arbitrary_cwd(tmp_path, monkeypatch, _no_pdf_converter):
     """M21: render_resume must resolve its template against the repo root,
     not the process CWD. Chdir into a scratch dir with no template beneath
     it and verify the render still succeeds.

@@ -80,6 +80,13 @@ def parse_alert_email(
     # pipeline. Keying on title alone silently dropped the second card,
     # with no log line, on every alert containing two "Product Marketing
     # Manager"s (or similar) at different employers.
+    #
+    # Phase 5 iter-2 (finding #4): when company parsing falls back to the
+    # 'Unknown' sentinel for two distinct cards with the same title, keying
+    # on (title, 'Unknown') collides and silently drops one — the exact
+    # audit failure M7 was written to prevent. When company is 'Unknown',
+    # fall back to (title, url) so distinct apply URLs identify distinct
+    # jobs.
     seen_title_company: set[tuple[str, str]] = set()
 
     # Each job is in an <h3> tag inside a table card
@@ -110,16 +117,8 @@ def parse_alert_email(
                 parts = raw.split("–", 1)
                 company = parts[0].strip()
                 location = parts[1].strip()
-            else:
+            elif raw:
                 company = raw
-
-        # M7 fix: dedup by (title, company) AFTER company extraction — must
-        # come here (not before card lookup) because we need the company
-        # string to build the key.
-        dedup_key = (title, company)
-        if dedup_key in seen_title_company:
-            continue
-        seen_title_company.add(dedup_key)
 
         # Extract date posted (second div — has lighter color styling)
         date_posted = None
@@ -139,12 +138,24 @@ def parse_alert_email(
         if desc_divs:
             description_snippet = desc_divs[0].get_text(strip=True)
 
-        # Extract Apply URL
+        # Extract Apply URL — MUST happen BEFORE the dedup slot is claimed
+        # (Phase 5 iter-2 A3 fix). A card with a missing/broken URL would
+        # otherwise reserve the (title, company) slot and silently drop the
+        # next valid card with the same pair — reintroducing the exact
+        # class of bug M7 was written to prevent.
         apply_link = card.find("a", string=lambda s: s and "Apply" in s.strip())
         if not apply_link or not apply_link.get("href"):
             continue
 
         url = apply_link["href"].strip()
+
+        # M7 + Phase 5 iter-2: build the dedup key AFTER url is validated.
+        # For 'Unknown' company (parser fell back), key on URL instead so
+        # two distinct Unknown-company jobs both surface.
+        dedup_key = (title, url) if company == "Unknown" else (title, company)
+        if dedup_key in seen_title_company:
+            continue
+        seen_title_company.add(dedup_key)
 
         jobs.append({
             "title": title,

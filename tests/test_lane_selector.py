@@ -10,11 +10,15 @@ These tests exercise the real classifier against a table of JD-shaped
 fixtures, with the LLM tiebreaker monkeypatched so the suite stays hermetic.
 
 Mutation check: remove any signal keyword from a lane in config/settings.yaml
-(e.g. drop "product marketing" from the pmm lane) — the corresponding
-row-parametrized test loses its 2x margin, falls through to the (stubbed)
-LLM, whose default fixture answer is 'mops' — and the parametrized case for
-that keyword FAILS. This is the "break a keyword set; suite must fail"
-scenario the audit calls out.
+(e.g. drop "product marketing" from the pmm lane) — the pmm 2x-margin
+guard `test_exactly_2x_margin_uses_heuristic_not_llm` loses its 2x margin,
+falls through to the (stubbed) LLM whose side_effect is an AssertionError,
+and that test FAILS. This is the "break a keyword set; suite must fail"
+scenario the audit calls out. (The row-parametrized
+`test_heuristic_returns_correct_lane_when_signals_dominate` test is a
+higher-signal, coarser guard — each row lists 5 signals so dropping ONE
+keeps the dominant lane in place; the boundary test is what catches
+single-keyword regressions.)
 """
 
 import sys

@@ -350,6 +350,50 @@ def load_project_bank() -> list[dict]:
     return data.get("projects", [])
 
 
+class _NoopGmailClient:
+    """No-auth stub matching the ``GmailClient`` method surface that the
+    S17 auto-apply seam calls into. Used by ``--test`` mode so
+    ``run_pipeline`` can invoke the seam without real Gmail credentials.
+
+    Extracted to module scope (Phase 5 iter-2, finding M17) so the
+    method contract can be verified against the real ``GmailClient`` in a
+    unit test — a nested-in-main() class was invisible to tests, so
+    ``send_with_labels(subject, body, to, labels, attachments)`` had drifted
+    from the real ``send_with_labels(*, subject, body, to, labels=None,
+    attachments=None)`` keyword-only shape without any test noticing.
+
+    Every method signature MUST match the corresponding ``GmailClient``
+    method (name + arity + kw-only markers). ``test_noop_gmail_client_matches_real_signatures``
+    proves this at every test run.
+    """
+
+    def search(self, query: str, max_results: int = 100) -> list[dict]:
+        return []
+
+    def get_or_create_label(self, name: str) -> str:
+        return f"stub:{name}"
+
+    def send_with_labels(
+        self,
+        *,
+        subject: str,
+        body: str,
+        to: str,
+        labels: list[str] | None = None,
+        attachments: list[Path] | None = None,
+    ) -> tuple[str, str]:
+        return ("stub_msg_id", "stub_thread_id")
+
+    def apply_label(self, msg_id: str, label_id: str) -> None:
+        return None
+
+    def remove_label(self, msg_id: str, label_id: str) -> None:
+        return None
+
+    def reply_to_thread(self, thread_id: str, body: str) -> str:
+        return "stub_reply_msg_id"
+
+
 def _build_attachments(processed: list[dict]) -> list[Path]:
     """Flatten per-job (resume_pdf, resume_docx, cover_letter_pdf,
     cover_letter_docx) into a single deduped attachment list.
@@ -676,19 +720,8 @@ def main() -> None:
         # poll_pending_reviews needs a client (or a stub) — passing
         # gmail_client=None would crash when the seam calls gmail.search().
         # A None-safe stub keeps --test hermetic (no real Gmail auth).
-        class _NoopGmailClient:
-            def search(self, query):
-                return []
-            def get_or_create_label(self, name):
-                return f"stub:{name}"
-            def send_with_labels(self, subject, body, to, labels, attachments):
-                return ("stub_msg_id", "stub_thread_id")
-            def apply_label(self, msg_id, label_id):
-                return None
-            def remove_label(self, msg_id, label_id):
-                return None
-            def reply_to_thread(self, thread_id, body):
-                return None
+        # Phase 5 iter-2 (M17): _NoopGmailClient extracted to module scope
+        # so tests can verify its method contract against GmailClient.
         try:
             processed, skipped, apply_events = run_pipeline(
                 jobs=jobs,

@@ -104,7 +104,7 @@ def test_attachment_list_has_four_files_per_processed_job():
     assert any(n.endswith("_cl.docx") for n in names)
 
 
-def test_send_digest_called_with_pdf_and_docx_attachments(monkeypatch, tmp_path):
+def test_send_digest_called_with_pdf_and_docx_attachments(monkeypatch, tmp_path, main_root_with_config):
     """M18 behavioral: drive main.main() end-to-end and assert that its
     digest-send branch actually invokes gmail.send_digest with both .pdf
     AND .docx attachments per processed job.
@@ -145,16 +145,12 @@ def test_send_digest_called_with_pdf_and_docx_attachments(monkeypatch, tmp_path)
     monkeypatch.setattr(main_mod, "run_pipeline", lambda **kw: (processed, [], []))
 
     # Redirect ROOT to tmp_path with fresh config/templates copies.
-    real_root = Path(__file__).parent.parent
-    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "templates").mkdir(exist_ok=True)
-    (tmp_path / "config" / "settings.yaml").write_text(
-        (real_root / "config" / "settings.yaml").read_text()
-    )
-    (tmp_path / "templates" / "project_bank.yaml").write_text(
-        (real_root / "templates" / "project_bank.yaml").read_text()
-    )
+    # Fixture forces apply.enabled=false so the digest-send branch stays
+    # on the plain-str (non-DigestPayload) path — fixes finding M18: a
+    # future settings.yaml flip to apply.enabled=true would route through
+    # DigestPayload + extend attachments and silently shift the 4-attach
+    # assertion below.
+    main_root_with_config(monkeypatch, tmp_path)
 
     monkeypatch.setenv("MY_EMAIL", "me@example.com")
     monkeypatch.setattr(sys, "argv", ["main.py"])
@@ -408,7 +404,7 @@ def test_compose_digest_uses_path_suffix_check():
     )
 
 
-def test_main_print_one_line_per_artifact_on_pdf_fallback(capsys, monkeypatch, tmp_path):
+def test_main_print_one_line_per_artifact_on_pdf_fallback(capsys, monkeypatch, tmp_path, main_root_with_config):
     """M17 behavioral (M4): drive main.main() in --test mode with a processed
     fixture whose PDF slots are None (the LibreOffice/docx2pdf fallback case),
     then assert stdout does NOT print the DOCX path twice as if it were a
@@ -446,21 +442,18 @@ def test_main_print_one_line_per_artifact_on_pdf_fallback(capsys, monkeypatch, t
         "apply_result": None,
     }]
 
-    # Redirect ROOT so the --test mode reads settings from tmp.
-    real_root = Path(__file__).parent.parent
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "templates").mkdir(exist_ok=True)
-    (tmp_path / "test_data").mkdir(exist_ok=True)
-    (tmp_path / "config" / "settings.yaml").write_text(
-        (real_root / "config" / "settings.yaml").read_text()
-    )
-    (tmp_path / "templates" / "project_bank.yaml").write_text(
-        (real_root / "templates" / "project_bank.yaml").read_text()
-    )
-    # sample_alert.eml is read once (before parse_alert_from_eml is stubbed).
-    (tmp_path / "test_data" / "sample_alert.eml").write_text("")
-
-    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    # Redirect ROOT so the --test mode reads settings from tmp. Fixture
+    # forces apply.enabled=false (M18) and stages settings.yaml +
+    # project_bank.yaml under tmp_path.
+    main_root_with_config(monkeypatch, tmp_path)
+    # Phase 5 iter-2 (finding #9): the previous test wrote an empty
+    # sample_alert.eml here — but parse_alert_from_eml is monkeypatched
+    # below, so the file is never actually read. Removing the dead write
+    # (and the stale "sample_alert.eml is read once" comment) prevents a
+    # future cleanup that removes the monkeypatch from silently letting
+    # main() SystemExit(1) at the "no_jobs_parsed" branch with an empty
+    # eml. If someone removes the patch, they'll see FileNotFoundError
+    # (loud + diagnosable) instead of an opaque exit-1.
     monkeypatch.setattr(
         main_mod, "parse_alert_from_eml",
         lambda eml_path, max_jobs=5: [

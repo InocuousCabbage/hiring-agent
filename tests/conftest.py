@@ -675,6 +675,53 @@ def apply_context_with_mode(ctx, *, mode: str, dry_run: bool):
     return replace(ctx, mode=mode, dry_run=dry_run, config=new_config)
 
 
+# ---------------------------------------------------------------------------
+# Fixture: main_root_with_config — redirect main.ROOT to a tmp scratch dir
+# populated with real settings.yaml + project_bank.yaml (with apply.enabled
+# forced to False). Extracted (Phase 5 iter-2, finding #11) to remove the
+# 5-line block that was duplicated across test_review_fixes.py and
+# test_full_pipeline.py (three call sites). Also fixes finding M18 (tests
+# were config-dependent on apply.enabled=false — this fixture forces it).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def main_root_with_config():
+    """Callable that, when invoked with (monkeypatch, tmp_path), sets
+    main.ROOT to tmp_path and stages real settings.yaml + project_bank.yaml
+    beneath it (with apply.enabled forced to False, independent of the
+    shipped setting — so a config flip in settings.yaml can never silently
+    reshape the digest-send branch these tests exercise).
+
+    Returns tmp_path for chaining.
+    """
+    import yaml as _yaml_local
+
+    def _apply(monkeypatch, tmp_path):
+        import main as main_mod  # noqa: PLC0415 — fixture invocation
+        real_root = Path(__file__).parent.parent
+        (tmp_path / "config").mkdir(exist_ok=True)
+        (tmp_path / "templates").mkdir(exist_ok=True)
+        # Load settings.yaml, force apply.enabled=false, write to tmp.
+        # Independent of the shipped default — a future config flip can't
+        # silently shift the digest-send branch (fixes finding M18).
+        settings_data = _yaml_local.safe_load(
+            (real_root / "config" / "settings.yaml").read_text()
+        )
+        settings_data.setdefault("apply", {})
+        settings_data["apply"]["enabled"] = False
+        (tmp_path / "config" / "settings.yaml").write_text(
+            _yaml_local.safe_dump(settings_data)
+        )
+        (tmp_path / "templates" / "project_bank.yaml").write_text(
+            (real_root / "templates" / "project_bank.yaml").read_text()
+        )
+        monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+        return tmp_path
+
+    return _apply
+
+
 @pytest.fixture
 def run_seam_config(apply_settings) -> dict:
     """

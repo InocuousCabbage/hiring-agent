@@ -54,8 +54,10 @@ sys.path.insert(0, str(ROOT / "src"))
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False,
-                                my_email="test@example.com"):
+def _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config,
+                                send_raises=False,
+                                my_email="test@example.com",
+                                clear_my_email=False):
     """Drive main.main() end-to-end with a stubbed Gmail client and stubbed
     pipeline. Returns the gmail stub for assertions.
 
@@ -65,12 +67,18 @@ def _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False,
       - main.parse_alert_email  — returns a single fake job
       - main.run_pipeline       — returns 1 processed job, 0 skipped
       - main.ROOT / "output"    — redirected to tmp_path so no repo write
-      - MY_EMAIL env            — set or cleared per case
+      - MY_EMAIL env            — set to my_email (empty string OK), or
+                                  fully DELETED when clear_my_email=True.
+                                  Distinguishes MY_EMAIL='' from
+                                  MY_EMAIL-unset — main.py handles both
+                                  via `if not recipient`, so tests must
+                                  cover both branches independently.
       - sys.argv                — production mode (no --test / --dry-run)
     """
-    # Ensure src/ is importable (redundant with module-level insert, but
-    # keeps this helper self-contained for readers).
-    sys.path.insert(0, str(ROOT / "src"))
+    # Phase 5 iter-2 (finding #8): removed the raw `sys.path.insert(0, ...)`
+    # that was here — it's redundant with the module-scope prepend at the
+    # top of this file and would leak past the test if monkeypatch weren't
+    # restoring sys.path. Import directly.
     import main as main_mod
     import gmail.client as gmail_client_mod  # GmailClient is imported inside main()
 
@@ -114,23 +122,22 @@ def _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False,
     monkeypatch.setattr(main_mod, "run_pipeline", _fake_run_pipeline)
 
     # Redirect ROOT/output writes to tmp_path so we never touch the repo.
-    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
-    # main.load_config uses ROOT to resolve settings.yaml — put a symlink
-    # (or reuse the real file via the original ROOT).
-    real_root = Path(__file__).parent.parent
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "templates").mkdir(exist_ok=True)
-    (tmp_path / "config" / "settings.yaml").write_text(
-        (real_root / "config" / "settings.yaml").read_text()
-    )
-    (tmp_path / "templates" / "project_bank.yaml").write_text(
-        (real_root / "templates" / "project_bank.yaml").read_text()
-    )
+    # Fixture also forces apply.enabled=false so the digest-send branch
+    # this helper exercises stays on the plain-str (non-DigestPayload)
+    # path regardless of any future settings.yaml flip.
+    main_root_with_config(monkeypatch, tmp_path)
 
-    if my_email:
-        monkeypatch.setenv("MY_EMAIL", my_email)
-    else:
+    # Phase 5 iter-2 (my_email='' semantic gap): distinguish 'empty string'
+    # from 'variable deleted'. If clear_my_email=True, delete entirely; else
+    # setenv with the given value (which may itself be ''). Both branches
+    # exist in prod (unset vs blank), and `if not recipient` treats them
+    # identically — but tests must cover BOTH so a future hardening to
+    # `if recipient is None` would not silently regress the empty-string
+    # branch.
+    if clear_my_email:
         monkeypatch.delenv("MY_EMAIL", raising=False)
+    else:
+        monkeypatch.setenv("MY_EMAIL", my_email)
     monkeypatch.setattr(sys, "argv", ["main.py"])
 
     main_mod.main()
@@ -140,28 +147,38 @@ def _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False,
 class TestDigestSendAndMarkProcessed:
     """H13 behavioral: exercise main.main()'s real digest-send branch."""
 
-    def test_mark_processed_called_on_success(self, monkeypatch, tmp_path):
-        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False)
+    def test_mark_processed_called_on_success(self, monkeypatch, tmp_path, main_root_with_config):
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config, send_raises=False)
         gmail.send_digest.assert_called_once()
         gmail.mark_processed.assert_called_once_with(
             "msg_123", "hiring-agent-processed"
         )
 
-    def test_mark_processed_not_called_on_send_failure(self, monkeypatch, tmp_path):
-        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=True)
+    def test_mark_processed_not_called_on_send_failure(self, monkeypatch, tmp_path, main_root_with_config):
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config, send_raises=True)
         gmail.send_digest.assert_called_once()
         gmail.mark_processed.assert_not_called()
 
-    def test_mark_processed_not_called_when_email_missing(self, monkeypatch, tmp_path):
-        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, my_email="")
+    def test_mark_processed_not_called_when_email_unset(self, monkeypatch, tmp_path, main_root_with_config):
+        """MY_EMAIL not present in the environment at all."""
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config, clear_my_email=True)
         gmail.send_digest.assert_not_called()
         gmail.mark_processed.assert_not_called()
 
-    def test_mark_processed_ordered_after_send_digest(self, monkeypatch, tmp_path):
+    def test_mark_processed_not_called_when_email_empty_string(self, monkeypatch, tmp_path, main_root_with_config):
+        """MY_EMAIL='' (present but blank) — must ALSO short-circuit the
+        send. Distinct from the unset case: guards against a future
+        hardening to `if recipient is None:` silently regressing the
+        empty-string branch."""
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config, my_email="")
+        gmail.send_digest.assert_not_called()
+        gmail.mark_processed.assert_not_called()
+
+    def test_mark_processed_ordered_after_send_digest(self, monkeypatch, tmp_path, main_root_with_config):
         """The send must resolve BEFORE the mark. If main.py ever reorders
         mark_processed above send_digest inside the same try (a mutation the
         old MagicMock self-test missed), this assertion fires."""
-        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False)
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config, send_raises=False)
         # Filter to just the two calls we care about, in order.
         call_names = [
             c[0] for c in gmail.mock_calls
@@ -174,13 +191,32 @@ class TestDigestSendAndMarkProcessed:
 
 def _find_calls_in(nodes, attr: str) -> list[int]:
     """Return line numbers of every Call to `.{attr}(...)` inside the AST
-    node list. Uses ast.walk so nested statements (for/if/…) are covered."""
-    lines = []
+    node list, WITHOUT descending into nested Try nodes.
+
+    Phase 5 iter-2 (H14 finding): a naive `ast.walk(n)` per statement
+    descends into the body / handlers / finalbody of every nested Try —
+    so a `mark_processed` call in a NESTED except handler would be
+    counted as a call in the OUTER try's body, silently bypassing the
+    'no mark_processed in an except handler' guard in the H14 caller.
+
+    Boundary-aware walk: iterate nodes with `ast.iter_child_nodes` and
+    skip descent into any child that is itself an ast.Try — its inner
+    calls belong to that inner Try, not the enclosing one.
+    """
+    lines: list[int] = []
+
+    def _walk_no_try(node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == attr:
+                lines.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Try):
+                # Nested Try — its calls belong to it, not the caller.
+                continue
+            _walk_no_try(child)
+
     for n in nodes:
-        for sub in ast.walk(n):
-            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
-                if sub.func.attr == attr:
-                    lines.append(sub.lineno)
+        _walk_no_try(n)
     return lines
 
 
@@ -595,7 +631,15 @@ class TestEmailParserGoldenFromSampleAlert:
         parser must surface a non-empty URL for each. Vacuous "url exists"
         checks (`assert j.get("url")`) would still pass on the empty string,
         so we also assert the SendGrid host prefix — the actual fixture
-        shape — for defense in depth."""
+        shape — for defense in depth.
+
+        Phase 5 iter-2 (finding #10): the previous `sendgrid.net in url
+        or hiring.cafe in url` OR-branch made the hiring.cafe alternative
+        dead — every URL in the shipped fixture is a SendGrid tracking
+        link, so the second disjunct was unreachable and silently masked
+        a regression that swapped the URL host to something else entirely.
+        Tightened to a single `sendgrid.net in url` assertion — the actual
+        fixture shape."""
         from parser.email_parser import parse_alert_from_eml
         jobs = parse_alert_from_eml(
             ROOT / "test_data" / "sample_alert.eml",
@@ -604,10 +648,83 @@ class TestEmailParserGoldenFromSampleAlert:
         for j in jobs:
             url = j.get("url", "")
             assert url, f"job {j.get('title')!r} has no URL"
-            assert "sendgrid.net" in url or "hiring.cafe" in url, (
+            assert "sendgrid.net" in url, (
                 f"job {j.get('title')!r} url does not look like the "
                 f"SendGrid tracking shape: {url!r}"
             )
+
+
+class TestNoopGmailClientContract:
+    """Phase 5 iter-2 (M17 finding): _NoopGmailClient is the stub main()
+    passes to run_pipeline in --test mode. If its method signatures drift
+    from the real GmailClient, --test mode crashes with AttributeError /
+    TypeError the moment the S17 seam invokes a mismatched stub — but
+    every existing test that hits main() in --test mode ALSO stubs
+    run_pipeline, so the drift is invisible.
+
+    This contract test compares the stub's methods to the real client's
+    methods via inspect.signature, so any signature drift (missing kwarg,
+    wrong kw-only marker, arity mismatch) fails the suite immediately.
+
+    Mutation check: revert _NoopGmailClient.search to `def search(self, query)`
+    (drop max_results). This test then fails: signatures diverge.
+    """
+
+    _METHODS = (
+        "search",
+        "get_or_create_label",
+        "send_with_labels",
+        "apply_label",
+        "remove_label",
+        "reply_to_thread",
+    )
+
+    def test_noop_gmail_client_matches_real_signatures(self):
+        import inspect
+        from main import _NoopGmailClient
+        from gmail.client import GmailClient
+
+        stub = _NoopGmailClient
+        real = GmailClient
+
+        for name in self._METHODS:
+            assert hasattr(stub, name), f"_NoopGmailClient missing method {name!r}"
+            assert hasattr(real, name), f"GmailClient missing method {name!r} — test is stale?"
+
+            stub_sig = inspect.signature(getattr(stub, name))
+            real_sig = inspect.signature(getattr(real, name))
+
+            stub_params = list(stub_sig.parameters.values())
+            real_params = list(real_sig.parameters.values())
+
+            # Parameter NAMES + KIND must match (kw-only markers are
+            # binding-level contract). Defaults + annotations may differ.
+            stub_shape = [(p.name, p.kind) for p in stub_params]
+            real_shape = [(p.name, p.kind) for p in real_params]
+            assert stub_shape == real_shape, (
+                f"_NoopGmailClient.{name} signature drift vs GmailClient:\n"
+                f"  stub: {stub_shape}\n"
+                f"  real: {real_shape}"
+            )
+
+    def test_noop_gmail_client_methods_all_callable_on_instance(self):
+        """Instance-level smoke: every stub method actually invokable with
+        a plausible arg set (guards against a signature that parses but
+        can't be called — e.g. mismatched positional-only markers)."""
+        from main import _NoopGmailClient
+
+        stub = _NoopGmailClient()
+
+        assert stub.search("q") == []
+        assert stub.search("q", max_results=5) == []
+        assert stub.get_or_create_label("L") == "stub:L"
+        assert stub.apply_label("m", "L") is None
+        assert stub.remove_label("m", "L") is None
+        # send_with_labels: kw-only per real GmailClient contract
+        result = stub.send_with_labels(subject="s", body="b", to="t")
+        assert isinstance(result, tuple) and len(result) == 2
+        # reply_to_thread returns a str per real signature
+        assert isinstance(stub.reply_to_thread("t", "b"), str)
 
 
 class TestEmailParserDedupByTitleAndCompany:
@@ -668,6 +785,81 @@ class TestEmailParserDedupByTitleAndCompany:
             ("Product Marketing Manager", "Acme"),
             ("Product Marketing Manager", "Beta"),
         ], f"Expected exactly 2 unique pairs, got {pairs}"
+
+    def test_broken_url_card_does_not_claim_dedup_slot(self):
+        """A3 regression (Phase 5 xhigh iter-1 finding): a card whose
+        apply_link is missing/broken must NOT claim the dedup slot for
+        (title, company). If it does, the next valid card with the same
+        (title, company) is silently dropped — the exact class of bug
+        M7 was written to prevent, reintroduced.
+
+        Mutation check: revert email_parser.py to `seen_title_company.add()`
+        BEFORE the apply_link guard. This test then fails: len(jobs) == 0
+        instead of 1, because the broken-URL first card claims the slot
+        and the valid-URL second card is dropped.
+        """
+        from parser.email_parser import parse_alert_email
+        # Card 1: same (title, company) as card 2 but NO <a Apply> link.
+        # Card 2: same (title, company) with a valid apply URL — must
+        # survive because card 1 never claimed the slot.
+        html = (
+            "<html><body><table>"
+            # Card 1 — broken: no apply link
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>Acme — Remote</div>"
+            "</td>"
+            # Card 2 — valid: with apply link
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>Acme — Remote</div>"
+            '<a href="https://example.com/valid">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 1, (
+            f"Expected 1 job (broken-URL card must not claim dedup slot), "
+            f"got {len(jobs)}. Broken-URL card claimed the slot and dropped "
+            f"the valid card — reintroduces the M7-class bug."
+        )
+        assert jobs[0]["url"] == "https://example.com/valid"
+
+    def test_unknown_company_does_not_collide_across_jobs(self):
+        """(title, 'Unknown') collision (Phase 5 xhigh iter-1 finding): when
+        company parsing falls back to 'Unknown' for two distinct cards with
+        the same title, dedup keyed on (title, 'Unknown') silently drops
+        one — the same audit-flagged failure the M7 fix was meant to
+        prevent. Distinct URLs identify distinct jobs; both must surface.
+
+        Mutation check: remove the URL-fallback branch from the parser
+        (revert to a bare `(title, company)` key). This test then fails:
+        one of the two Unknown-company jobs is dropped.
+        """
+        from parser.email_parser import parse_alert_email
+        # Two cards whose company <div> lacks the em-dash split shape —
+        # parser falls back to 'Unknown' for both. Distinct apply URLs
+        # prove they are distinct jobs.
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div></div>"  # no company text → falls back to 'Unknown'
+            '<a href="https://example.com/one">Apply</a>'
+            "</td>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div></div>"
+            '<a href="https://example.com/two">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 2, (
+            f"Expected 2 jobs when company fell back to 'Unknown' for "
+            f"both cards (distinct URLs → distinct jobs), got {len(jobs)}"
+        )
+        urls = sorted(j["url"] for j in jobs)
+        assert urls == [
+            "https://example.com/one",
+            "https://example.com/two",
+        ], f"Expected both distinct URLs preserved, got {urls}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
