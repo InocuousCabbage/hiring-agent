@@ -186,6 +186,24 @@ def dispatch(url: str, config: dict) -> "ATSAdapter | None":
     return None
 
 
+def get_transport(config: dict, kind: str | None = None):
+    """Module-level re-export of `src.apply.transport.get_transport`.
+
+    Kept as a thin call-through (rather than a plain `from ... import
+    get_transport` at module scope) so BOTH patch surfaces used by tests
+    keep working:
+      - `monkeypatch.setattr(dispatcher, "get_transport", ...)` replaces
+        this name outright (M5's RED test patches the dispatcher module
+        directly).
+      - `monkeypatch.setattr(src.apply.transport, "get_transport", ...)`
+        is picked up too, because the import below is resolved fresh on
+        every call (existing H4 wiring tests patch the transport module).
+    """
+    from src.apply.transport import get_transport as _get_transport
+
+    return _get_transport(config, kind)
+
+
 def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult:
     """Public entry point called from `src/main.py:172` (S17 seam).
 
@@ -214,8 +232,6 @@ def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult
     # For the initial gate here we pass kind=None (no CAPTCHA detected yet);
     # if an adapter escalates a CAPTCHA it will surface via its own
     # captcha_escalated status.
-    from src.apply.transport import get_transport
-
     try:
         transport = get_transport(config, kind=None)
     except Exception as exc:  # noqa: BLE001 — H12 covers graceful fallback; still soft-fail here.
@@ -235,8 +251,41 @@ def apply_to_job(job_url: str, ctx: "ApplyContext", config: dict) -> ApplyResult
     # soft-failed here so apply_to_job's `never raises` contract holds.
     from src.apply.base import SessionExpiredError
 
+    # M5: load the bootstrapped storage_state (if any) for this (ats, user)
+    # so transport.open() reuses the credentials the user bootstrapped via
+    # `apply/bootstrap.py` instead of always opening a fresh anonymous
+    # browser. Never let a credential-lookup failure abort the apply — fall
+    # back to storage_state=None (today's behavior) on any error.
+    storage_state = None
+    ats_name = getattr(adapter, "name", None)
+    if ats_name:
+        try:
+            from src.apply.credentials import load_state
+
+            user = getattr(ctx, "applicant", None) or config.get("apply", {}).get(
+                "user", "single"
+            )
+            state = load_state(ats_name, user)
+            if isinstance(state, dict) and {
+                "state",
+                "last_verified",
+                "user",
+            }.issubset(state.keys()):
+                from src.apply.bootstrap import unwrap_state
+
+                storage_state, _, _ = unwrap_state(state)
+            else:
+                storage_state = state
+        except Exception as exc:  # noqa: BLE001 — never abort apply on lookup failure
+            log.warning(
+                "apply.storage_state_load_failed",
+                ats=ats_name,
+                reason=_exc_repr(exc),
+            )
+            storage_state = None
+
     try:
-        with transport.open(job_url, storage_state=None) as session:
+        with transport.open(job_url, storage_state=storage_state) as session:
             page = getattr(session, "page", None)
             try:
                 result = adapter.apply(page=page, ctx=ctx)  # type: ignore[arg-type]

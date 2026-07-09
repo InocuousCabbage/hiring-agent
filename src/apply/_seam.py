@@ -309,6 +309,14 @@ def run_for_job(
     # YAML, storage-state can fail — every failure surfaces as
     # apply.seam.error and returns None.
     try:
+        # H6: wire the CAPTCHA detector into ApplyContext. Without this,
+        # ApplyContext's default (None) wins and every adapter's CAPTCHA
+        # gate (`callable(None)` -> False) is dead — Turnstile/reCAPTCHA
+        # gated pages get a blind submit-click instead of an escalation.
+        # Imported at function scope (not module scope) so the seam import
+        # stays cheap when apply.enabled=false.
+        from src.apply.captcha import detect as captcha_detect
+
         profile_path = apply_config.get(
             "profile_path", "templates/candidate_profile.yaml"
         )
@@ -370,6 +378,7 @@ def run_for_job(
             resume_docx_path=resume_docx_path,
             cover_letter_docx_path=cover_letter_docx_path,
             dedup=dedup,
+            captcha_detector=captcha_detect,
         )
         job_url = job.get("ats_apply_url") or job.get("url", "") or ""
         result = _call_apply_to_job(job_url=job_url, ctx=ctx, config=apply_config)
