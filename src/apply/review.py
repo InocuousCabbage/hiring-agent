@@ -579,25 +579,23 @@ def execute_confirmed_submit(
     # json-dumped the envelope verbatim, and Playwright either restored zero
     # cookies or raised — the bootstrapped session was effectively unused.
     state = load_state_fn(decision.ats, decision.applicant) if load_state_fn else None
+    # SE2 (Phase 3 xhigh iter-1): delegate envelope-unwrap + shape validation
+    # to the shared credentials helper. Pre-fix: this file had its own
+    # inline envelope-detect + unwrap block that drifted independently
+    # from the dispatcher's copy. `unwrap_state_if_envelope` accepts a raw
+    # value (already loaded via `load_state_fn`, since this file supports
+    # injecting the load function for testability) and returns either the
+    # unwrapped inner state OR None on malformed shape / unwrap failure.
     if state is not None:
-        # Envelope form → unwrap; already-flat state → pass through.
-        #
-        # SD5 fix (Phase 1 xhigh): on unwrap failure we DROP the state
-        # entirely (state = None) rather than falling through with the
-        # wrapped envelope still bound — the pre-fix `state` variable
-        # remained the wrapper and was verbatim json.dump'd to the temp
-        # file, reintroducing the exact M2 bug we're supposed to fix.
-        if isinstance(state, dict) and "state" in state and "last_verified" in state:
-            try:
-                from src.apply.bootstrap import unwrap_state  # noqa: E402
-                inner, _lv, _u = unwrap_state(state)
-                state = inner
-            except Exception:  # noqa: BLE001 — malformed envelope
-                log.warning(
-                    "apply.review.storage_state_unwrap_failed",
-                    review_id=decision.review_id,
-                )
-                state = None
+        try:
+            from src.apply.credentials import unwrap_state_if_envelope  # noqa: E402
+            state = unwrap_state_if_envelope(state)
+        except Exception:  # noqa: BLE001 — defensive: helper never raises but be safe
+            log.warning(
+                "apply.review.storage_state_unwrap_failed",
+                review_id=decision.review_id,
+            )
+            state = None
     tmp_path: Path | None = None
     if state:
         fd, name = tempfile.mkstemp(suffix=".storage_state.json")

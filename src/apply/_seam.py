@@ -257,6 +257,17 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
         _log.info("apply.seam.disabled")
         return []
 
+    # SG1 (Phase 3 xhigh iter-1): reset the dispatcher's per-run
+    # storage_state cache. The cache prevents a keyring hang from firing
+    # on every apply (B4-class regression class), but long-lived processes
+    # need a fresh probe once per pipeline invocation to pick up newly
+    # bootstrapped credentials without a restart.
+    try:
+        from src.apply.dispatcher import _reset_state_cache
+        _reset_state_cache()
+    except Exception as exc:  # noqa: BLE001 — cache reset must never block
+        _log.warning("apply.state_cache_reset_failed", error=str(exc))
+
     # 2. Wire the config-driven storage dir into the credentials backend.
     _call_configure_storage_dir(config)
 
@@ -334,7 +345,22 @@ def run_for_job(
         # gated pages get a blind submit-click instead of an escalation.
         # Imported at function scope (not module scope) so the seam import
         # stays cheap when apply.enabled=false.
-        from src.apply.captcha import detect as captcha_detect
+        #
+        # SG3 (Phase 3 xhigh iter-1): guard the captcha import — a broken
+        # playwright/import environment must not crash every per-job apply.
+        # Mirrors the dedup fail-open pattern: set captcha_detect=None on
+        # import failure so ApplyContext's default (None) wins gracefully
+        # and the adapter's CAPTCHA gate (`callable(None)` → False) skips
+        # detection rather than raising.
+        captcha_detect = None
+        try:
+            from src.apply.captcha import detect as _detect_impl
+            captcha_detect = _detect_impl
+        except Exception as _captcha_import_exc:  # noqa: BLE001
+            job_log.warning(
+                "apply.seam.captcha_import_failed",
+                exc_type=type(_captcha_import_exc).__name__,
+            )
 
         profile_path = apply_config.get(
             "profile_path", "templates/candidate_profile.yaml"

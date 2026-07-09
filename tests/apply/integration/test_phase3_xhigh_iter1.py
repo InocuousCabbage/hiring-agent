@@ -44,6 +44,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _reset_dispatcher_state_cache():
+    """SG1 (Phase 3 xhigh iter-1): dispatcher's per-run storage_state cache
+    is a module-level dict — MUST be reset around every test that touches
+    the apply_to_job path so cached values from a prior test don't poison
+    the current one. Reset BEFORE and AFTER for isolation.
+    """
+    try:
+        from src.apply.dispatcher import _reset_state_cache
+        _reset_state_cache()
+    except ImportError:
+        pass
+    yield
+    try:
+        from src.apply.dispatcher import _reset_state_cache
+        _reset_state_cache()
+    except ImportError:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SB1 — install_scrubber() failure must not crash run_pipeline
 # ─────────────────────────────────────────────────────────────────────────────

@@ -456,6 +456,91 @@ def load_state(ats: str, user: str) -> dict | None:
     return json.loads(raw)
 
 
+def unwrap_state_if_envelope(raw: dict | None) -> dict | None:
+    """SE2 (Phase 3 xhigh iter-1): shared shape-validation + envelope-unwrap
+    for a raw storage_state value. Extracted so the review-loop path (which
+    receives its state via an injected `load_state_fn`) can share the same
+    logic without going through `load_and_unwrap_state` (which owns its own
+    `load_state` call).
+
+    Returns:
+      * ``None`` if raw is None / non-dict / malformed shape.
+      * the inner Playwright storage_state dict on any recognized shape.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "apply.storage_state.malformed_type type=%s",
+            type(raw).__name__,
+        )
+        return None
+    envelope_keys = {"state", "last_verified", "user"}
+    if envelope_keys.issubset(raw.keys()):
+        try:
+            from src.apply.bootstrap import unwrap_state  # local: avoid cycle
+            inner, _lv, _u = unwrap_state(raw)
+        except Exception as e:  # noqa: BLE001
+            # SD1: log exc_type only — payload can't leak via a class name.
+            logger.warning(
+                "apply.storage_state.unwrap_failed exc_type=%s",
+                type(e).__name__,
+            )
+            return None
+        if not isinstance(inner, dict):
+            return None
+        raw = inner
+    # SG2: strict shape check.
+    if not (isinstance(raw.get("cookies"), list) or isinstance(raw.get("origins"), list)):
+        logger.warning("apply.storage_state.malformed_shape")
+        return None
+    return raw
+
+
+def load_and_unwrap_state(ats: str, user: str) -> dict | None:
+    """SE2 (Phase 3 xhigh iter-1): shared helper used by both the dispatcher's
+    per-apply storage-state lookup path AND review.execute_confirmed_submit.
+
+    Returns the UNWRAPPED Playwright storage_state dict (top-level `cookies`
+    + `origins` keys) suitable for `browser.new_context(storage_state=...)`.
+    Handles three shapes:
+
+      * ``None``                     → returned unchanged.
+      * envelope ``{state, last_verified, user}`` → unwrapped via
+        ``bootstrap.unwrap_state``; returns the inner state.
+      * flat ``{cookies, origins}``  → validated + returned as-is.
+      * anything else                → returns ``None`` (malformed shape).
+
+    Any unwrap exception is caught and swallowed → returns ``None``. Log
+    lines carry only structural fields (`ats`, `user`, `reason`) so no
+    decrypted payload bytes can leak through the log path (SD1 coupling).
+
+    SG2: strict shape validation — a malformed dict (neither envelope nor
+    `{cookies, origins}`) NEVER falls through to the caller. This closes
+    the pre-fix dispatcher path where a garbage load_state return was
+    passed verbatim to `transport.open(storage_state=...)`.
+    """
+    try:
+        raw = load_state(ats, user)
+    except StorageStateBackendError:
+        # Backend hard-failure — log structural fields ONLY (SD1).
+        logger.warning(
+            "apply.storage_state.backend_error ats=%s user=%s", ats, user
+        )
+        return None
+    except Exception as e:  # noqa: BLE001 — belt-and-braces
+        # SD1: exception message may carry decrypted payload bytes from
+        # Fernet InvalidToken unwrap. Log only exception type name.
+        logger.warning(
+            "apply.storage_state.load_failed ats=%s user=%s exc_type=%s",
+            ats,
+            user,
+            type(e).__name__,
+        )
+        return None
+    return unwrap_state_if_envelope(raw)
+
+
 def has_state(ats: str, user: str) -> bool:
     """Return True iff `load_state` would return a non-None dict. Never
     raises — swallows any backend error and returns False."""
