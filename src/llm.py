@@ -99,14 +99,18 @@ def _call_via_cli(prompt: str, model: str, system: str | None, timeout: int) -> 
                 f.write(full_prompt)
                 tmp_path = f.name
             try:
-                # Read prompt from file via shell redirection
-                result = subprocess.run(
-                    f'cat "{tmp_path}" | claude -p',
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    shell=True,
-                )
+                # Argv form (no shell=True): feed the prompt file directly as
+                # the child's stdin. A TimeoutExpired SIGKILL then targets the
+                # `claude` child itself — no orphaned grandchild via a shell
+                # pipeline (M10).
+                with open(tmp_path, "rb") as stdin_f:
+                    result = subprocess.run(
+                        ["claude", "-p"],
+                        stdin=stdin_f,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
             finally:
                 os.unlink(tmp_path)
         else:
