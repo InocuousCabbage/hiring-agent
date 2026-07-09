@@ -242,8 +242,12 @@ def test_m6_test_mode_dry_run_threads_into_apply_seam(monkeypatch):
 
     captured: dict[str, Any] = {}
 
-    def _capture_run_for_job(*, apply_config, **kwargs):
-        captured["dry_run_seen_by_seam"] = bool(apply_config.get("dry_run", False))
+    def _capture_run_for_job(*, apply_config, dry_run=False, **kwargs):
+        # SB2 (Phase 3 xhigh iter-1): dry_run is now threaded as an explicit
+        # kwarg — NOT via config mutation. The seam OR's the per-call flag
+        # with apply_config.get('dry_run', False). This test accepts either
+        # source as evidence the flag propagated.
+        captured["dry_run_seen_by_seam"] = bool(dry_run) or bool(apply_config.get("dry_run", False))
         return None
 
     monkeypatch.setattr(_apply_seam, "run_for_job", _capture_run_for_job)

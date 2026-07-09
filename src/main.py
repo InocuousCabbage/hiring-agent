@@ -420,12 +420,24 @@ def run_pipeline(
     # runs the S12 review poller once for the 24h/72h state machine.
     # Live-config guarantee (L14): apply_config is a REFERENCE, not a copy.
     from src.apply import _seam as _apply_seam
-    apply_config = config.get("apply", {})
-    # M6: when the caller requests dry_run (e.g. `--test`), force it through
-    # to the apply seam by mutating the live apply-config dict in place —
-    # this preserves the L14 live-reference guarantee the seam relies on.
-    if dry_run and isinstance(apply_config, dict):
-        apply_config["dry_run"] = True
+    # SG4 (Phase 3 xhigh iter-1): use setdefault so the SAME dict is threaded
+    # through to the seam. `config.get('apply', {})` returns a fresh orphan
+    # dict when 'apply' is missing, so any downstream mutation (including
+    # a prior dry_run ratchet) would be lost. setdefault ensures the config
+    # carries a live reference.
+    apply_config = config.setdefault("apply", {})
+    if not isinstance(apply_config, dict):
+        # Defensive: `apply: null` / non-dict scalar. Reset to empty dict
+        # on the outer config so the seam's _safe_apply_config sees it too.
+        apply_config = {}
+        config["apply"] = apply_config
+    # SB2 (Phase 3 xhigh iter-1): DO NOT mutate `apply_config['dry_run']` here.
+    # The pre-fix ratchet (`apply_config['dry_run'] = True`) was a one-way
+    # flag that persisted for the lifetime of the config dict — a long-lived
+    # process invoked once with `--test` (or any dry_run=True call) would
+    # silently stay in dry_run forever on every subsequent call. Instead we
+    # thread `dry_run` as an explicit kwarg to run_for_job; the seam OR's it
+    # with the config-supplied value.
     apply_events = _apply_seam.initialize(config, gmail_client)
 
     processed = []
@@ -595,6 +607,10 @@ def run_pipeline(
                 apply_config=apply_config,
                 job_log=job_log,
                 gmail_client=gmail_client,
+                # SB2: explicit per-call dry_run flag — the seam OR's it with
+                # apply_config.get('dry_run', False). This replaces the pre-fix
+                # `apply_config['dry_run'] = True` one-way ratchet.
+                dry_run=dry_run,
             )
 
             processed.append({

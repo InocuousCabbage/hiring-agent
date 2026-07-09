@@ -239,7 +239,18 @@ def initialize(config: dict, gmail_client: Any | None) -> list:
     # 1. Scrubber MUST be installed before ANY adapter log line (L7), and
     # unconditionally (M9) — even when apply.enabled=false, since other
     # pipeline stages log raw LLM output regardless of the apply gate.
-    _call_install_scrubber()
+    #
+    # SB1 (Phase 3 xhigh iter-1): the scrubber install is best-effort. A
+    # structlog.configure() failure (or any exception raised inside
+    # install_scrubber) MUST NOT propagate past initialize — every
+    # run_pipeline call would crash at pipeline entry, including calls
+    # with apply.enabled=false where the scrubber failure is irrelevant to
+    # the caller's intent. Log the failure structurally and continue; the
+    # PII-scrub is a defense-in-depth layer, not a hard gate.
+    try:
+        _call_install_scrubber()
+    except Exception as exc:  # noqa: BLE001 — never-blocking on scrubber install
+        _log.warning("apply.scrubber_install_failed", error=str(exc))
 
     apply_config = _safe_apply_config(config)
     if not apply_config.get("enabled", False):
@@ -278,6 +289,7 @@ def run_for_job(
     resume_docx_path: Path | None = None,
     cover_letter_docx_path: Path | None = None,
     gmail_client: Any | None = None,
+    dry_run: bool = False,
 ) -> "ApplyResult | None":
     """Called PER JOB after the HM-lookup block, before ``processed.append``.
 
@@ -300,6 +312,13 @@ def run_for_job(
     # H14: apply_config may be None/False when yaml maps `apply: null`.
     if not isinstance(apply_config, dict) or not apply_config.get("enabled", False):
         return None
+
+    # SB2 (Phase 3 xhigh iter-1): effective dry_run = per-call kwarg OR
+    # config value. The per-call flag flows in from run_pipeline; the config
+    # value is the operator-configured default (H17 ships `dry_run: true`).
+    # OR-ing preserves the safety property that dry_run=True anywhere in the
+    # decision chain stays dry_run.
+    effective_dry_run = bool(dry_run) or bool(apply_config.get("dry_run", False))
 
     from src.apply.base import SessionExpiredError
     from src.apply.profile import CandidateProfile
@@ -373,7 +392,8 @@ def run_for_job(
             cover_letter_path=cover_letter_path,
             config=apply_config,
             applicant=str(apply_config.get("user", "single")),
-            dry_run=bool(apply_config.get("dry_run", False)),
+            # SB2: use the OR'd flag so per-call dry_run wins over config.
+            dry_run=effective_dry_run,
             mode=effective_mode,
             resume_docx_path=resume_docx_path,
             cover_letter_docx_path=cover_letter_docx_path,
@@ -395,7 +415,8 @@ def run_for_job(
         # DB across every test run. Under dry_run we log-only.
         _STAGE_STATUSES = {"review_required", "soft_dup_warn", "captcha_escalated"}
         if result is not None and getattr(result, "status", None) in _STAGE_STATUSES:
-            if apply_config.get("dry_run", False):
+            if effective_dry_run:
+                # SB2: use the OR'd flag so per-call dry_run wins here too.
                 job_log.info(
                     "apply.review.stage_skipped_dry_run",
                     status=getattr(result, "status", None),
