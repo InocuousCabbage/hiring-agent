@@ -296,22 +296,21 @@ def test_render_cover_letter_returns_pdf_and_docx_tuple(tmp_path):
     assert pdf_path is None or pdf_path.exists()
 
 
-def test_render_resume_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
+def test_render_resume_returns_none_pdf_on_fallback(tmp_path, _no_pdf_converter):
     """HIGH-3 (structural fix): When no PDF converter is available, render_resume
     must return (None, docx_path) — NOT (docx_path, docx_path).
 
     Returning the same Path twice loses the ops signal that PDF conversion failed.
     None in the PDF slot lets callers detect fallback unambiguously.
+
+    iter-3 (finding #5): stub extraction. The inline `monkeypatch.setattr(
+    renderer_mod, "_find_libreoffice", ...) + sys.platform = "linux"` block
+    duplicated the `_no_pdf_converter` fixture defined below — a drift
+    hazard if the platform check moves off `sys.platform`. Both tests
+    now go through the fixture so a single edit keeps them in sync.
     """
     if _TEMPLATE_MISSING:
         pytest.skip(_TEMPLATE_SKIP_REASON)
-
-    # Force the no-converter path by stubbing both LibreOffice + docx2pdf.
-    import pdf_gen.renderer as renderer_mod
-    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
-    # Block docx2pdf via sys.platform — non-darwin skips it; force darwin path to ImportError
-    import sys
-    monkeypatch.setattr(sys, "platform", "linux")  # skips the docx2pdf branch entirely
 
     pdf_path, docx_path = render_resume(
         tailored_resume=SAMPLE_TAILORED_RESUME,
@@ -329,13 +328,11 @@ def test_render_resume_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
     assert docx_path.suffix == ".docx"
 
 
-def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
-    """HIGH-3: cover letter renderer must return (None, docx_path) on fallback."""
-    import pdf_gen.renderer as renderer_mod
-    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
-    import sys
-    monkeypatch.setattr(sys, "platform", "linux")  # skip docx2pdf branch
+def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, _no_pdf_converter):
+    """HIGH-3: cover letter renderer must return (None, docx_path) on fallback.
 
+    iter-3 (finding #5): uses _no_pdf_converter fixture — see paired
+    test_render_resume_returns_none_pdf_on_fallback for the rationale."""
     pdf_path, docx_path = render_cover_letter(
         cover_letter=SAMPLE_COVER_LETTER,
         job=SAMPLE_JOB,

@@ -705,11 +705,18 @@ def main_root_with_config():
         # Load settings.yaml, force apply.enabled=false, write to tmp.
         # Independent of the shipped default — a future config flip can't
         # silently shift the digest-send branch (fixes finding M18).
+        # iter-3 (finding #7): _yaml.safe_load returns None on empty file
+        # OR on `apply: null` in settings.yaml — either would crash
+        # `settings_data.setdefault(...)` with AttributeError. Coerce
+        # missing/None values to {} defensively at every level we touch.
         settings_data = _yaml_local.safe_load(
             (real_root / "config" / "settings.yaml").read_text()
-        )
-        settings_data.setdefault("apply", {})
-        settings_data["apply"]["enabled"] = False
+        ) or {}
+        apply_block = settings_data.setdefault("apply", {})
+        if apply_block is None:
+            apply_block = {}
+            settings_data["apply"] = apply_block
+        apply_block["enabled"] = False
         (tmp_path / "config" / "settings.yaml").write_text(
             _yaml_local.safe_dump(settings_data)
         )

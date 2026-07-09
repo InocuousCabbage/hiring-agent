@@ -149,10 +149,17 @@ def parse_alert_email(
 
         url = apply_link["href"].strip()
 
-        # M7 + Phase 5 iter-2: build the dedup key AFTER url is validated.
-        # For 'Unknown' company (parser fell back), key on URL instead so
-        # two distinct Unknown-company jobs both surface.
-        dedup_key = (title, url) if company == "Unknown" else (title, company)
+        # M7 + Phase 5 iter-2/iter-3: build the dedup key AFTER url is
+        # validated. When the parser could not identify a real company —
+        # either the "Unknown" fallback OR an empty-string result from
+        # em/en-dash split of a leading-dash raw (e.g. raw='— Remote' →
+        # parts[0].strip()='') OR an all-whitespace company — key on URL
+        # instead so distinct-URL jobs both surface. The sentinel set
+        # covers every no-real-company outcome from the extraction block
+        # above, not just 'Unknown'; iter-2 CRITICAL caught the empty-string
+        # sibling that a narrow `company == "Unknown"` check missed.
+        no_real_company = (company == "Unknown") or (not company.strip())
+        dedup_key = (title, url) if no_real_company else (title, company)
         if dedup_key in seen_title_company:
             continue
         seen_title_company.add(dedup_key)

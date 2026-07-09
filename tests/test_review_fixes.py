@@ -14,13 +14,13 @@ Tests cover:
 """
 
 import ast
-import importlib
 import inspect
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -193,7 +193,7 @@ def _find_calls_in(nodes, attr: str) -> list[int]:
     """Return line numbers of every Call to `.{attr}(...)` inside the AST
     node list, WITHOUT descending into nested Try nodes.
 
-    Phase 5 iter-2 (H14 finding): a naive `ast.walk(n)` per statement
+    Phase 5 iter-2/iter-3 (H14 finding): a naive `ast.walk(n)` per statement
     descends into the body / handlers / finalbody of every nested Try —
     so a `mark_processed` call in a NESTED except handler would be
     counted as a call in the OUTER try's body, silently bypassing the
@@ -202,6 +202,14 @@ def _find_calls_in(nodes, attr: str) -> list[int]:
     Boundary-aware walk: iterate nodes with `ast.iter_child_nodes` and
     skip descent into any child that is itself an ast.Try — its inner
     calls belong to that inner Try, not the enclosing one.
+
+    iter-3 CRITICAL: the child-only guard is NOT sufficient. When a top-
+    level `n` in `nodes` is ITSELF an ast.Try, `_walk_no_try(n)` was
+    invoked directly (not through `iter_child_nodes`), so it recursed
+    into that Try's own body + handlers + finalbody + orelse — leaking
+    the nested Try's calls into the outer Try's tally. Guard both entry
+    points: skip nested Try nodes at the top-level loop AND during child
+    descent.
     """
     lines: list[int] = []
 
@@ -216,6 +224,12 @@ def _find_calls_in(nodes, attr: str) -> list[int]:
             _walk_no_try(child)
 
     for n in nodes:
+        # iter-3 fix: a top-level Try in `nodes` is a nested Try relative
+        # to the caller who owns `nodes`. Its calls belong to that inner
+        # Try, not the enclosing one — same rule the child-descent guard
+        # enforces.
+        if isinstance(n, ast.Try):
+            continue
         _walk_no_try(n)
     return lines
 
@@ -286,6 +300,74 @@ class TestSendDigestMarkProcessedStructurallyPaired:
         assert paired >= 1, (
             "expected at least one Try that pairs send_digest with mark_processed"
         )
+
+
+class TestFindCallsInWalkerBoundaries:
+    """iter-3 CRITICAL regression: `_find_calls_in` must NOT descend into
+    a Try whose calls belong to that Try, not the caller. Applies both
+    when the Try is a CHILD of a walked node AND when the Try is a
+    TOP-LEVEL element of `nodes`.
+
+    A bug in either guard would leak nested-Try calls into the outer
+    tally — silently defeating the H14 'no mark_processed in an except'
+    check on real main.py code.
+    """
+
+    def test_top_level_try_in_nodes_is_not_descended(self):
+        """Directly exercise the top-level guard: pass a nested Try as
+        an element of `nodes` and confirm its own body's calls are NOT
+        counted. Mutation: remove the `if isinstance(n, ast.Try): continue`
+        guard → this test fails (call gets counted)."""
+        src = textwrap.dedent("""
+            try:
+                inner_call.mark_processed()
+            except Exception:
+                pass
+        """)
+        tree = ast.parse(src)
+        # tree.body is [Try] — pass the Try node in as a top-level element.
+        lines = _find_calls_in(tree.body, "mark_processed")
+        assert lines == [], (
+            f"_find_calls_in must skip a top-level Try in `nodes`; got "
+            f"lines={lines}. The bug lets the Try's inner call leak into "
+            f"the caller's tally, silently defeating the H14 guard."
+        )
+
+    def test_nested_try_as_child_is_not_descended(self):
+        """Regression for the original child-descent guard (iter-2 fix).
+        Ensures we did not lose that guard while adding the iter-3 top-
+        level guard. Mutation: remove `if isinstance(child, ast.Try):
+        continue` in the recursion → this test fails."""
+        src = textwrap.dedent("""
+            def outer():
+                try:
+                    ok_call()
+                    try:
+                        nested_call.mark_processed()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        """)
+        tree = ast.parse(src)
+        # Grab the outer function's body — its first statement is a Try.
+        outer_fn = tree.body[0]
+        outer_try = outer_fn.body[0]
+        # Pass the outer Try's own body — the ok_call is there, plus a
+        # nested Try whose inner mark_processed must NOT count.
+        lines = _find_calls_in(outer_try.body, "mark_processed")
+        assert lines == [], (
+            f"_find_calls_in must skip a nested Try during child descent; "
+            f"got lines={lines}."
+        )
+
+    def test_direct_call_in_top_level_expression_is_counted(self):
+        """Sanity: the top-level guard must NOT be over-broad. A direct
+        Expr with a Call at the top level must still be counted."""
+        src = "top_call.mark_processed()\n"
+        tree = ast.parse(src)
+        lines = _find_calls_in(tree.body, "mark_processed")
+        assert len(lines) == 1, f"expected 1 direct call, got {lines}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -655,19 +737,32 @@ class TestEmailParserGoldenFromSampleAlert:
 
 
 class TestNoopGmailClientContract:
-    """Phase 5 iter-2 (M17 finding): _NoopGmailClient is the stub main()
-    passes to run_pipeline in --test mode. If its method signatures drift
-    from the real GmailClient, --test mode crashes with AttributeError /
-    TypeError the moment the S17 seam invokes a mismatched stub — but
+    """Phase 5 iter-2/iter-3 (M17 finding): _NoopGmailClient is the stub
+    main() passes to run_pipeline in --test mode. If its method signatures
+    drift from the real GmailClient, --test mode crashes with AttributeError
+    / TypeError the moment the S17 seam invokes a mismatched stub — but
     every existing test that hits main() in --test mode ALSO stubs
     run_pipeline, so the drift is invisible.
 
-    This contract test compares the stub's methods to the real client's
-    methods via inspect.signature, so any signature drift (missing kwarg,
-    wrong kw-only marker, arity mismatch) fails the suite immediately.
+    Three guards:
+      1. `_METHODS` covers every stub method the SEAM invokes at runtime.
+         iter-3 added the source-grep check because a new seam call added
+         without extending _METHODS would crash --test mode but leave the
+         contract test green (the drift bug's mirror image).
+      2. Signature shape matches the real GmailClient (kw-only markers,
+         arity, param names).
+      3. Every method is actually callable on an instance with a plausible
+         arg set.
 
-    Mutation check: revert _NoopGmailClient.search to `def search(self, query)`
-    (drop max_results). This test then fails: signatures diverge.
+    (2)+(3) are combined into ONE loop in iter-3 to avoid the split-drift
+    hazard flagged as finding #8: two tests iterating the same _METHODS
+    tuple can silently disagree about the contract (e.g. one adds a method
+    the other doesn't).
+
+    Mutation checks:
+      - revert _NoopGmailClient.search to `def search(self, query)` → sig fails
+      - add a new `gmail.foo()` seam call without adding 'foo' to _METHODS
+        → seam-coverage check fails
     """
 
     _METHODS = (
@@ -679,52 +774,120 @@ class TestNoopGmailClientContract:
         "reply_to_thread",
     )
 
-    def test_noop_gmail_client_matches_real_signatures(self):
-        import inspect
+    def test_seam_gmail_methods_all_covered_by_METHODS(self):
+        """iter-3 (finding #3): if the seam adds a new `gmail.<method>()`
+        call and _METHODS doesn't stub it, --test mode crashes but the
+        signature/callable tests both stay green (they only iterate what
+        _METHODS already lists — the mirror image of the M17 drift bug).
+
+        Grep every `gmail.<method>(...)` call site in the SEAM (src/apply/*)
+        — the code path that receives _NoopGmailClient in --test mode.
+        (src/main.py invokes methods on the REAL GmailClient directly in
+        the production branch, not on the stub, so those are out of scope
+        for the stub's contract.)
+        """
+        # Seam-only: files whose `gmail` parameter binds to _NoopGmailClient
+        # in --test mode. src/main.py's own `gmail = GmailClient()` calls are
+        # a different code path (real Gmail auth, production-only).
+        seam_files = [
+            ROOT / "src" / "apply" / "review.py",
+            ROOT / "src" / "apply" / "_seam.py",
+        ]
+        # Match `gmail.foo(` — the seam's binding name for the injected
+        # client. Skips comment lines to avoid docstring-attribute noise.
+        call_pattern = re.compile(r"\bgmail\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
+        called = set()
+        for path in seam_files:
+            source = path.read_text()
+            for line in source.splitlines():
+                if line.strip().startswith("#"):
+                    continue
+                for m in call_pattern.finditer(line):
+                    called.add(m.group(1))
+
+        assert called, (
+            "Seam grep returned zero gmail.<method>() calls — the seam "
+            "files were probably renamed. Update seam_files in this test."
+        )
+
+        missing = called - set(self._METHODS)
+        assert not missing, (
+            f"Seam invokes gmail methods NOT covered by _NoopGmailClient "
+            f"stub / _METHODS: {sorted(missing)}. --test mode will crash "
+            f"AttributeError the first time these run. Add them to "
+            f"_NoopGmailClient + _METHODS."
+        )
+
+        # And the reverse: catch a dead _METHODS entry the seam no longer
+        # calls (would be code-hygiene noise, not a bug — but flag it).
+        stale = set(self._METHODS) - called
+        assert not stale, (
+            f"_METHODS lists methods no longer called by the seam: "
+            f"{sorted(stale)}. Remove from _METHODS + _NoopGmailClient."
+        )
+
+    def test_noop_gmail_client_matches_real_and_is_callable(self):
+        """Combined signature + callability contract. Consolidated from two
+        tests in iter-2 (finding #8) — the split iterated the same _METHODS
+        tuple twice, and could silently disagree about the contract.
+
+        For every _METHOD:
+          - stub + real must both have the method
+          - stub sig matches real sig (name + kind per param)
+          - stub method is invokable on an instance
+          - stub's return value satisfies the seam's expected shape
+        """
         from main import _NoopGmailClient
         from gmail.client import GmailClient
 
-        stub = _NoopGmailClient
-        real = GmailClient
+        stub_cls = _NoopGmailClient
+        real_cls = GmailClient
+        stub = stub_cls()
+
+        # Callable exemplar args per method — the seam's actual call shape.
+        # Kept explicit so any signature drift is caught by the .invocation,
+        # not just introspection.
+        callable_probes = {
+            "search": (lambda: stub.search("q"), lambda: stub.search("q", max_results=5)),
+            "get_or_create_label": (lambda: stub.get_or_create_label("L"),),
+            "send_with_labels": (lambda: stub.send_with_labels(subject="s", body="b", to="t"),),
+            "apply_label": (lambda: stub.apply_label("m", "L"),),
+            "remove_label": (lambda: stub.remove_label("m", "L"),),
+            "reply_to_thread": (lambda: stub.reply_to_thread("t", "b"),),
+        }
+        return_shape = {
+            "search": lambda r: r == [],
+            "get_or_create_label": lambda r: r == "stub:L",
+            "send_with_labels": lambda r: isinstance(r, tuple) and len(r) == 2,
+            "apply_label": lambda r: r is None,
+            "remove_label": lambda r: r is None,
+            "reply_to_thread": lambda r: isinstance(r, str),
+        }
 
         for name in self._METHODS:
-            assert hasattr(stub, name), f"_NoopGmailClient missing method {name!r}"
-            assert hasattr(real, name), f"GmailClient missing method {name!r} — test is stale?"
+            assert hasattr(stub_cls, name), f"_NoopGmailClient missing method {name!r}"
+            assert hasattr(real_cls, name), f"GmailClient missing method {name!r} — test is stale?"
 
-            stub_sig = inspect.signature(getattr(stub, name))
-            real_sig = inspect.signature(getattr(real, name))
-
-            stub_params = list(stub_sig.parameters.values())
-            real_params = list(real_sig.parameters.values())
-
-            # Parameter NAMES + KIND must match (kw-only markers are
-            # binding-level contract). Defaults + annotations may differ.
-            stub_shape = [(p.name, p.kind) for p in stub_params]
-            real_shape = [(p.name, p.kind) for p in real_params]
+            stub_sig = inspect.signature(getattr(stub_cls, name))
+            real_sig = inspect.signature(getattr(real_cls, name))
+            stub_shape = [(p.name, p.kind) for p in stub_sig.parameters.values()]
+            real_shape = [(p.name, p.kind) for p in real_sig.parameters.values()]
             assert stub_shape == real_shape, (
                 f"_NoopGmailClient.{name} signature drift vs GmailClient:\n"
                 f"  stub: {stub_shape}\n"
                 f"  real: {real_shape}"
             )
 
-    def test_noop_gmail_client_methods_all_callable_on_instance(self):
-        """Instance-level smoke: every stub method actually invokable with
-        a plausible arg set (guards against a signature that parses but
-        can't be called — e.g. mismatched positional-only markers)."""
-        from main import _NoopGmailClient
-
-        stub = _NoopGmailClient()
-
-        assert stub.search("q") == []
-        assert stub.search("q", max_results=5) == []
-        assert stub.get_or_create_label("L") == "stub:L"
-        assert stub.apply_label("m", "L") is None
-        assert stub.remove_label("m", "L") is None
-        # send_with_labels: kw-only per real GmailClient contract
-        result = stub.send_with_labels(subject="s", body="b", to="t")
-        assert isinstance(result, tuple) and len(result) == 2
-        # reply_to_thread returns a str per real signature
-        assert isinstance(stub.reply_to_thread("t", "b"), str)
+            # Callable + return-shape checks. Any mismatched positional-
+            # only marker or default surfaces here as TypeError.
+            probes = callable_probes.get(name, ())
+            assert probes, f"iter-3: add a callable probe for _METHOD {name!r}"
+            for probe in probes:
+                result = probe()
+                assert return_shape[name](result), (
+                    f"_NoopGmailClient.{name} returned {result!r} — does not "
+                    f"satisfy the shape the seam depends on."
+                )
 
 
 class TestEmailParserDedupByTitleAndCompany:
@@ -860,6 +1023,74 @@ class TestEmailParserDedupByTitleAndCompany:
             "https://example.com/one",
             "https://example.com/two",
         ], f"Expected both distinct URLs preserved, got {urls}"
+
+    def test_empty_string_company_does_not_collide_across_jobs(self):
+        """(title, '') empty-string sentinel collision (Phase 5 xhigh iter-2
+        CRITICAL finding): when the company <div>'s raw text STARTS with an
+        em-dash (e.g. '— Remote'), the em-dash split path produces
+        parts[0].strip() = '' (empty string) — NOT 'Unknown'. The iter-1
+        fix only added a URL-fallback for company == 'Unknown', so two
+        cards with raw='— Remote' both key to (title, '') and the second
+        is silently dropped. Same M7 failure class, different sibling
+        sentinel.
+
+        Mutation check: replace the sentinel guard in email_parser.py with
+        the iter-1-only `company == "Unknown"` check. This test then
+        fails: len(jobs) == 1 because both cards key to (title, '') and
+        the second is dropped.
+        """
+        from parser.email_parser import parse_alert_email
+        # Two cards where company_div's raw text starts with em-dash —
+        # split path produces empty-string company. Distinct URLs → distinct
+        # jobs. Both must surface, not just the first.
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>— Remote</div>"  # split → company='', location='Remote'
+            '<a href="https://example.com/one">Apply</a>'
+            "</td>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>— Remote</div>"
+            '<a href="https://example.com/two">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 2, (
+            f"Expected 2 jobs when company fell back to empty string for "
+            f"both cards (distinct URLs → distinct jobs), got {len(jobs)}. "
+            f"Second card silently dropped by (title, '') collision — the "
+            f"empty-string sibling of the iter-1 'Unknown' bug."
+        )
+        urls = sorted(j["url"] for j in jobs)
+        assert urls == [
+            "https://example.com/one",
+            "https://example.com/two",
+        ], f"Expected both distinct URLs preserved, got {urls}"
+
+    def test_en_dash_empty_string_company_does_not_collide(self):
+        """En-dash sibling of the em-dash empty-string case. Parser handles
+        both '—' (em) and '–' (en) via the same split-then-strip path, so
+        a card with raw='– Remote' has the same empty-string sentinel
+        failure. Sweep coverage for the sentinel-collision class."""
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Content Manager</span></h3>"
+            "<div>– Remote</div>"  # en-dash split → company=''
+            '<a href="https://example.com/en1">Apply</a>'
+            "</td>"
+            "<td><h3><span>Content Manager</span></h3>"
+            "<div>– Remote</div>"
+            '<a href="https://example.com/en2">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 2, (
+            f"En-dash empty-company sibling of the em-dash bug: expected "
+            f"2 jobs, got {len(jobs)}. Same sentinel-collision class."
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
