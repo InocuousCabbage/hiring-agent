@@ -734,9 +734,19 @@ def main() -> None:
         return
 
     # ── Production / dry-run mode ─────────────────────────────────────────────
-    from gmail.client import GmailClient
+    from gmail.client import AuthError, GmailClient
 
-    gmail = GmailClient()
+    # SE5 (Phase 3 xhigh iter-1): catch AuthError from GmailClient() and exit
+    # non-zero with a grep-able signal. Pre-fix: an expired-token AuthError
+    # (raised by the B4 headless guard) propagated as an uncaught traceback
+    # under a cron entrypoint — no structured event, no clear exit code,
+    # operator only sees a stack trace in stderr.
+    try:
+        gmail = GmailClient()
+    except AuthError as exc:
+        log.error("gmail.auth_required", reason=str(exc))
+        print(f"gmail auth required: {exc}", file=sys.stderr)
+        sys.exit(2)
     log.info("step.gmail_intake", status="starting")
 
     alert = gmail.find_unprocessed_alert(

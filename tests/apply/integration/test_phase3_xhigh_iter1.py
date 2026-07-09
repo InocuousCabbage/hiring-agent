@@ -802,17 +802,36 @@ def test_se5_main_catches_auth_error_and_exits_nonzero(monkeypatch, capsys):
     grep-able failure signal.
     """
     from src import main as main_mod
-    from src.gmail.client import AuthError
+    # SE5 fix note: main.py runs a sys.path bootstrap that puts `src/` on
+    # sys.path, so `from gmail.client import AuthError` inside main() and
+    # `from src.gmail.client import AuthError` inside the test load into
+    # DIFFERENT module objects — the classes are NOT the same object.
+    # Trigger the bootstrap by touching main first, then import AuthError
+    # via the SAME path main() uses so the raise/except identity matches.
+    _ = main_mod  # trigger bootstrap
+    from gmail.client import AuthError  # type: ignore[import-not-found]
 
     def _boom_gmail_client():
         raise AuthError("headless auth required")
 
     # Patch the imported symbol used inside main().
-    # NB: main.py imports GmailClient inside main() as
-    # `from gmail.client import GmailClient` — we patch the module attr
-    # so any call to `GmailClient()` from main() falls through to _boom.
-    import src.gmail.client as gc
-    monkeypatch.setattr(gc, "GmailClient", _boom_gmail_client)
+    # NB: main.py bootstraps sys.path with `src/` PREPENDED (line 40) plus
+    # the repo ROOT (bootstrap lines 17-25), so `from gmail.client import
+    # GmailClient` and `import src.gmail.client` load into DIFFERENT module
+    # slots in sys.modules. Patch BOTH so the main()'s runtime lookup picks
+    # up the replacement regardless of which slot Python's importer bound.
+    import src.gmail.client as gc_src
+    monkeypatch.setattr(gc_src, "GmailClient", _boom_gmail_client)
+    try:
+        import gmail.client as gc_bare  # type: ignore[import-not-found]
+        monkeypatch.setattr(gc_bare, "GmailClient", _boom_gmail_client)
+    except ImportError:
+        # `gmail` unreachable via bare path in this test session — the
+        # bootstrap in main.py will still put `src/` on sys.path before
+        # the import, so main()'s from-import will fall through to
+        # gc_bare eventually. Import it lazily below via importlib once
+        # main.py's bootstrap fires.
+        pass
 
     # Also stub argv so main() runs without --test.
     monkeypatch.setattr(sys, "argv", ["main"])

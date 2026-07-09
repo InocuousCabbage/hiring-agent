@@ -308,18 +308,40 @@ def _atomic_write(path: Path, data: bytes) -> None:
     fsync → chmod 0o600 (belt-and-braces) → `os.rename` to final path
     → chmod 0o600 on final. `os.rename` is atomic on POSIX filesystems
     for same-directory renames.
+
+    SE4 (Phase 3 xhigh iter-1): try/finally around the write ensures the
+    .tmp file is cleaned up on ANY error — pre-fix, an OSError from
+    os.rename/chmod could leave `.tmp` on disk containing the newly-written
+    (potentially secret) payload indefinitely.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.chmod(tmp, 0o600)
-    os.rename(tmp, path)
-    # Rename does not always preserve mode across all filesystems.
-    os.chmod(path, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, 0o600)
+        os.rename(tmp, path)
+        # Rename does not always preserve mode across all filesystems.
+        os.chmod(path, 0o600)
+    except Exception:
+        # Best-effort cleanup — never mask the original error.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Shared helper (SE3): write a text payload with the same safety
+    guarantees as `_atomic_write` (0o600 create, fsync, atomic rename,
+    tmp cleanup on failure). Used by both `src.apply.credentials` and
+    `src.gmail.client` for token persistence.
+    """
+    _atomic_write(path, text.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------

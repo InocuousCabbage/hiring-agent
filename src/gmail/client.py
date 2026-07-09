@@ -100,22 +100,29 @@ class AuthError(RuntimeError):
 def _is_headless() -> bool:
     """Best-effort headless-environment detection for the OAuth guard.
 
-    Headless if there's no controlling TTY on stdin AND neither an X11
-    nor a Wayland display is advertised, OR if the operator has set
-    ``HIRING_AGENT_HEADLESS`` to explicitly force the guard (e.g. from
-    the cron entrypoint, where isatty()/DISPLAY heuristics may not be
-    reliable).
+    Post-SB4 (Phase 3 xhigh iter-1): default to TTY-only signal. Under a
+    tmux/launchd/always-on machine, a stale ``DISPLAY`` from the parent
+    process gets inherited into the cron worker even though no X server
+    is actually reachable. The pre-fix guard (``not has_tty AND
+    not has_display``) then flipped to False and let ``run_local_server``
+    hang forever.
+
+    Post-fix policy: if stdin is not a TTY, treat the process as headless.
+    Operators explicitly needing an interactive OAuth flow from a
+    non-TTY entrypoint can set ``HIRING_AGENT_INTERACTIVE_OAUTH=1`` to
+    opt out of the guard (still gated on ``HIRING_AGENT_HEADLESS``
+    override for symmetry with the cron entrypoint).
     """
     if os.environ.get("HIRING_AGENT_HEADLESS"):
         return True
+    if os.environ.get("HIRING_AGENT_INTERACTIVE_OAUTH"):
+        return False
     try:
         has_tty = sys.stdin.isatty()
     except Exception:
         has_tty = False
-    has_display = bool(os.environ.get("DISPLAY")) or bool(
-        os.environ.get("WAYLAND_DISPLAY")
-    )
-    return not has_tty and not has_display
+    # SB4: TTY-only. Stale DISPLAY inheritance no longer bypasses the guard.
+    return not has_tty
 
 
 def _sanitize_query(value: str) -> str:
@@ -162,14 +169,41 @@ class GmailClient:
             token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(token_path.parent, 0o700)
 
-            # L4: write via temp file + atomic os.replace (same dir, same
-            # filesystem) so a concurrent reader never observes a truncated
-            # JSON blob mid-write.
+            # L4 + SB3 (Phase 3 xhigh iter-1): write via temp file +
+            # atomic os.replace so a concurrent reader never observes a
+            # truncated JSON blob. SB3 fix: create the .tmp file with
+            # mode 0o600 at creation time (os.open with the mode arg)
+            # rather than `open(path, 'w')` (which respects umask, so
+            # the token was world-readable during the write window
+            # before the follow-up chmod). SE3: fsync before rename so
+            # the token survives a power failure. SE4: try/finally
+            # cleans up the .tmp on failure so no orphan file with a
+            # valid token is left behind.
             tmp_path = token_path.parent / f"{token_path.name}.tmp"
-            with open(tmp_path, "w") as f:
-                f.write(creds.to_json())
-            os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, token_path)
+            token_json = creds.to_json()
+            fd = os.open(
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                try:
+                    os.write(fd, token_json.encode("utf-8"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                # Belt-and-braces chmod in case umask or fs quirks stripped bits.
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, token_path)
+                # Rename does not always preserve mode across all filesystems.
+                os.chmod(token_path, 0o600)
+            except Exception:
+                # SE4: never leave an orphan .tmp with a valid token behind.
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
 
         return creds
 
