@@ -30,106 +30,226 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Critical #2: mark_processed only called on send success
+# Critical #2 (H13 + H14): mark_processed only called on send success
+#
+# ── Failure-mode being guarded ──
+# main.main()'s digest-send branch runs (roughly):
+#     try:
+#         gmail.send_digest(...)
+#         gmail.mark_processed(alert_id, processed_label)
+#     except Exception as exc:
+#         log.error(...)
+# The shipped bug this guards against: mark_processed OUTSIDE the try (or
+# BEFORE the send inside it) — either arrangement can mark an alert
+# 'processed' when the digest never actually shipped to the operator's inbox,
+# and the alert never re-enters the pipeline on the next cron tick.
+#
+# ── Discipline: BEHAVIORAL, not source-grep ──
+# The previous H13/H14 tests re-implemented main.py's send/mark logic against
+# a MagicMock (H13) or asserted `"mark_processed" in line` (H14 tautology).
+# Neither would fail if main.py was reintroduced with the bug. The
+# replacements below drive main.main() end-to-end with a stub GmailClient,
+# then assert mark_processed's presence-vs-absence and ordering against the
+# real production call site.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False,
+                                my_email="test@example.com"):
+    """Drive main.main() end-to-end with a stubbed Gmail client and stubbed
+    pipeline. Returns the gmail stub for assertions.
+
+    Every I/O boundary the digest-send branch depends on is patched:
+      - main.GmailClient        — no real Gmail auth
+      - gmail.find_unprocessed_alert — returns a fake alert dict
+      - main.parse_alert_email  — returns a single fake job
+      - main.run_pipeline       — returns 1 processed job, 0 skipped
+      - main.ROOT / "output"    — redirected to tmp_path so no repo write
+      - MY_EMAIL env            — set or cleared per case
+      - sys.argv                — production mode (no --test / --dry-run)
+    """
+    # Ensure src/ is importable (redundant with module-level insert, but
+    # keeps this helper self-contained for readers).
+    sys.path.insert(0, str(ROOT / "src"))
+    import main as main_mod
+    import gmail.client as gmail_client_mod  # GmailClient is imported inside main()
+
+    gmail = MagicMock()
+    if send_raises:
+        gmail.send_digest.side_effect = Exception("SMTP timeout")
+    gmail.find_unprocessed_alert.return_value = {
+        "id": "msg_123",
+        "html": "<html></html>",
+        "text": "",
+    }
+
+    # main() does `from gmail.client import AuthError, GmailClient` at call time,
+    # so we patch the source module (main.py has no module-scope GmailClient).
+    monkeypatch.setattr(gmail_client_mod, "GmailClient", lambda: gmail)
+    monkeypatch.setattr(
+        main_mod,
+        "parse_alert_email",
+        lambda html_body, text_body, max_jobs: [
+            {"title": "Engineer", "company": "Acme", "url": "https://example.com"}
+        ],
+    )
+    processed_fixture = [{
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com",
+        "lane": "pmm",
+        "resume_pdf": None,
+        "resume_docx": tmp_path / "acme_resume.docx",
+        "cover_letter_pdf": None,
+        "cover_letter_docx": tmp_path / "acme_cl.docx",
+        "hiring_manager": None,
+        "apply_result": None,
+    }]
+    # Materialize the docx paths so _build_attachments has real files.
+    (tmp_path / "acme_resume.docx").write_bytes(b"PK")  # ZIP-ish magic
+    (tmp_path / "acme_cl.docx").write_bytes(b"PK")
+
+    def _fake_run_pipeline(**kwargs):
+        return (processed_fixture, [], [])
+    monkeypatch.setattr(main_mod, "run_pipeline", _fake_run_pipeline)
+
+    # Redirect ROOT/output writes to tmp_path so we never touch the repo.
+    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    # main.load_config uses ROOT to resolve settings.yaml — put a symlink
+    # (or reuse the real file via the original ROOT).
+    real_root = Path(__file__).parent.parent
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "templates").mkdir(exist_ok=True)
+    (tmp_path / "config" / "settings.yaml").write_text(
+        (real_root / "config" / "settings.yaml").read_text()
+    )
+    (tmp_path / "templates" / "project_bank.yaml").write_text(
+        (real_root / "templates" / "project_bank.yaml").read_text()
+    )
+
+    if my_email:
+        monkeypatch.setenv("MY_EMAIL", my_email)
+    else:
+        monkeypatch.delenv("MY_EMAIL", raising=False)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    main_mod.main()
+    return gmail
+
+
 class TestDigestSendAndMarkProcessed:
-    """Verify mark_processed is only called when send_digest succeeds."""
+    """H13 behavioral: exercise main.main()'s real digest-send branch."""
 
-    def _run_main_block(self, send_raises=False, my_email="test@example.com"):
-        """
-        Simulate the production branch of main.main() (the `if not args.dry_run` block)
-        by importing main and exercising the logic with mocks.
-        """
-        gmail = MagicMock()
-        if send_raises:
-            gmail.send_digest.side_effect = Exception("SMTP timeout")
-
-        alert = {"id": "msg_123", "html": "<html></html>", "text": ""}
-        config = {
-            "gmail": {
-                "digest_subject_template": "Digest {date}",
-                "processed_label": "hiring-agent-processed",
-            },
-        }
-        processed = [
-            {
-                "title": "Engineer",
-                "company": "Acme",
-                "url": "https://example.com",
-                "lane": "pmm",
-                "resume_pdf": Path("/tmp/resume.pdf"),
-                "cover_letter_pdf": Path("/tmp/cl.pdf"),
-            }
-        ]
-        skipped = []
-
-        from gmail.digest import compose_digest
-
-        with patch.dict(os.environ, {"MY_EMAIL": my_email} if my_email else {}, clear=False):
-            # Remove MY_EMAIL if testing absent case
-            if not my_email:
-                os.environ.pop("MY_EMAIL", None)
-
-            recipient = os.getenv("MY_EMAIL")
-            if not recipient:
-                return gmail  # early exit path
-
-            subject = config["gmail"]["digest_subject_template"].format(date="2026-03-06")
-            body = compose_digest(processed=processed, skipped=skipped)
-            attachments = [processed[0]["resume_pdf"], processed[0]["cover_letter_pdf"]]
-
-            try:
-                gmail.send_digest(
-                    to=recipient,
-                    subject=subject,
-                    body_text=body,
-                    attachments=attachments,
-                )
-                gmail.mark_processed(alert["id"], config["gmail"]["processed_label"])
-            except Exception:
-                pass  # mirroring main.py behavior
-
-        return gmail
-
-    def test_mark_processed_called_on_success(self):
-        gmail = self._run_main_block(send_raises=False)
+    def test_mark_processed_called_on_success(self, monkeypatch, tmp_path):
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False)
         gmail.send_digest.assert_called_once()
-        gmail.mark_processed.assert_called_once_with("msg_123", "hiring-agent-processed")
+        gmail.mark_processed.assert_called_once_with(
+            "msg_123", "hiring-agent-processed"
+        )
 
-    def test_mark_processed_not_called_on_failure(self):
-        gmail = self._run_main_block(send_raises=True)
+    def test_mark_processed_not_called_on_send_failure(self, monkeypatch, tmp_path):
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=True)
         gmail.send_digest.assert_called_once()
         gmail.mark_processed.assert_not_called()
 
-    def test_mark_processed_not_called_when_email_missing(self):
-        gmail = self._run_main_block(my_email="")
+    def test_mark_processed_not_called_when_email_missing(self, monkeypatch, tmp_path):
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, my_email="")
         gmail.send_digest.assert_not_called()
         gmail.mark_processed.assert_not_called()
 
-    def test_main_source_has_mark_inside_try(self):
-        """Verify in the actual main.py source that mark_processed is inside the try block."""
+    def test_mark_processed_ordered_after_send_digest(self, monkeypatch, tmp_path):
+        """The send must resolve BEFORE the mark. If main.py ever reorders
+        mark_processed above send_digest inside the same try (a mutation the
+        old MagicMock self-test missed), this assertion fires."""
+        gmail = _drive_main_with_gmail_stub(monkeypatch, tmp_path, send_raises=False)
+        # Filter to just the two calls we care about, in order.
+        call_names = [
+            c[0] for c in gmail.mock_calls
+            if c[0] in ("send_digest", "mark_processed")
+        ]
+        assert call_names == ["send_digest", "mark_processed"], (
+            f"send_digest must precede mark_processed; got: {call_names}"
+        )
+
+
+def _find_calls_in(nodes, attr: str) -> list[int]:
+    """Return line numbers of every Call to `.{attr}(...)` inside the AST
+    node list. Uses ast.walk so nested statements (for/if/…) are covered."""
+    lines = []
+    for n in nodes:
+        for sub in ast.walk(n):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                if sub.func.attr == attr:
+                    lines.append(sub.lineno)
+    return lines
+
+
+class TestSendDigestMarkProcessedStructurallyPaired:
+    """H14 structural (replaces the substring-in-line tautology).
+
+    Walks the AST of main.main(). For every Try node whose body contains a
+    gmail.send_digest() call, we verify:
+      1. mark_processed also lives in the SAME Try.body (not handlers/finalbody)
+      2. mark_processed appears AFTER send_digest (line order)
+      3. No mark_processed sneaks into an `except` handler for that Try
+
+    Mutations this catches (any one FAILS the test):
+      - Move mark_processed OUT of the try (bare top-level statement) → (1) fails
+      - Reorder so mark_processed comes BEFORE send_digest inside the try → (2) fails
+      - Move mark_processed into the `except` handler → (1)+(3) fail
+
+    (The mutation "reorder within same try body" is ALSO caught by the H13
+    behavioral test's `test_mark_processed_ordered_after_send_digest`, so
+    we have defense in depth: structural + behavioral.)
+
+    Standalone mark_processed calls in main() that are NOT paired with a
+    send_digest inside the same Try are legitimate (the no-jobs-found branch
+    marks the alert processed without a digest ship). This test only
+    constrains the send+mark pair — that is the failure mode Critical #2
+    was written to prevent.
+    """
+
+    def test_send_and_mark_share_try_body_with_correct_order(self):
         source = (ROOT / "src" / "main.py").read_text()
         tree = ast.parse(source)
-
-        # Find the main() function
-        main_func = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "main":
-                main_func = node
-                break
+        main_func = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "main"), None,
+        )
         assert main_func is not None, "main() function not found"
 
-        # Find mark_processed calls — they should all be inside Try nodes
+        paired = 0
         for node in ast.walk(main_func):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Attribute) and func.attr == "mark_processed":
-                    # Walk up to find enclosing Try
-                    # Simpler: check mark_processed appears in a try body in the source
-                    line = source.splitlines()[node.lineno - 1]
-                    assert "mark_processed" in line
+            if not isinstance(node, ast.Try):
+                continue
+            send_lines = _find_calls_in(node.body, "send_digest")
+            if not send_lines:
+                continue  # not the try we care about
+            mark_body_lines = _find_calls_in(node.body, "mark_processed")
+            assert mark_body_lines, (
+                f"Try containing send_digest at lines {send_lines} has NO "
+                f"mark_processed in its body — the guard is defeated. "
+                f"mark_processed must live in the same Try.body so a "
+                f"send_digest exception skips it."
+            )
+            # Assert every mark_processed follows every send_digest by line
+            assert min(mark_body_lines) > max(send_lines), (
+                f"mark_processed at line {min(mark_body_lines)} must FOLLOW "
+                f"send_digest at line {max(send_lines)} (send-then-mark)."
+            )
+            # And no mark_processed hiding in except handlers.
+            for handler in node.handlers:
+                handler_marks = _find_calls_in([handler], "mark_processed")
+                assert not handler_marks, (
+                    f"mark_processed at line {handler_marks[0]} is inside an "
+                    f"except handler of the send_digest try — it would fire "
+                    f"even when send_digest raised, defeating the guard."
+                )
+            paired += 1
+
+        assert paired >= 1, (
+            "expected at least one Try that pairs send_digest with mark_processed"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -410,6 +530,144 @@ class TestEmlEncoding:
         # Should not raise
         result = parse_alert_from_eml(eml_path)
         assert isinstance(result, list)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# M20: email_parser golden-file extraction (was: isinstance(result, list) only)
+#
+# The prior TestEmlEncoding.test_parse_handles_non_ascii asserted only that
+# the parser returned SOME list — even []. It was the ONLY behavioral test
+# for email_parser, and nothing verified that title/company/url were
+# actually extracted from the shipped sample_alert.eml fixture.
+#
+# These golden assertions lock in the extraction contract: exact job count,
+# the specific title/company pairs the fixture is known to contain, and the
+# SendGrid tracking URL shape. A parser regression that swaps <h3>/<div>
+# selectors, breaks the em-dash split, or returns [] on a valid alert will
+# fail here.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestEmailParserGoldenFromSampleAlert:
+    """Golden assertions against the checked-in sample_alert.eml fixture.
+
+    The fixture is a real Hiring.cafe alert with 6 distinct jobs. If the
+    fixture is edited, update SAMPLE_ALERT_GOLDEN below to match — but do
+    NOT relax the assertions to `> 0` or `isinstance(..., list)`.
+    """
+
+    SAMPLE_ALERT_GOLDEN = [
+        ("Lead Product Marketing Manager", "Group O"),
+        ("Sr. Specialist, Product and Solutions Marketing", "Cardinal Health"),
+        ("Senior Product Marketing Manager – Financial Close", "OneStream"),
+        ("Product Managers #IN1176", "Cummins"),
+        ("Senior Marketing Manager - Global Digital Experience", "Sinch"),
+        ("Product Specialist Demand Generation (BIM, Remote, USA)", "Allplan"),
+    ]
+
+    def test_sample_alert_job_count_matches_golden(self):
+        from parser.email_parser import parse_alert_from_eml
+        jobs = parse_alert_from_eml(
+            ROOT / "test_data" / "sample_alert.eml",
+            max_jobs=99,
+        )
+        assert len(jobs) == len(self.SAMPLE_ALERT_GOLDEN), (
+            f"Expected {len(self.SAMPLE_ALERT_GOLDEN)} jobs from sample_alert.eml, "
+            f"got {len(jobs)}. If the fixture was intentionally edited, update "
+            f"SAMPLE_ALERT_GOLDEN. Otherwise the parser regressed."
+        )
+
+    def test_sample_alert_title_company_pairs_match_golden(self):
+        from parser.email_parser import parse_alert_from_eml
+        jobs = parse_alert_from_eml(
+            ROOT / "test_data" / "sample_alert.eml",
+            max_jobs=99,
+        )
+        actual = [(j["title"], j["company"]) for j in jobs]
+        assert actual == self.SAMPLE_ALERT_GOLDEN, (
+            f"title/company extraction drifted from golden:\n"
+            f"  expected: {self.SAMPLE_ALERT_GOLDEN}\n"
+            f"  got:      {actual}"
+        )
+
+    def test_sample_alert_every_job_has_sendgrid_tracking_url(self):
+        """Every card in the shipped fixture routes through SendGrid; the
+        parser must surface a non-empty URL for each. Vacuous "url exists"
+        checks (`assert j.get("url")`) would still pass on the empty string,
+        so we also assert the SendGrid host prefix — the actual fixture
+        shape — for defense in depth."""
+        from parser.email_parser import parse_alert_from_eml
+        jobs = parse_alert_from_eml(
+            ROOT / "test_data" / "sample_alert.eml",
+            max_jobs=99,
+        )
+        for j in jobs:
+            url = j.get("url", "")
+            assert url, f"job {j.get('title')!r} has no URL"
+            assert "sendgrid.net" in url or "hiring.cafe" in url, (
+                f"job {j.get('title')!r} url does not look like the "
+                f"SendGrid tracking shape: {url!r}"
+            )
+
+
+class TestEmailParserDedupByTitleAndCompany:
+    """M7 regression: dedup keys on (title, company), not title alone.
+
+    Prior bug: `if title in seen_titles: continue` silently dropped the
+    second card whenever two alerts contained the same job title at
+    different companies (a common shape for "Product Marketing Manager"
+    or "Content Marketing Manager"). No log line was emitted, so the
+    dropped job was invisible.
+
+    Fix: dedup key = (title, company) after company extraction. This test
+    exercises the fix with a synthetic 2-card HTML fragment; if the fix
+    regresses, only 1 job is returned and this test fails.
+    """
+
+    def _make_alert_html(self, cards: list[tuple[str, str]]) -> str:
+        """Build minimal HTML that mirrors the Hiring.cafe card shape:
+        an <h3><span>Title</span></h3> followed by a <div>Company — Location</div>
+        inside a <td>."""
+        card_html = "".join(
+            f'<td><h3><span>{title}</span></h3>'
+            f'<div>{company} — Remote</div>'
+            f'<a href="https://example.com/{i}">Apply</a></td>'
+            for i, (title, company) in enumerate(cards)
+        )
+        return f"<html><body><table>{card_html}</table></body></html>"
+
+    def test_same_title_different_companies_returns_two_jobs(self):
+        from parser.email_parser import parse_alert_email
+        html = self._make_alert_html([
+            ("Product Marketing Manager", "Company A"),
+            ("Product Marketing Manager", "Company B"),
+        ])
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 2, (
+            f"Expected 2 jobs (same title, different companies), got "
+            f"{len(jobs)}. Jobs: {[(j['title'], j['company']) for j in jobs]}"
+        )
+        companies = sorted(j["company"] for j in jobs)
+        assert companies == ["Company A", "Company B"], (
+            f"Expected both companies represented, got {companies}"
+        )
+
+    def test_true_duplicates_still_deduped(self):
+        """Same (title, company) pair should still be deduped — the fix
+        narrows the key, it does not remove dedup entirely."""
+        from parser.email_parser import parse_alert_email
+        html = self._make_alert_html([
+            ("Product Marketing Manager", "Acme"),
+            ("Product Marketing Manager", "Acme"),  # exact duplicate
+            ("Product Marketing Manager", "Beta"),
+        ])
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        # 2 unique (title, company) pairs after dedup
+        pairs = sorted((j["title"], j["company"]) for j in jobs)
+        assert pairs == [
+            ("Product Marketing Manager", "Acme"),
+            ("Product Marketing Manager", "Beta"),
+        ], f"Expected exactly 2 unique pairs, got {pairs}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

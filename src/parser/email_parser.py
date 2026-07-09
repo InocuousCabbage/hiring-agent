@@ -75,7 +75,12 @@ def parse_alert_email(
 
     soup = BeautifulSoup(html_body, "lxml")
     jobs = []
-    seen_titles = set()
+    # M7 fix: key dedup on (title, company) — same-titled roles at different
+    # companies are legitimately different jobs and must both enter the
+    # pipeline. Keying on title alone silently dropped the second card,
+    # with no log line, on every alert containing two "Product Marketing
+    # Manager"s (or similar) at different employers.
+    seen_title_company: set[tuple[str, str]] = set()
 
     # Each job is in an <h3> tag inside a table card
     for h3 in soup.find_all("h3"):
@@ -85,11 +90,6 @@ def parse_alert_email(
 
         if not title or len(title) < 3:
             continue
-
-        # De-duplicate by title (same job can appear in different alerts)
-        if title in seen_titles:
-            continue
-        seen_titles.add(title)
 
         # Navigate to the parent <td> which contains the full card
         card = h3.find_parent("td")
@@ -112,6 +112,14 @@ def parse_alert_email(
                 location = parts[1].strip()
             else:
                 company = raw
+
+        # M7 fix: dedup by (title, company) AFTER company extraction — must
+        # come here (not before card lookup) because we need the company
+        # string to build the key.
+        dedup_key = (title, company)
+        if dedup_key in seen_title_company:
+            continue
+        seen_title_company.add(dedup_key)
 
         # Extract date posted (second div — has lighter color styling)
         date_posted = None

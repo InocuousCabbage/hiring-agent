@@ -350,5 +350,133 @@ def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, monkeypatch)
     assert docx_path.suffix == ".docx"
 
 
+# ── M23: renderer content assertions ──────────────────────────────────────────
+# Prior state: the renderer tests asserted only zip validity + paragraph
+# count > 20 — an untailored base_resume.docx (all paragraphs untouched)
+# passed. If _fill_resume_template silently no-op'd (broken .runs walk, empty
+# section handler, etc.), the shipped DOCX would be the un-tailored template
+# and the tests would never notice.
+#
+# These tests read the DOCX text back and assert the tailored summary +
+# bullet content is actually present. Mutation check: no-op the placeholder
+# fill loop in renderer._fill_resume_template — the summary text vanishes
+# from the DOCX and this test fails.
+
+
+def _docx_full_text(docx_path: Path) -> str:
+    """Extract concatenated paragraph text from a DOCX (including tables)."""
+    doc = Document(str(docx_path))
+    parts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    parts.append(p.text)
+    return "\n".join(parts)
+
+
+@pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
+def test_render_resume_docx_contains_tailored_summary_and_bullets(tmp_path):
+    """M23: the rendered DOCX must contain the tailored summary + a
+    signature phrase from at least one bullet. If the fill loop no-ops,
+    the DOCX ships the base template and this test fails."""
+    _, docx_path = render_resume(
+        tailored_resume=SAMPLE_TAILORED_RESUME,
+        lane=SAMPLE_LANE,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+    text = _docx_full_text(docx_path)
+
+    # Tailored summary must be present verbatim (or nearly so — the fill
+    # process may reflow whitespace, so we check a distinctive substring).
+    summary_marker = "translate complex business requirements"
+    assert summary_marker in text, (
+        f"Tailored summary substring {summary_marker!r} missing from rendered "
+        f"DOCX. Renderer likely no-op'd the summary fill.\n"
+        f"First 400 chars of DOCX text:\n{text[:400]}"
+    )
+
+    # At least one distinctive bullet phrase from SAMPLE_TAILORED_RESUME
+    # must be present.
+    bullet_marker = "223% average improvement in funnel conversion"
+    assert bullet_marker in text, (
+        f"Tailored bullet substring {bullet_marker!r} missing from rendered "
+        f"DOCX. Renderer likely dropped role bullets."
+    )
+
+
+def test_render_cover_letter_docx_contains_tailored_paragraphs(tmp_path):
+    """M23: cover letter DOCX must contain the tailored paragraph body,
+    not just the applicant name header. If _create_cover_letter_docx
+    silently dropped the paragraphs, this test fails."""
+    _, docx_path = render_cover_letter(
+        cover_letter=SAMPLE_COVER_LETTER,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+    text = _docx_full_text(docx_path)
+
+    # A distinctive phrase from the first SAMPLE_COVER_LETTER paragraph.
+    marker = "Telecom offer implementation is one of the more technically demanding"
+    assert marker in text, (
+        f"Cover-letter tailored paragraph missing from rendered DOCX. "
+        f"First 400 chars:\n{text[:400]}"
+    )
+    # And a second-paragraph phrase to prove multi-paragraph rendering.
+    marker2 = "generated $1M+ in pipeline"
+    assert marker2 in text, (
+        f"Second cover-letter paragraph missing. First 400 chars:\n{text[:400]}"
+    )
+
+
+# ── M21: chdir render test ────────────────────────────────────────────────────
+# Prior guard (`test_render_resume_pdf_uses_root_based_path` in
+# test_review_fixes.py) is a source-text grep — it lints for the _ROOT/
+# pattern but does NOT verify runtime behavior. A CWD-relative regression
+# under a different spelling (e.g. `os.path.join(os.getcwd(), lane[...])`)
+# would still ship.
+#
+# This test chdirs into a scratch dir, then invokes render_resume — a
+# renderer that reads its template relative to CWD (not _ROOT) crashes with
+# FileNotFoundError. Passes today because renderer resolves against _ROOT.
+
+
+@pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
+def test_render_resume_finds_template_from_arbitrary_cwd(tmp_path, monkeypatch):
+    """M21: render_resume must resolve its template against the repo root,
+    not the process CWD. Chdir into a scratch dir with no template beneath
+    it and verify the render still succeeds.
+
+    Mutation check: revert renderer.py's template_path to
+    `Path(lane['template'])`. This test fails with FileNotFoundError,
+    proving the guard is behavioral rather than source-grep."""
+    # A scratch dir with NO templates/ subtree.
+    scratch = tmp_path / "scratch_cwd"
+    scratch.mkdir()
+    output_dir = tmp_path / "out"
+
+    monkeypatch.chdir(scratch)
+
+    pdf_path, docx_path = render_resume(
+        tailored_resume=SAMPLE_TAILORED_RESUME,
+        lane=SAMPLE_LANE,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=output_dir,
+    )
+    # DOCX must exist under output_dir; renderer must NOT have raised
+    # FileNotFoundError on the template.
+    assert docx_path.exists(), (
+        f"DOCX not rendered from arbitrary CWD — template likely resolved "
+        f"against CWD instead of _ROOT.\n"
+        f"CWD was: {scratch}\n"
+        f"Expected output: {docx_path}"
+    )
+    assert docx_path.suffix == ".docx"
+
+
 if __name__ == "__main__":
     main()

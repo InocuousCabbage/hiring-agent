@@ -104,24 +104,72 @@ def test_attachment_list_has_four_files_per_processed_job():
     assert any(n.endswith("_cl.docx") for n in names)
 
 
-def test_send_digest_called_with_pdf_and_docx_attachments():
-    """gmail.send_digest receives both .pdf AND .docx attachments for resume + CL."""
+def test_send_digest_called_with_pdf_and_docx_attachments(monkeypatch, tmp_path):
+    """M18 behavioral: drive main.main() end-to-end and assert that its
+    digest-send branch actually invokes gmail.send_digest with both .pdf
+    AND .docx attachments per processed job.
+
+    Prior version of this test called `gmail.send_digest(...)` on a MagicMock
+    ITSELF and then asserted its own inputs — a self-fulfilling tautology that
+    never exercised main.py. Renaming the `attachments` kwarg in main.py to
+    e.g. `files` kept the old test green because it never touched main.py.
+
+    Mutation check (see PR description): temporarily rename the kwarg in
+    main.py's send_digest call site to `files=`; this test then fails on
+    `kwargs["attachments"]` KeyError, proving the guard is behavioral.
+    """
     processed = _processed_fixture()
-    attachments = _build_attachments(processed)
+
+    # Materialize the attachment paths so any downstream stat check is happy.
+    for p in processed:
+        for k in ("resume_pdf", "resume_docx", "cover_letter_pdf", "cover_letter_docx"):
+            path = p[k]
+            path = tmp_path / path.name
+            (tmp_path / path.name).write_bytes(b"PK")  # ZIP magic; enough for send
+            p[k] = path
+
+    import main as main_mod
+    import gmail.client as gmail_client_mod
 
     gmail = MagicMock()
-    gmail.send_digest(
-        to="me@example.com",
-        subject="Digest",
-        body_text="body",
-        attachments=attachments,
+    gmail.find_unprocessed_alert.return_value = {
+        "id": "msg_pipeline", "html": "<html></html>", "text": "",
+    }
+    monkeypatch.setattr(gmail_client_mod, "GmailClient", lambda: gmail)
+    monkeypatch.setattr(
+        main_mod, "parse_alert_email",
+        lambda html_body, text_body, max_jobs: [
+            {"title": "Engineer", "company": "Acme", "url": "https://example.com"}
+        ],
+    )
+    monkeypatch.setattr(main_mod, "run_pipeline", lambda **kw: (processed, [], []))
+
+    # Redirect ROOT to tmp_path with fresh config/templates copies.
+    real_root = Path(__file__).parent.parent
+    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "templates").mkdir(exist_ok=True)
+    (tmp_path / "config" / "settings.yaml").write_text(
+        (real_root / "config" / "settings.yaml").read_text()
+    )
+    (tmp_path / "templates" / "project_bank.yaml").write_text(
+        (real_root / "templates" / "project_bank.yaml").read_text()
     )
 
+    monkeypatch.setenv("MY_EMAIL", "me@example.com")
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    main_mod.main()
+
+    # Assert main.py actually called send_digest with the right kwarg shape.
     gmail.send_digest.assert_called_once()
     _, kwargs = gmail.send_digest.call_args
+    assert "attachments" in kwargs, (
+        f"main.py send_digest call missing 'attachments' kwarg — got {list(kwargs)}"
+    )
     sent = kwargs["attachments"]
-    assert len(sent) == 4
-    pdfs  = [p for p in sent if p.suffix == ".pdf"]
+    assert len(sent) == 4, f"Expected 4 attachments, got {len(sent)}: {sent}"
+    pdfs = [p for p in sent if p.suffix == ".pdf"]
     docxs = [p for p in sent if p.suffix == ".docx"]
     assert len(pdfs) == 2, f"Expected 2 PDFs, got {len(pdfs)}"
     assert len(docxs) == 2, f"Expected 2 DOCX, got {len(docxs)}"
@@ -361,16 +409,94 @@ def test_compose_digest_uses_path_suffix_check():
 
 
 def test_main_print_one_line_per_artifact_on_pdf_fallback(capsys, monkeypatch, tmp_path):
-    """M4: test-mode print should print 1 line per artifact pair when PDF is None,
-    not 2 duplicate lines naming the same DOCX path.
+    """M17 behavioral (M4): drive main.main() in --test mode with a processed
+    fixture whose PDF slots are None (the LibreOffice/docx2pdf fallback case),
+    then assert stdout does NOT print the DOCX path twice as if it were a
+    distinct PDF + DOCX pair.
 
-    Source-level check: detect that main.py treats None-pdf as a fallback case
-    rather than printing pdf and docx slots as if they were two distinct files.
+    Prior version asserted `"is None" in main_source` — vacuously true
+    (5 unrelated occurrences of "is None" in main.py mean it stays green
+    even if the entire fallback-print block is deleted). This test drives
+    the real print branch and diffs the captured lines.
+
+    Mutation check (see PR description): temporarily reintroduce the M4 bug —
+    have the fallback branch print `resume_docx` on both the "Resume PDF" and
+    "Resume DOCX" lines. This test then fails on the "expected exactly one
+    DOCX line per artifact" assertion.
     """
-    main_source = (ROOT / "src" / "main.py").read_text()
-    # Must check for None on the pdf slot somewhere in the test-mode block
-    assert "is None" in main_source or "if p[\"resume_pdf\"]" in main_source or "p.get(\"resume_pdf\")" in main_source, (
-        "main.py test-mode print should detect None pdf slot for fallback messaging"
+    import main as main_mod
+    import gmail.client as gmail_client_mod
+
+    # Materialize the DOCX-only fixture (PDFs are None — fallback mode).
+    resume_docx = tmp_path / "acme_resume.docx"
+    cl_docx = tmp_path / "acme_cl.docx"
+    resume_docx.write_bytes(b"PK")
+    cl_docx.write_bytes(b"PK")
+
+    processed = [{
+        "title": "Engineer",
+        "company": "Acme",
+        "url": "https://example.com",
+        "lane": "pmm",
+        "resume_pdf": None,           # fallback — no PDF converter
+        "resume_docx": resume_docx,
+        "cover_letter_pdf": None,     # fallback — no PDF converter
+        "cover_letter_docx": cl_docx,
+        "hiring_manager": None,
+        "apply_result": None,
+    }]
+
+    # Redirect ROOT so the --test mode reads settings from tmp.
+    real_root = Path(__file__).parent.parent
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "templates").mkdir(exist_ok=True)
+    (tmp_path / "test_data").mkdir(exist_ok=True)
+    (tmp_path / "config" / "settings.yaml").write_text(
+        (real_root / "config" / "settings.yaml").read_text()
+    )
+    (tmp_path / "templates" / "project_bank.yaml").write_text(
+        (real_root / "templates" / "project_bank.yaml").read_text()
+    )
+    # sample_alert.eml is read once (before parse_alert_from_eml is stubbed).
+    (tmp_path / "test_data" / "sample_alert.eml").write_text("")
+
+    monkeypatch.setattr(main_mod, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        main_mod, "parse_alert_from_eml",
+        lambda eml_path, max_jobs=5: [
+            {"title": "Engineer", "company": "Acme", "url": "https://example.com"}
+        ],
+    )
+    monkeypatch.setattr(main_mod, "run_pipeline", lambda **kw: (processed, [], []))
+    # --test mode instantiates a _NoopGmailClient inline; no patch needed.
+    monkeypatch.setattr(sys, "argv", ["main.py", "--test"])
+
+    main_mod.main()
+
+    captured = capsys.readouterr()
+    stdout = captured.out
+
+    # The processed job's DOCX line MUST appear (it's the artifact we shipped).
+    assert "acme_resume.docx" in stdout, (
+        f"Fallback branch should print the resume DOCX path. stdout:\n{stdout}"
+    )
+    assert "acme_cl.docx" in stdout, (
+        f"Fallback branch should print the cover-letter DOCX path. stdout:\n{stdout}"
+    )
+    # And each DOCX path must appear EXACTLY ONCE — not once labelled 'PDF'
+    # and once labelled 'DOCX' (the M4 double-line bug).
+    resume_count = stdout.count(str(resume_docx))
+    cl_count = stdout.count(str(cl_docx))
+    assert resume_count == 1, (
+        f"resume DOCX printed {resume_count} times (expected 1 — double-line "
+        f"bug reintroduced?):\n{stdout}"
+    )
+    assert cl_count == 1, (
+        f"cover-letter DOCX printed {cl_count} times (expected 1):\n{stdout}"
+    )
+    # And the DOCX-fallback marker text (from the fallback branch) is present.
+    assert "no PDF converter" in stdout, (
+        f"Fallback branch should signal 'no PDF converter'. stdout:\n{stdout}"
     )
 
 
