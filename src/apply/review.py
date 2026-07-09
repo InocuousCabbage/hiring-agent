@@ -599,11 +599,24 @@ def execute_confirmed_submit(
             state = None
     tmp_path: Path | None = None
     if state:
+        # Iter-4 (Phase 3 xhigh iter-4): symmetric with the LocalTransport
+        # iter-3 F1 fix — mkstemp creates the file BEFORE write_text/chmod
+        # runs. If either subsequent step raises, the tempfile carries
+        # partial-or-full session cookie contents and would orphan on disk
+        # (this block sits OUTSIDE the outer try/finally below). Wrap in
+        # a local try/except that unlinks on failure BEFORE re-raising.
         fd, name = tempfile.mkstemp(suffix=".storage_state.json")
         os.close(fd)
         tmp_path = Path(name)
-        tmp_path.write_text(json.dumps(state))
-        os.chmod(tmp_path, 0o600)
+        try:
+            tmp_path.write_text(json.dumps(state))
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
 
     result: Any
     try:
