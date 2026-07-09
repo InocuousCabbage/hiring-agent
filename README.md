@@ -30,36 +30,34 @@ hiring-agent/
 │   └── project_bank.yaml      # Your real projects + metrics
 ├── src/
 │   ├── main.py                # Orchestrator — runs the full pipeline
-│   ├── gmail/
-│   │   ├── __init__.py
-│   │   ├── client.py          # Gmail API auth + read/send/label
-│   │   └── digest.py          # Compose + send the digest email
-│   ├── parser/
-│   │   ├── __init__.py
-│   │   └── email_parser.py    # Extract job entries from alert HTML
-│   ├── scraper/
-│   │   ├── __init__.py
-│   │   └── jd_fetcher.py      # Fetch + clean job descriptions
-│   ├── classifier/
-│   │   ├── __init__.py
-│   │   └── lane_selector.py   # PMM vs Content vs MOps classification
-│   ├── tailor/
-│   │   ├── __init__.py
-│   │   ├── resume_tailor.py   # Resume tailoring via Claude API
-│   │   └── cover_letter.py    # Cover letter generation
-│   ├── pdf_gen/
-│   │   ├── __init__.py
-│   │   └── renderer.py        # DOCX template fill → PDF export
-│   └── qa/
-│       ├── __init__.py
-│       └── checker.py         # QA checklist + auto-fix loop
-├── tests/
-│   └── ...
+│   ├── llm.py                 # Claude API + Claude-CLI subprocess wrapper
+│   ├── gmail/                 # Gmail API auth + read/send/label + digest
+│   ├── parser/                # Extract job entries from alert HTML
+│   ├── scraper/               # Fetch + clean job descriptions
+│   ├── classifier/            # PMM vs Content vs MOps classification
+│   ├── tailor/                # Resume tailoring + cover letter generation
+│   ├── pdf_gen/               # DOCX build + LibreOffice PDF export
+│   ├── qa/                    # QA checklist + auto-fix loop
+│   ├── contacts/              # Hiring-manager finder (opt-in)
+│   ├── browser/               # Shared Playwright session (Phase 3)
+│   └── apply/                 # Auto-apply pipeline (Phase 3, opt-in)
+│       ├── adapters/          # Per-ATS adapters (greenhouse, computer_use)
+│       ├── migrations/        # SQLite schema (applied_jobs, review_pending)
+│       ├── transport/         # Local + Browserbase Playwright transport
+│       ├── bootstrap.py       # `python -m src.apply.bootstrap <ats>`
+│       ├── dedup.py           # applied_jobs + `--unblock` CLI
+│       ├── dispatcher.py      # URL → ATS routing
+│       ├── review.py          # YES/NO review loop + poller
+│       └── ...
+├── tests/                     # Offline unit + integration + apply/ live gates
+├── docs/
+│   └── apply-flow.md          # Auto-apply operator manual
 ├── requirements.txt
 ├── .env.example
+├── SETUP.md
 └── deploy/
     ├── Dockerfile
-    └── cron_entry.sh
+    └── cron_entry.sh          # Cron entrypoint (flock-guarded)
 ```
 
 ## Setup
