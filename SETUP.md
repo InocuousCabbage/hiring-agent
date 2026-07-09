@@ -144,11 +144,12 @@ Open `.env` in a text editor and fill in:
 
 # Your Gmail address (same one from Step 4)
 MY_EMAIL=your-email@gmail.com
-
-# These match hiring.cafe's email format — usually don't need to change
-ALERT_SENDER=ali@hiring.cafe
-ALERT_SUBJECT_CONTAINS=HiringCafe
 ```
+
+Alert matching (sender / subject / processed-label) is configured in
+`config/settings.yaml` under the `gmail:` block — not via env vars.
+Defaults match hiring.cafe's email format and usually don't need to
+change.
 
 ---
 
