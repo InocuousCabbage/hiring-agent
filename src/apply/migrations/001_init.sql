@@ -31,11 +31,25 @@ CREATE TABLE IF NOT EXISTS applied_jobs (
     submitted_at              TEXT
 );
 
--- HARD dedup: SQLite treats NULL as distinct from NULL under UNIQUE, which is
--- what we want — a missing ats_job_id must NOT collide with another missing
--- one. The job_url fallback in was_applied() handles the None-triple case.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_applied_jobs_hard
-    ON applied_jobs (company, ats_domain, ats_job_id);
+-- HARD dedup: the CURRENT canonical UNIQUE index is on (ats_domain,
+-- ats_job_id) — see migration 003 for the H9 rationale (raw company
+-- weakens the key with spelling variance like 'Acme' vs 'Acme, Inc.').
+--
+-- xhigh-H6: the OLD (company, ats_domain, ats_job_id) index is no longer
+-- created here. Pre-fix 001 created it and 003 dropped it; on a warm
+-- upgrade to 003's new applicant-aware DELETE partition, 001's IF NOT
+-- EXISTS would silently recreate the old index if it had been dropped and
+-- new rows had landed under the v2 index that violated the v1 shape (two
+-- applicants at the same posting) — causing a UNIQUE constraint failure
+-- at every subsequent DedupDB open. Removing the old-index CREATE from
+-- 001 closes that upgrade cliff; 003 (applied via
+-- ``_apply_migration_003_gated`` in dedup.py) is the sole source of truth
+-- for the hard-dedup index shape.
+--
+-- Fresh DBs get the v2 index directly from 003; there is no window in
+-- which a fresh DB carries the deprecated v1 index.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_applied_jobs_hard_v2
+    ON applied_jobs (ats_domain, ats_job_id);
 
 -- SOFT dedup surface: fast lookup by normalized (company, role) pair.
 CREATE INDEX IF NOT EXISTS ix_applied_jobs_soft

@@ -1,10 +1,14 @@
 """src/apply/dedup.py — S5 SQLite-backed dedup DB.
 
 Owns:
-    * `DedupDB` class — hard-dedup + soft-warn + rate-limit surface + review_pending.
+    * `DedupDB` class — hard-dedup + soft-warn + rate-limit surface.
     * `AlreadyAppliedError` — raised on hard-dup insert.
     * `normalize_company` / `normalize_role` — pure normalizers (importable by S8/S12).
     * CLI: `python -m src.apply.dedup --unblock <job_url>`.
+
+Note: the ``review_pending`` table is CREATED by the 001 migration in this
+module, but its Python-side CRUD lives in ``src/apply/state_store.ReviewStore``
+— a single write-path avoids two drifting layers over one table (L3 audit).
 
 Consumed by S8 (adapters), S12 (review loop), S14 (digest), S17 (seam-wiring).
 See master-plan §4.6 (schema), §4.7 (config keys), §12 success criteria #4-5.
@@ -214,6 +218,11 @@ _MIGRATION_SQL_PATH = Path(__file__).parent / "migrations" / "001_init.sql"
 # Phase 1 (H4/M1/M12) additive columns. Kept as a separate migration file so
 # `test_h1_schema_reconciliation.py`'s byte-shape of 001 remains stable.
 _MIGRATION_002_SQL_PATH = Path(__file__).parent / "migrations" / "002_review_pending_paths.sql"
+# Phase 2 (H9) normalized hard-dedup index. Drops raw company from the
+# UNIQUE key so spelling variance ('Acme' vs 'Acme, Inc.') at the same
+# (ats_domain, ats_job_id) posting can no longer slip through the hard
+# gate. Kept as a separate migration so 001's byte-shape stays stable.
+_MIGRATION_003_SQL_PATH = Path(__file__).parent / "migrations" / "003_normalized_hard_dedup.sql"
 
 
 def _strip_sql_comments(raw: str) -> str:
@@ -233,22 +242,57 @@ def _strip_sql_comments(raw: str) -> str:
     return "\n".join(kept)
 
 
-def _execute_migrations(conn: sqlite3.Connection) -> None:
-    """Run 001 as a script (idempotent CREATE IF NOT EXISTS), then run each
-    ADD COLUMN statement from 002 individually so we can swallow the
-    duplicate-column OperationalError that sqlite raises on ALREADY-added
-    columns. Keeps the migration idempotent across cold + warm starts.
+# xhigh-H11: SQLite emits idempotent-DDL errors in a small set of well-known
+# shapes. Pre-fix matched on the bare 'already exists' substring which
+# false-positived on unrelated errors like 'output file already exists' from
+# a disk I/O failure. Post-fix uses regex anchors on the SQLite-specific
+# phrasing so unrelated errors propagate unswallowed.
+_IDEMPOTENT_DDL_ERROR_RE = re.compile(
+    r"("
+    r"duplicate column name"       # ALTER TABLE ADD COLUMN idempotent
+    r"|(?:^|\W)index \S+ already exists"   # CREATE INDEX IF NOT EXISTS re-run
+    r"|(?:^|\W)table \S+ already exists"   # CREATE TABLE IF NOT EXISTS re-run
+    r"|(?:^|\W)trigger \S+ already exists" # CREATE TRIGGER IF NOT EXISTS re-run
+    r"|(?:^|\W)view \S+ already exists"    # CREATE VIEW IF NOT EXISTS re-run
+    r"|no such index"              # DROP INDEX IF EXISTS on absent index
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_idempotent_ddl_error(exc: sqlite3.OperationalError) -> bool:
+    """xhigh-H11: tightened match. True iff the OperationalError is one of
+    the specific SQLite idempotent-DDL variants — NOT any error whose
+    message loosely contains 'already exists'.
     """
-    conn.executescript(_MIGRATION_SQL_PATH.read_text(encoding="utf-8"))
-    if not _MIGRATION_002_SQL_PATH.exists():
-        return
-    raw = _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8")
-    # SD1 fix: strip `--` comments BEFORE splitting on `;`. The pre-fix code
-    # split first and used `stmt.startswith("--")` as a skip-guard — but the
-    # split delivered a chunk that contained the file's header comments
-    # PLUS the first ALTER, whose first character was `-`. That skipped
-    # `ADD COLUMN resume_path` entirely; only warm starts saw the column
-    # (because ReviewStore.__init__ also ALTERed via its own path).
+    return bool(_IDEMPOTENT_DDL_ERROR_RE.search(str(exc)))
+
+
+def _apply_migration_statements(
+    conn: sqlite3.Connection,
+    raw: str,
+    *,
+    swallow_idempotent: bool = True,
+) -> None:
+    """Execute a migration SQL string statement-by-statement.
+
+    xhigh-H10: NEVER call ``executescript`` — it implicitly commits the outer
+    transaction, which breaks a caller-supplied BEGIN..ROLLBACK boundary.
+    Per-statement execution keeps everything atomic within the caller's
+    transaction so a partial failure rolls back cleanly.
+
+    xhigh-H11: when ``swallow_idempotent`` is True, only OperationalError
+    variants matching the ``_IDEMPOTENT_DDL_ERROR_RE`` regex are swallowed —
+    any other OperationalError propagates so partially-migrated state
+    doesn't go undetected.
+
+    iter2-H3: ``sqlite3.IntegrityError`` from CREATE UNIQUE INDEX also
+    swallows-with-warning when swallow_idempotent is True. Legacy DBs with
+    multi-applicant rows at the same posting cannot create the v2 index;
+    without this catch, DedupDB init crashes permanently on that class of
+    upgrade. The application layer's ``was_applied`` predicate still
+    enforces the (ats_domain, ats_job_id) shape at query time.
+    """
     stripped = _strip_sql_comments(raw)
     for stmt in (s.strip() for s in stripped.split(";")):
         if not stmt:
@@ -256,13 +300,154 @@ def _execute_migrations(conn: sqlite3.Connection) -> None:
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError as exc:
-            # Duplicate column on a warm start — expected + safe. Any other
-            # OperationalError (locked DB, no such table, disk I/O, malformed
-            # DB) is a real fault we DO want to see: re-raise so the caller
-            # doesn't silently continue against a partially-migrated schema.
-            msg = str(exc).lower()
-            if "duplicate column" in msg or "already exists" in msg:
+            if swallow_idempotent and _is_idempotent_ddl_error(exc):
                 continue
+            raise
+        except sqlite3.IntegrityError as exc:
+            # iter2-H3: only swallow IntegrityError from CREATE UNIQUE
+            # INDEX on a legacy DB with pre-existing conflicts. Any other
+            # IntegrityError (INSERT, UPDATE) is a real fault we DO want
+            # to see — filter by statement prefix.
+            if swallow_idempotent and stmt.lstrip().upper().startswith("CREATE UNIQUE INDEX"):
+                import structlog
+                _log = structlog.get_logger("apply.dedup.migration")
+                _log.warning(
+                    "apply.dedup.migration_index_conflict",
+                    reason=(
+                        "legacy rows collide under the new UNIQUE index; "
+                        "index skipped, code-level was_applied predicate "
+                        "still enforces uniqueness at query time"
+                    ),
+                    stmt=stmt,
+                    error=str(exc),
+                )
+                continue
+            raise
+
+
+# xhigh-H6: schema_migrations tracker so destructive migration steps only
+# fire on the first apply. The table itself is bootstrapped inside the same
+# transaction (CREATE IF NOT EXISTS) and each migration id is INSERTed with
+# INSERT OR IGNORE so re-application is a no-op.
+_SCHEMA_MIGRATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS schema_migrations ("
+    "  migration_id TEXT PRIMARY KEY,"
+    "  applied_at   TEXT NOT NULL"
+    ")"
+)
+
+
+def _migration_already_applied(conn: sqlite3.Connection, migration_id: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ? LIMIT 1",
+        (migration_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def _record_migration_applied(conn: sqlite3.Connection, migration_id: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) "
+        "VALUES (?, ?)",
+        (migration_id, _utcnow_iso()),
+    )
+
+
+def _execute_migrations(conn: sqlite3.Connection) -> None:
+    """Apply 001 + 002 + 003 statement-by-statement inside a single caller-
+    controlled transaction (xhigh-H10). 003's destructive DELETE step is
+    gated by ``schema_migrations`` so it fires exactly once per DB
+    (xhigh-H6). Idempotent across cold + warm starts.
+    """
+    # 001 — canonical schema. Runs statement-by-statement so a caller
+    # BEGIN..ROLLBACK stays atomic (xhigh-H10). Errors like "table already
+    # exists" are the warm-start no-op signal.
+    _apply_migration_statements(
+        conn, _MIGRATION_SQL_PATH.read_text(encoding="utf-8"),
+    )
+
+    # Bootstrap the migration tracker BEFORE reading it below.
+    conn.execute(_SCHEMA_MIGRATIONS_DDL)
+
+    # 002 — additive columns (review_pending resume/cover/applicant/etc.).
+    if _MIGRATION_002_SQL_PATH.exists():
+        _apply_migration_statements(
+            conn, _MIGRATION_002_SQL_PATH.read_text(encoding="utf-8"),
+        )
+        _record_migration_applied(conn, "002_review_pending_paths")
+
+    # 003 — H9 hard-dedup index swap + one-shot DELETE. The DELETE is
+    # xhigh-H6-gated by schema_migrations so it can NEVER re-run and
+    # partitions by applicant so multi-user rows are not clobbered.
+    if _MIGRATION_003_SQL_PATH.exists():
+        _apply_migration_003_gated(conn)
+
+
+def _apply_migration_003_gated(conn: sqlite3.Connection) -> None:
+    """Apply migration 003 in two phases:
+
+    Phase 1 (xhigh-H6 one-shot): the destructive DELETE runs iff the
+    ``003_normalized_hard_dedup`` marker is absent from ``schema_migrations``.
+    The DELETE partition also includes ``applicant`` so multi-user rows at
+    the same (ats_domain, ats_job_id) are preserved.
+
+    Phase 2 (idempotent-DDL): the CREATE/DROP INDEX statements are always
+    reapplied — they're already no-ops on warm starts (CREATE ... IF NOT
+    EXISTS + DROP ... IF EXISTS).
+    """
+    marker = "003_normalized_hard_dedup"
+    if not _migration_already_applied(conn, marker):
+        # xhigh-H6: applicant-aware partition. Keep the earliest row PER
+        # (applicant, ats_domain, ats_job_id) rather than globally per
+        # (ats_domain, ats_job_id) — otherwise applicant B's row at the
+        # same posting as applicant A's would be silently discarded.
+        conn.execute(
+            "DELETE FROM applied_jobs "
+            "WHERE ats_domain IS NOT NULL "
+            "  AND ats_job_id IS NOT NULL "
+            "  AND id NOT IN ("
+            "      SELECT MIN(id) FROM applied_jobs "
+            "      WHERE ats_domain IS NOT NULL AND ats_job_id IS NOT NULL "
+            "      GROUP BY applicant, ats_domain, ats_job_id"
+            "  )"
+        )
+        _record_migration_applied(conn, marker)
+
+    # Idempotent index DDL. Runs on every open so the constraint is always
+    # in place even if the marker row somehow existed without the index.
+    #
+    # iter2-H3: catch sqlite3.IntegrityError (NOT OperationalError) that
+    # fires when a legacy DB carries multi-applicant rows at the same
+    # (ats_domain, ats_job_id) posting — allowed under the pre-Phase-2
+    # (company, ats_domain, ats_job_id) UNIQUE index but rejected under
+    # the v2 (ats_domain, ats_job_id) key. Pre-fix uncaught → DedupDB
+    # init crashes permanently. Post-fix logs the collision and skips
+    # the CREATE (multi-applicant DB persists without the v2 index; the
+    # code-level ``was_applied`` predicate still enforces the new shape).
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_applied_jobs_hard_v2 "
+            "ON applied_jobs (ats_domain, ats_job_id)"
+        )
+    except sqlite3.OperationalError as exc:
+        if not _is_idempotent_ddl_error(exc):
+            raise
+    except sqlite3.IntegrityError as exc:
+        # iter2-H3: multi-applicant collision. Log + continue so operators
+        # can triage rather than facing an unrecoverable DedupDB init crash.
+        # The applied_jobs table stays queryable; downstream was_applied
+        # predicates still enforce the (ats_domain, ats_job_id) shape.
+        import structlog
+        _log = structlog.get_logger("apply.dedup.migration")
+        _log.warning(
+            "apply.dedup.migration_003_index_conflict",
+            reason="legacy multi-applicant rows collide under v2 index",
+            error=str(exc),
+        )
+    try:
+        conn.execute("DROP INDEX IF EXISTS ux_applied_jobs_hard")
+    except sqlite3.OperationalError as exc:
+        if not _is_idempotent_ddl_error(exc):
             raise
 
 
@@ -270,7 +455,12 @@ def _execute_migrations(conn: sqlite3.Connection) -> None:
 
 
 class DedupDB:
-    """SQLite-backed dedup + rate-limit + review-pending store.
+    """SQLite-backed dedup + rate-limit surface.
+
+    Owns hard-dedup (``applied_jobs`` UNIQUE index), soft-warn, and per-ATS
+    rate-limit counts. The ``review_pending`` table lives in the same DB file
+    but is written through ``src/apply/state_store.ReviewStore`` (L3 audit:
+    two write paths for one table is a landmine).
 
     The class is intentionally small: each method opens its own connection via
     `with self._connect() as conn, conn:`. If the S8 fill loop shows this hot,
@@ -332,23 +522,57 @@ class DedupDB:
         ats_domain: str | None,
         ats_job_id: str | None,
         job_url: str,
+        *,
+        applicant: str | None = None,
     ) -> bool:
-        """True iff a prior row matches the HARD triple, OR (fallback) the
-        exact ``job_url`` when any part of the triple is None. Never raises."""
+        """True iff a prior row matches the HARD posting identity
+        ``(ats_domain, ats_job_id)``, OR (fallback) the exact ``job_url`` when
+        either part of the pair is None. Never raises.
+
+        H9: the raw ``company`` argument is kept in the signature for
+        backward-compat (all in-tree callers still pass it) but is NOT part
+        of the primary predicate. The ATS posting identity is
+        ``(ats_domain, ats_job_id)``; raw-company equality only weakens the
+        key, letting spelling variance ('Acme' vs 'Acme, Inc.') at the same
+        posting slip through the gate. The 003 UNIQUE index
+        ``ux_applied_jobs_hard_v2`` enforces the same shape at the write
+        site.
+
+        xhigh-H7/H13: ``applicant`` is a keyword-only filter that gates
+        cross-user leaks — applicant A's YES-branch precheck must NOT match
+        applicant B's row on the same posting. When ``applicant`` is None
+        (backward-compat) the filter is skipped.
+        """
         try:
             with self._connect() as conn, conn:
-                if company and ats_domain and ats_job_id:
-                    cur = conn.execute(
-                        "SELECT 1 FROM applied_jobs "
-                        "WHERE company = ? AND ats_domain = ? AND ats_job_id = ? "
-                        "LIMIT 1",
-                        (company, ats_domain, ats_job_id),
-                    )
+                if ats_domain and ats_job_id:
+                    if applicant is not None:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs "
+                            "WHERE ats_domain = ? AND ats_job_id = ? "
+                            "  AND applicant = ? "
+                            "LIMIT 1",
+                            (ats_domain, ats_job_id, applicant),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs "
+                            "WHERE ats_domain = ? AND ats_job_id = ? "
+                            "LIMIT 1",
+                            (ats_domain, ats_job_id),
+                        )
                 else:
-                    cur = conn.execute(
-                        "SELECT 1 FROM applied_jobs WHERE job_url = ? LIMIT 1",
-                        (job_url,),
-                    )
+                    if applicant is not None:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs "
+                            "WHERE job_url = ? AND applicant = ? LIMIT 1",
+                            (job_url, applicant),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "SELECT 1 FROM applied_jobs WHERE job_url = ? LIMIT 1",
+                            (job_url,),
+                        )
                 return cur.fetchone() is not None
         except sqlite3.Error:
             # Contract: never raises. If the DB is unavailable, treat as
@@ -422,6 +646,16 @@ class DedupDB:
         ats_domain = _extract_ats_domain(apply_url)
         ats_job_id = _extract_ats_job_id(apply_url)
 
+        # B2 fix: coerce Path values to str before binding. ``ApplyResult``
+        # types these as ``Path | None``; sqlite3 raises
+        # ``ProgrammingError: type PosixPath is not supported`` at bind time
+        # (parameters 14 + 15). Idempotent when the caller already passes a
+        # str; ``None`` and falsy values collapse to ``None``.
+        confirmation_screenshot_str = (
+            str(confirmation_screenshot) if confirmation_screenshot else None
+        )
+        trace_path_str = str(trace_path) if trace_path else None
+
         row = (
             applicant,
             company,
@@ -436,8 +670,8 @@ class DedupDB:
             application_id,
             status,
             review_id,
-            confirmation_screenshot,
-            trace_path,
+            confirmation_screenshot_str,
+            trace_path_str,
             _utcnow_iso(),
             submitted_at,
         )
@@ -473,107 +707,6 @@ class DedupDB:
                 (job_url,),
             )
             return int(cur.rowcount)
-
-    # ── review_pending ──
-
-    def insert_review_pending(
-        self,
-        *,
-        review_id: str,
-        job_url: str,
-        apply_url: str,
-        company: str,
-        role_title: str,
-        ats: str,
-        screenshot_path: str,
-        trace_path: str | None,
-        gmail_thread_id: str | None,
-    ) -> None:
-        """Insert a row into ``review_pending``. The Gmail review loop (S12)
-        calls this when an apply requires human review.
-
-        H1 fix: the reconciled schema uses ``filled_at`` and ``first_sent_at``
-        in place of the old ``created_at``. Both fall to _utcnow_iso() here
-        since the row is inserted immediately after the review email is sent.
-        """
-        now = _utcnow_iso()
-        with self._connect() as conn, conn:
-            conn.execute(
-                "INSERT INTO review_pending ("
-                "review_id, job_url, apply_url, company, role_title, ats, "
-                "filled_at, screenshot_path, trace_path, "
-                "first_sent_at, last_repinged_at, repings_sent, "
-                "gmail_thread_id, resolution, resolved_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    review_id,
-                    job_url,
-                    apply_url,
-                    company,
-                    role_title,
-                    ats,
-                    now,
-                    screenshot_path,
-                    trace_path,
-                    now,
-                    None,
-                    0,
-                    gmail_thread_id,
-                    None,
-                    None,
-                ),
-            )
-
-    def get_review_pending(self, review_id: str) -> dict | None:
-        """Return the ``review_pending`` row for ``review_id`` as a dict, or None."""
-        with self._connect() as conn, conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT * FROM review_pending WHERE review_id = ?",
-                (review_id,),
-            )
-            row = cur.fetchone()
-        return dict(row) if row is not None else None
-
-    def list_pending_reviews(self) -> list[dict]:
-        """Return all rows where ``resolution IS NULL``, oldest first.
-
-        H1 fix: ordering uses ``first_sent_at`` (post-reconciliation column
-        name) instead of the retired ``created_at``.
-        """
-        with self._connect() as conn, conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT * FROM review_pending "
-                "WHERE resolution IS NULL "
-                "ORDER BY first_sent_at ASC"
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-    def update_review_resolution(
-        self,
-        review_id: str,
-        resolution: str,
-        last_repinged_at: str | None = None,
-    ) -> None:
-        """Set the resolution (and optionally the last-repinged timestamp) for
-        the given ``review_id``."""
-        with self._connect() as conn, conn:
-            if last_repinged_at is not None:
-                conn.execute(
-                    "UPDATE review_pending "
-                    "SET resolution = ?, last_repinged_at = ? "
-                    "WHERE review_id = ?",
-                    (resolution, last_repinged_at, review_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE review_pending "
-                    "SET resolution = ? "
-                    "WHERE review_id = ?",
-                    (resolution, review_id),
-                )
-
 
 # ── CLI: `python -m src.apply.dedup --unblock <job_url>` ─────────────────────
 

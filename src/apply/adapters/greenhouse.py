@@ -631,6 +631,169 @@ def _apply_result_failure(
     )
 
 
+# ── B3 escalation: record-with-fallback ──────────────────────────────────────
+
+
+def _record_or_escalate(
+    dedup: Any,
+    result: "ApplyResult",
+    *,
+    applicant: str,
+    company: str,
+    role_title: str,
+    job_url: str,
+) -> "ApplyResult":
+    """Record a DOM-verified submission and escalate on record failure.
+
+    B3 audit finding (2026-07-08): the greenhouse adapter used to wrap
+    ``ctx.dedup.record(...)`` in a blanket ``try/except Exception`` that
+    logged an ``apply.dedup.record_failed`` warning and returned the
+    original ``status='submitted'`` result. When the record failed
+    (locked DB, B2 Path bind failure, disk I/O, permissions), the next
+    run's ``was_applied`` precheck missed and the agent silently re-applied
+    to the same posting.
+
+    Post-fix behavior:
+
+    * On success — return the original ``result`` unchanged. The
+      applied_jobs row landed; the caller sees the DOM-verified submit.
+    * On ``AlreadyAppliedError`` — return the original ``result``. This
+      is an idempotent replay (row already recorded on an earlier run);
+      preserving ``status='submitted'`` matches the prior behavior of
+      ``apply.dedup_hit`` and avoids double-warning the operator.
+    * On any other Exception — emit ``apply.dedup.record_failed.escalated``
+      at ``log.error`` and return a NEW ``ApplyResult`` with
+      ``status='submitted_unrecorded'``. The distinct status is what the
+      next run's precheck + digest key on so the operator sees the
+      double-submit risk explicitly.
+
+    Args:
+        dedup: The ``DedupDB`` instance (or a duck-typed test double).
+        result: The DOM-verified ``ApplyResult`` from the adapter.
+        applicant: Applicant slug (matches ``DedupDB.record`` signature).
+        company: Raw company string from the job scrape.
+        role_title: Raw role title from the job scrape.
+        job_url: Canonical job URL.
+
+    Returns:
+        Either ``result`` (success / already_applied) or a new
+        ``ApplyResult`` with ``status='submitted_unrecorded'`` carrying
+        the same DOM-verified evidence (apply_url, application_id,
+        screenshot, trace, submitted_at) plus a ``reason`` string that
+        names the underlying exception type.
+
+    xhigh-BLOCKING/H1: when ``dedup`` is ``None`` (the YES-branch replay
+    path via ``review._AutoModeCtx`` which explicitly sets ``ctx.dedup =
+    None`` so the outer ``execute_confirmed_submit`` owns the record()
+    call), this helper returns ``result`` unchanged. Pre-fix, the blanket
+    ``except Exception`` swallowed the ``AttributeError`` from ``None.record``
+    and returned ``submitted_unrecorded`` with a bogus 'AttributeError'
+    reason — both mislabeling the outcome AND double-taxing the record
+    responsibility (execute_confirmed_submit also calls dedup_db.record()).
+    """
+    if dedup is None:
+        # YES-branch replay — the caller (execute_confirmed_submit) owns
+        # the record() call. Return the DOM-verified success unchanged.
+        return result
+    try:
+        dedup.record(
+            result,
+            applicant,
+            company,
+            role_title,
+            job_url,
+        )
+    except AlreadyAppliedError:
+        log.info(
+            "apply.dedup_hit",
+            extra={"ats": _ADAPTER_NAME, "reason": "record_race"},
+        )
+        return result
+    except Exception as exc:
+        # Escalate loud: this is the fail-open path the old blanket-catch
+        # silently absorbed. Operators MUST see this in error logs.
+        log.error(
+            "apply.dedup.record_failed.escalated",
+            extra={
+                "ats": _ADAPTER_NAME,
+                "exc_type": type(exc).__name__,
+                "job_url": job_url,
+                "application_id_present": bool(
+                    getattr(result, "application_id", None)
+                ),
+            },
+        )
+        reason_prefix = "record_failed"
+        prior_reason = getattr(result, "reason", None)
+        reason = (
+            f"{reason_prefix}: {type(exc).__name__} — {prior_reason}"
+            if prior_reason
+            else f"{reason_prefix}: {type(exc).__name__}"
+        )
+        return ApplyResult(
+            status="submitted_unrecorded",
+            ats=getattr(result, "ats", _ADAPTER_NAME),
+            apply_url=getattr(result, "apply_url", None),
+            application_id=getattr(result, "application_id", None),
+            confirmation_screenshot=getattr(result, "confirmation_screenshot", None),
+            reason=reason,
+            human_review_url=getattr(result, "human_review_url", None),
+            submitted_at=getattr(result, "submitted_at", None),
+            trace_path=getattr(result, "trace_path", None),
+            review_id=getattr(result, "review_id", None),
+        )
+    return result
+
+
+def _soft_warn_lookup(dedup: Any, company: str, role_title: str) -> list[dict]:
+    """Soft-dup check that normalizes company/role the SAME way `record()` writes.
+
+    H8 audit finding (2026-07-08): the adapter used `.strip().lower()` at the
+    soft-warn check site, but `DedupDB.record()` writes `normalize_company` /
+    `normalize_role`. So a record of ``('Stripe, Inc.', 'Senior Data
+    Engineer')`` was never matched by a later check of the same posting — the
+    spec §13c soft-dup gate silently missed.
+
+    Post-fix: this helper normalizes inputs with the exact same functions
+    `record()` uses, then calls `soft_warn_check(company_norm, role_norm)`.
+
+    xhigh-H8: FAIL CLOSED on any exception. Pre-fix returned ``[]`` which
+    disabled the soft-warn gate silently — a broken DB would open the
+    auto-submit path. Post-fix returns a synthetic sentinel hit so
+    ``soft_warn_active=True`` at the call site routes to review.
+
+    iter2-B1: ``dedup=None`` is INTENTIONAL on the YES-branch replay path
+    (``review._AutoModeCtx`` sets ``self.dedup = None`` so the outer
+    ``execute_confirmed_submit`` owns the ``was_applied`` precheck and all
+    other gates are bypassed on the replay). Returning a synthetic hit
+    here would cascade into ``soft_dup_warn`` → ``_handle_yes`` sees
+    non-submit_ok → ``release_claim`` → 72h auto-decline of a REAL
+    operator YES. So dedup=None returns ``[]`` (skip the check) — the
+    fail-closed policy applies only to genuine exceptions from a real
+    dedup surface.
+    """
+    from src.apply.dedup import normalize_company, normalize_role
+    if dedup is None:
+        # iter2-B1: intentional pass-through for YES-branch replay.
+        return []
+    try:
+        return dedup.soft_warn_check(
+            normalize_company(company or ""),
+            normalize_role(role_title or ""),
+        ) or []
+    except Exception as exc:  # noqa: BLE001 — fail-CLOSED per xhigh-H8
+        log.warning(
+            "apply.soft_warn_lookup_failed",
+            extra={
+                "ats": _ADAPTER_NAME,
+                "exc_type": type(exc).__name__,
+                "company": company,
+            },
+        )
+        # Synthetic hit → soft_warn_active=True at the call site → review.
+        return [{"reason": "soft_warn_lookup_failed", "synthetic": True}]
+
+
 # ── Adapter class ────────────────────────────────────────────────────────────
 
 
@@ -698,15 +861,68 @@ class GreenhouseAdapter:
         # ('boards.greenhouse.io'), NOT self.name ('greenhouse'). Otherwise the
         # gate misses and the follow-up record() at end-of-flow raises
         # AlreadyAppliedError, previously swallowed silently → double-apply.
-        try:
-            hit = ctx.dedup.was_applied(
-                company,
-                _extract_ats_domain(apply_url),
-                _extract_ats_job_id(apply_url),
-                apply_url,
-            )
-        except Exception:
+        #
+        # iter3-B1: `ctx.dedup=None` is INTENTIONAL on two paths — the
+        # YES-branch replay via `review._AutoModeCtx` (execute_confirmed_submit
+        # owns the was_applied precheck; all adapter gates are meant to
+        # bypass) AND the seam's H7 dedup-init-fail-closed path (dedup is
+        # unavailable + mode is forced to review). Both paths must skip
+        # Gate-1 cleanly. Pre-iter3, iter2-H1's `except Exception` caught
+        # the AttributeError from `None.was_applied(...)` and set hit=True
+        # → adapter returned phantom `already_applied` → M4 reconciled the
+        # YES-branch as 'submitted' with no ATS click, AND the H7 path
+        # skipped stage_review (already_applied not in _STAGE_STATUSES),
+        # so the operator never saw a review email.
+        #
+        # iter2-H1: FAIL CLOSED on GENUINE exception (real dedup surface,
+        # DB error). Return status='skipped' with reason='dedup_check_failed'
+        # so the legacy digest's Skipped section surfaces it — distinct
+        # from status='already_applied' (real hit) so operators can tell
+        # a "we don't know" from a "we know it's applied".
+        #
+        # iter2-H2: pass `applicant` kwarg (with TypeError fallback for
+        # legacy doubles).
+        _ats_domain_gate1 = _extract_ats_domain(apply_url)
+        _ats_job_id_gate1 = _extract_ats_job_id(apply_url)
+        if ctx.dedup is None:
+            # iter3-B1: intentional pass-through — caller owns dedup.
             hit = False
+        else:
+            try:
+                try:
+                    hit = ctx.dedup.was_applied(
+                        company,
+                        _ats_domain_gate1,
+                        _ats_job_id_gate1,
+                        apply_url,
+                        applicant=applicant or None,
+                    )
+                except TypeError:
+                    # Older test doubles without the applicant kwarg.
+                    hit = ctx.dedup.was_applied(
+                        company,
+                        _ats_domain_gate1,
+                        _ats_job_id_gate1,
+                        apply_url,
+                    )
+            except Exception as exc:  # noqa: BLE001 — fail-CLOSED per iter2-H1
+                log.warning(
+                    "apply.gate1_dedup_check_failed_fail_closed",
+                    extra={
+                        "ats": self.name,
+                        "exc_type": type(exc).__name__,
+                    },
+                )
+                # iter3: return skipped/dedup_check_failed so the legacy
+                # digest Skipped section surfaces it — distinct from the
+                # true `already_applied` outcome below so operators can
+                # triage broken-DB events versus real duplicates.
+                return ApplyResult(
+                    status="skipped",
+                    ats=self.name,
+                    apply_url=apply_url,
+                    reason=f"dedup_check_failed: {type(exc).__name__}",
+                )
         if hit:
             log.info("apply.dedup_hit", extra={"ats": self.name})
             return ApplyResult(
@@ -720,10 +936,33 @@ class GreenhouseAdapter:
         # (e.g. 'boards.greenhouse.io'), NOT adapter.name ('greenhouse') —
         # same shape mismatch H5 fixed on was_applied. Passing self.name
         # made the query always return 0 → rate limit inoperative.
-        try:
-            today_count = ctx.dedup.count_today(_extract_ats_domain(apply_url))
-        except Exception:
+        #
+        # iter3-B1: same dedup=None handling as Gate-1 — intentional pass
+        # through on YES-branch replay / H7 fail-closed. Otherwise
+        # count_today would AttributeError.
+        if ctx.dedup is None:
             today_count = 0
+        else:
+            try:
+                today_count = ctx.dedup.count_today(_extract_ats_domain(apply_url))
+            except Exception as exc:  # noqa: BLE001
+                # iter3-M1: on a genuine dedup exception, fail-closed to
+                # skipped/rate_limit_check_failed (consistent with Gate-1's
+                # dedup_check_failed). Better to skip than double-submit or
+                # blow the rate cap.
+                log.warning(
+                    "apply.gate2_rate_check_failed_fail_closed",
+                    extra={
+                        "ats": self.name,
+                        "exc_type": type(exc).__name__,
+                    },
+                )
+                return ApplyResult(
+                    status="skipped",
+                    ats=self.name,
+                    apply_url=apply_url,
+                    reason=f"rate_limit_check_failed: {type(exc).__name__}",
+                )
         cap = int(ctx.config.get("rate_limit_per_ats_per_day", 10) or 10)
         if today_count >= cap:
             log.info(
@@ -738,13 +977,11 @@ class GreenhouseAdapter:
             )
 
         # ── Gate 3: soft-dup warn (does NOT short-circuit; just tags status) ──
-        try:
-            soft_warn = ctx.dedup.soft_warn_check(
-                (company or "").strip().lower(),
-                (role_title or "").strip().lower(),
-            ) or []
-        except Exception:
-            soft_warn = []
+        # H8 fix: route through `_soft_warn_lookup` so company/role are
+        # normalized with the SAME functions `DedupDB.record()` writes with.
+        # Previously `.strip().lower()` here missed rows recorded under the
+        # `normalize_company` / `normalize_role` shape.
+        soft_warn = _soft_warn_lookup(ctx.dedup, company or "", role_title or "")
         soft_warn_active = bool(soft_warn)
 
         # ── Browser lifecycle — L5 try/finally ──
@@ -969,31 +1206,29 @@ class GreenhouseAdapter:
                 trace_path=trace,
             )
             # Only record to dedup on a DOM-verified submission.
-            # H5 fix: narrow the except to AlreadyAppliedError so real
-            # duplicates emit dedup_hit (not the misleading record_failed)
-            # AND other DB errors surface for the operator.
-            try:
-                ctx.dedup.record(
-                    result,
-                    applicant,
-                    company,
-                    role_title,
-                    apply_url,
-                )
-            except AlreadyAppliedError:
-                log.info(
-                    "apply.dedup_hit",
-                    extra={"ats": self.name, "reason": "record_race"},
-                )
-            except Exception:
-                log.warning(
-                    "apply.dedup.record_failed", extra={"ats": self.name}
-                )
+            # B3 fix: route through `_record_or_escalate` so a record
+            # failure (locked DB, disk I/O, permissions, ...) surfaces
+            # as `submitted_unrecorded` instead of the old plain
+            # `submitted`. The prior blanket `except Exception` here
+            # downgraded record failures to an `apply.dedup.record_failed`
+            # warning and returned `submitted` unchanged, causing a silent
+            # double-apply on the next run because `was_applied` still
+            # missed. `_record_or_escalate` preserves the
+            # `AlreadyAppliedError` -> dedup_hit path.
+            result = _record_or_escalate(
+                ctx.dedup,
+                result,
+                applicant=applicant,
+                company=company,
+                role_title=role_title,
+                job_url=apply_url,
+            )
             log.info(
                 "apply.submitted",
                 extra={
                     "ats": self.name,
                     "application_id_present": bool(application_id),
+                    "status": getattr(result, "status", None),
                 },
             )
             return result

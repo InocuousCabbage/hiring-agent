@@ -34,8 +34,13 @@ _log = logging.getLogger(__name__)
 DigestPayload = namedtuple("DigestPayload", ["body", "attachments"])
 
 # Fixed order for the rollup blocks (spec §Acceptance criterion #3, #4).
+#
+# xhigh-BLOCKING/H3: `submitted_unrecorded` renders BETWEEN Submitted and
+# Review-required so operators see the double-submit-risk warning right
+# after the successful submissions — high visibility for the escalation.
 _BLOCK_ORDER: tuple[str, ...] = (
     "submitted",
+    "submitted_unrecorded",
     "review_required",
     "auto_declined",
     "soft_dup",
@@ -196,6 +201,9 @@ def _render_apply_rollup(
         row = _apply_result_to_row(ar)
         if status == "submitted":
             buckets["submitted"].append(row)
+        elif status == "submitted_unrecorded":
+            # xhigh-BLOCKING/H3
+            buckets["submitted_unrecorded"].append(row)
         elif status == "review_required":
             buckets["review_required"].append(row)
         elif status == "auto_declined":
@@ -210,6 +218,9 @@ def _render_apply_rollup(
 
     if buckets["submitted"]:
         parts.append(_render_submitted(buckets["submitted"]))
+    if buckets["submitted_unrecorded"]:
+        # xhigh-BLOCKING/H3
+        parts.append(_render_submitted_unrecorded(buckets["submitted_unrecorded"]))
     if buckets["review_required"]:
         block, atts = _render_review_required(buckets["review_required"])
         parts.append(block)
@@ -244,6 +255,9 @@ def _decision_status_to_bucket(status: Any) -> str | None:
     """H11: map a `Decision.status` string to the digest bucket kind."""
     if status == "submitted":
         return "submitted"
+    if status == "submitted_unrecorded":
+        # xhigh-BLOCKING/H3
+        return "submitted_unrecorded"
     if status == "review_required":
         return "review_required"
     if status == "auto_declined":
@@ -263,6 +277,14 @@ def _decision_to_row(dec: Any) -> dict:
     Preserves per-bucket rendering: `Submitted` reads `ats` + `application_id`;
     `Review required` reads `gmail_thread_id` + `screenshot_path`;
     `Auto-declined` reads `review_id`.
+
+    xhigh-H6 (iter2): the `Decision` dataclass carries neither
+    `application_id` nor `reason`, so both come back as None on this path.
+    The `_render_submitted_unrecorded` bucket surfaces the review_id +
+    the review's apply_url anchor so the operator can still triage without
+    the underlying exception name. If callers need the exception name in
+    the digest, they should attach the ApplyResult to the processed job
+    (via `processed_apply_results`) which DOES carry `reason`.
     """
     return {
         "ats": getattr(dec, "ats", None),
@@ -271,6 +293,7 @@ def _decision_to_row(dec: Any) -> dict:
         "gmail_thread_id": getattr(dec, "thread_id", None) or None,
         "company": getattr(dec, "company", None),
         "role_title": getattr(dec, "role_title", None),
+        "apply_url": getattr(dec, "apply_url", None),
     }
 
 
@@ -328,6 +351,36 @@ def _render_submitted(rows: list[dict]) -> str:
         ats = row.get("ats") or "unknown"
         app_id = row.get("application_id") or "unknown"
         lines.append(f"- Submitted to {ats} — application_id {app_id}")
+    return "\n".join(lines)
+
+
+def _render_submitted_unrecorded(rows: list[dict]) -> str:
+    """xhigh-BLOCKING/H3 renderer. Surfaces DOM-verified submissions whose
+    ``DedupDB.record()`` call failed — the ATS accepted the submission but
+    the applied_jobs row never landed. Operators MUST see this because the
+    next run's ``was_applied`` precheck will miss and the agent could
+    silently double-apply if the DB glitch persists.
+
+    xhigh-H6 (iter2): fall back to review_id / apply_url when application_id
+    or reason are None (Decision-shape rows carry neither). Operators need
+    at least one anchor to triage the affected row in the DB.
+    """
+    lines = ["## Submitted (not recorded — double-submit risk)"]
+    for row in rows:
+        ats = row.get("ats") or "unknown"
+        app_id = row.get("application_id") or "unknown"
+        reason = row.get("reason")
+        review_id = row.get("review_id") or "<unknown>"
+        apply_url = row.get("apply_url") or "<unknown-url>"
+        # Compose a diagnostic line that ALWAYS carries at least one
+        # locatable identifier (review_id) + the anchor (apply_url) even
+        # when the ApplyResult layer (which carries reason) isn't in play.
+        parts = [f"- Submitted_unrecorded to {ats}"]
+        parts.append(f"application_id {app_id}")
+        if reason:
+            parts.append(f"(record failed: {reason})")
+        parts.append(f"[review_id={review_id}, url={apply_url}]")
+        lines.append(" — ".join(parts))
     return "\n".join(lines)
 
 

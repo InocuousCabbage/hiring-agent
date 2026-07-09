@@ -96,19 +96,22 @@ def _call_poll_pending_reviews(*, gmail: Any, now: datetime, config: dict) -> li
 
     # H1 fix: DedupDB owns the CREATE TABLE for review_pending. We touch it
     # first so the reconciled schema is in place before ReviewStore opens the
-    # same DB file. Best-effort: if dedup_db_path is missing, fall back to a
-    # local review-only DB path so the poller can still open a store.
+    # same DB file.
     #
     # Resolve via _resolve_db_path so relative paths anchor at REPO ROOT (not
     # CWD) — prevents split-brain DB between DedupDB and ReviewStore when the
     # process is invoked from an unexpected working directory.
+    #
+    # xhigh-H9: FAIL CLOSED on dedup init failure at the poll boundary. Pre-
+    # fix swallowed the exception silently, letting poll_pending_reviews run
+    # (and possibly YES-branch execute_confirmed_submit fire) against an
+    # unknown DB state. Post-fix: propagate the exception; the caller
+    # (`initialize()`) catches it into ``apply.review.poll_failed`` and
+    # skips the poll entirely.
     from src.apply.dedup import _resolve_db_path
     db_path = _resolve_db_path(config)
-    try:
-        from src.apply.dedup import DedupDB
-        DedupDB(db_path)
-    except Exception:  # noqa: BLE001 — never-blocking; ReviewStore still runs its own CREATE.
-        pass
+    from src.apply.dedup import DedupDB
+    DedupDB(db_path)  # xhigh-H9: propagates on failure — do NOT swallow.
 
     store = ReviewStore(db_path)
 
@@ -308,6 +311,7 @@ def run_for_job(
         # from the frozen dataclass, which crashed every production apply as
         # soon as H4 delivered a real page.
         dedup = None
+        dedup_init_failed = False
         try:
             from src.apply.dedup import DedupDB as _DedupDB, _resolve_db_path
             # Anchor at repo root — otherwise the ApplyContext DedupDB and the
@@ -315,8 +319,38 @@ def run_for_job(
             # process's CWD isn't the repo root.
             db_path = _resolve_db_path(apply_config)
             dedup = _DedupDB(db_path)
-        except Exception:  # noqa: BLE001 — seam never blocks on dedup init
+        except Exception as exc:  # noqa: BLE001 — seam never blocks on dedup init
             dedup = None
+            dedup_init_failed = True
+            job_log.error("apply.seam.dedup_init_failed", error=str(exc))
+
+        # H7 (audit 2026-07-08): fail CLOSED when dedup is unavailable and
+        # mode='auto'. Otherwise the greenhouse adapter's blanket try/except
+        # around each dedup gate coerces None-attribute errors to "not
+        # applied"/count 0/no warning, so auto-mode would happily submit a
+        # posting already applied yesterday. Force mode='review' so the
+        # browser flow still fills + screenshots + emails a review, but the
+        # submit gate is closed.
+        #
+        # xhigh-H9: normalize case + whitespace BEFORE the string compare.
+        # Pre-fix `mode == 'auto'` literal match missed 'AUTO', ' auto ',
+        # etc. Also normalize the effective_mode written into the context so
+        # downstream `getattr(ctx, 'mode', ...)` comparisons see the
+        # canonical value.
+        raw_mode = apply_config.get("mode", "review")
+        normalized_mode = str(raw_mode).strip().lower() if raw_mode is not None else "review"
+        if normalized_mode not in ("auto", "review"):
+            # Defensive: unknown mode strings default to safest ('review').
+            normalized_mode = "review"
+        effective_mode = normalized_mode
+        if dedup_init_failed and effective_mode == "auto":
+            job_log.warning(
+                "apply.seam.dedup_init_fail_closed",
+                original_mode=raw_mode,
+                forced_mode="review",
+            )
+            effective_mode = "review"
+
         ctx = ApplyContext(
             profile=profile,
             job=job,
@@ -325,7 +359,7 @@ def run_for_job(
             config=apply_config,
             applicant=str(apply_config.get("user", "single")),
             dry_run=bool(apply_config.get("dry_run", False)),
-            mode=apply_config.get("mode", "review"),
+            mode=effective_mode,
             resume_docx_path=resume_docx_path,
             cover_letter_docx_path=cover_letter_docx_path,
             dedup=dedup,
