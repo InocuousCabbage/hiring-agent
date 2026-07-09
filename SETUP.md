@@ -352,9 +352,11 @@ Verify:
 python -m src.apply.bootstrap --status
 ```
 
-Expected output: `greenhouse: bootstrapped, last_verified=<iso>`. If the stored
-timestamp is older than 30 days or unparseable the line ends with
-` (stale — re-bootstrap recommended)`; re-run the bootstrap when you see it.
+Expected output: `greenhouse: bootstrapped, last_verified=<iso>`. Any of
+these means re-bootstrap: the line ends with ` (stale — re-bootstrap
+recommended)` (timestamp older than 30 days, or the stored envelope is
+malformed), or the `last_verified=` value reads `unknown` instead of an
+ISO timestamp.
 
 ### Enable in config
 
