@@ -469,6 +469,19 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
                     log.warning("jd_fetcher.playwright_goto_timeout", url=url)
                     # Continue — page may be partially loaded and still usable
 
+                # M16 (iter-1 refinement): wait for network to settle first
+                # so Cloudflare's "Just a moment..." interstitial completes
+                # its challenge redirect before we start racing selectors.
+                # Bounded at 5s (returns immediately on already-idle pages).
+                # Without this pre-gate, the ``h1`` selector matched
+                # Cloudflare's own challenge h1 in ~ms and _extract_best_text
+                # returned interstitial body text — silent regression on
+                # bot-protected pages.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeout:
+                    pass
+
                 # M16: race all substantive-content selectors in ONE wait.
                 # Comma-separated CSS gives an OR — the first match releases
                 # us. Cap total wait at 5s (matches the pre-fix per-selector
@@ -476,7 +489,7 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
                 # pages return in ms.
                 try:
                     page.wait_for_selector(
-                        "main, article, [class*='description'], h1",
+                        "main, article, [class*='description']",
                         timeout=5000,
                     )
                 except PlaywrightTimeout:
@@ -570,9 +583,20 @@ def _find_ats_link(page) -> str | None:
         # Return only href + trimmed text; the trim/lowercase steps stay
         # in Python for symmetry with the pre-fix filter and to keep the
         # JS payload small enough for hostile pages that stub text APIs.
+        #
+        # iter-1 fix: use ``innerText`` (visibility-aware) rather than
+        # ``textContent`` (includes hidden/sr-only/noscript). Pre-fix
+        # Python called Playwright's ``inner_text()`` which honors CSS
+        # visibility; matching that here avoids a hidden "Apply" sr-only
+        # anchor overriding the real Greenhouse link and mis-routing
+        # auto-apply. Fallback to ``textContent`` on browsers that lack
+        # ``innerText`` on the anchor (shouldn't happen in Chromium).
         raw = page.eval_on_selector_all(
             "a[href]",
-            "elements => elements.map(el => ({href: el.getAttribute('href') || '', text: (el.textContent || '').trim()}))",
+            "elements => elements.map(el => ({"
+            "href: el.getAttribute('href') || '', "
+            "text: ((el.innerText != null ? el.innerText : el.textContent) || '').trim()"
+            "}))",
         )
     except Exception:
         return None

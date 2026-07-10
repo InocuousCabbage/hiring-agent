@@ -367,7 +367,156 @@ def test_m13_search_uses_batch_or_metadata_for_message_fetches():
     )
 
 
+# ── M13 iter-1 refinement — batch failure falls back to sequential ───────────
+
+
+def test_m13_batch_execute_failure_falls_back_to_sequential():
+    """When batch.execute() itself raises (top-level HTTP failure), the
+    caller must NOT return an empty list — instead fall back to sequential
+    per-message fetches so the review-poll tick doesn't starve."""
+    from gmail.client import GmailClient
+
+    class _MsgGetStub2:
+        def __init__(self, mid, payload):
+            self.mid = mid
+            self.payload = payload
+            self.execute_calls = 0
+
+        def execute(self):
+            self.execute_calls += 1
+            return self.payload
+
+    class _FakeMessagesResource3:
+        def __init__(self):
+            self._refs = [{"id": f"m{i}", "threadId": f"t{i}"} for i in range(3)]
+            self._payloads = {
+                f"m{i}": {
+                    "id": f"m{i}",
+                    "threadId": f"t{i}",
+                    "internalDate": str(1_700_000_000 + i),
+                    "payload": {
+                        "headers": [{"name": "From", "value": "a@b.com"}],
+                        "mimeType": "text/plain",
+                        "body": {"data": ""},
+                    },
+                }
+                for i in range(3)
+            }
+
+        def list(self, userId, q, maxResults):
+            return _FakeExecutable({"messages": list(self._refs)})
+
+        def get(self, userId, id, format="full"):
+            return _MsgGetStub2(id, self._payloads[id])
+
+    class _FakeUsers3:
+        def __init__(self, msgs):
+            self._msgs = msgs
+
+        def messages(self):
+            return self._msgs
+
+    class _FakeService3:
+        def __init__(self, msgs):
+            self._users = _FakeUsers3(msgs)
+
+        def users(self):
+            return self._users
+
+        def new_batch_http_request(self, callback=None):
+            batch = MagicMock()
+            batch.add = lambda *a, **k: None
+            batch.execute = MagicMock(side_effect=RuntimeError("network flake"))
+            return batch
+
+    msgs = _FakeMessagesResource3()
+    service = _FakeService3(msgs)
+    client = _make_gmail_client_with_fake_service(service)
+
+    # Should not raise despite batch.execute() failing.
+    results = client.search("subject:test", max_results=3)
+    # Fallback ran — all 3 payloads recovered via sequential fetches.
+    assert len(results) == 3
+    ids = sorted(r["id"] for r in results)
+    assert ids == ["m0", "m1", "m2"]
+
+
 # ── M15 — single-eval link scan ──────────────────────────────────────────────
+
+
+def test_m15_find_ats_link_js_reads_visible_text_not_hidden_content():
+    """M15 iter-1: the JS map must use ``innerText`` (visibility-aware)
+    not ``textContent`` (includes hidden text). Pre-fix Python called
+    Playwright's ``inner_text()`` — matching that here avoids sr-only
+    "Apply" links overriding the real Greenhouse anchor."""
+    source = (ROOT / "src" / "scraper" / "jd_fetcher.py").read_text()
+
+    import re
+
+    m = re.search(
+        r"def _find_ats_link\(.*?(?=\ndef [_a-zA-Z])",
+        source,
+        flags=re.DOTALL,
+    )
+    assert m, "could not locate _find_ats_link in jd_fetcher.py"
+    body = m.group(0)
+    assert "innerText" in body, (
+        "M15 iter-1: _find_ats_link's JS eval must prefer el.innerText "
+        "(visibility-aware) over el.textContent (includes hidden text)"
+    )
+
+
+# ── M16 iter-1 — Cloudflare interstitial handling ────────────────────────────
+
+
+def test_m16_iter1_waits_for_networkidle_before_racing_selectors():
+    """M16 iter-1: the fetch must call ``wait_for_load_state("networkidle")``
+    before racing selectors. Without this, Cloudflare's "Just a moment..."
+    interstitial's h1 matches instantly and returns the challenge body."""
+    source = (ROOT / "src" / "scraper" / "jd_fetcher.py").read_text()
+
+    import re
+
+    m = re.search(
+        r"def _fetch_with_playwright\(.*?(?=\ndef [_a-zA-Z])",
+        source,
+        flags=re.DOTALL,
+    )
+    assert m, "could not locate _fetch_with_playwright"
+    body = m.group(0)
+    assert 'wait_for_load_state("networkidle"' in body or \
+           "wait_for_load_state('networkidle'" in body, (
+        "M16 iter-1: must wait for networkidle before selector race"
+    )
+
+
+def test_m16_iter1_does_not_race_on_h1_selector_alone():
+    """M16 iter-1: the selector race must NOT include a bare `h1` fallback.
+    Cloudflare's challenge page has an h1 that matches in ~10ms."""
+    source = (ROOT / "src" / "scraper" / "jd_fetcher.py").read_text()
+
+    import re
+
+    # Find the wait_for_selector calls inside _fetch_with_playwright.
+    m = re.search(
+        r"def _fetch_with_playwright\(.*?(?=\ndef [_a-zA-Z])",
+        source,
+        flags=re.DOTALL,
+    )
+    assert m, "could not locate _fetch_with_playwright"
+    body = m.group(0)
+
+    # Check that no wait_for_selector call passes a bare "h1" (or comma-set
+    # containing "h1" as a standalone token).
+    for match in re.finditer(r'wait_for_selector\(\s*[\'"]([^\'"]+)[\'"]', body):
+        selectors = [s.strip() for s in match.group(1).split(",")]
+        assert "h1" not in selectors, (
+            f"M16 iter-1: wait_for_selector({match.group(1)!r}) contains "
+            f"bare 'h1' — Cloudflare interstitials match this instantly"
+        )
+
+
+
 
 
 def test_m15_find_ats_link_uses_single_page_evaluation():

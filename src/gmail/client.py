@@ -553,7 +553,32 @@ class GmailClient:
                 ),
                 request_id=mid,
             )
-        batch.execute()
+        # iter-1 refinement: guard batch.execute() itself. Pre-fix's
+        # per-message loop only lost the ONE failing message on transient
+        # error; a bare batch.execute() propagates the top-level failure
+        # and starves the entire review-poll tick. On failure, fall
+        # through to sequential fetches — same shape, same round-trip
+        # count as pre-fix, but keeps the poll alive.
+        try:
+            batch.execute()
+        except Exception as exc:
+            log.warning(
+                "gmail.search_batch_execute_failed",
+                error_type=type(exc).__name__,
+                fallback="sequential",
+            )
+            payloads.clear()
+            errors.clear()
+            for mid in ordered_ids:
+                try:
+                    payloads[mid] = (
+                        self.service.users()
+                        .messages()
+                        .get(userId="me", id=mid, format="full")
+                        .execute()
+                    )
+                except Exception as inner_exc:
+                    errors[mid] = inner_exc
 
         # Log-and-drop per-message errors so a single 404 (deleted mid-poll)
         # never sinks the whole search. The poll caller already tolerates
