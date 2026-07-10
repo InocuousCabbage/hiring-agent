@@ -290,20 +290,16 @@ class GmailClient:
         ).execute()
 
     def _get_or_create_label(self, label_name: str) -> str:
-        """Get label ID by name, creating it if it doesn't exist."""
-        results = self.service.users().labels().list(userId="me").execute()
-        for label in results.get("labels", []):
-            if label["name"] == label_name:
-                return label["id"]
+        """Get label ID by name, creating it if it doesn't exist.
 
-        # Create it
-        body = {
-            "name": label_name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
-        created = self.service.users().labels().create(userId="me", body=body).execute()
-        return created["id"]
+        M14 iter-2 refinement: routed through the public cached
+        ``get_or_create_label`` so ``mark_processed`` (called per alert
+        on the hot path) also benefits from the per-instance label cache.
+        Pre-refinement, this private method issued a fresh labels.list()
+        RPC per alert cycle. The public method has identical
+        create-body semantics, so the delegation is behavior-preserving.
+        """
+        return self.get_or_create_label(label_name)
 
     @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
     def get_unread_alerts(

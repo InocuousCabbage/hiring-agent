@@ -104,6 +104,75 @@ def test_l1_auto_fix_returns_originals_on_wrong_shape(monkeypatch):
     assert result_resume is resume_in
 
 
+def test_l1_iter2_auto_fix_returns_originals_when_root_is_list(monkeypatch):
+    """L1 iter-2: a non-object JSON ROOT (e.g. "[]" or "\"foo\"") must fall
+    back to originals rather than raising AttributeError on fixed.get(...).
+    Pre-iter-2 the sub-value guards ran AFTER a .get on a non-dict root,
+    which crashed before the guards ran."""
+    from qa import checker
+
+    monkeypatch.setattr(
+        checker,
+        "call_claude",
+        lambda prompt, model=None: "[]",  # valid JSON, non-object root
+    )
+    resume_in = {"lane": "PMM", "summary": "orig"}
+    cover_in = {"body": "orig"}
+    result_resume, result_cover = checker.auto_fix(
+        tailored_resume=resume_in,
+        cover_letter=cover_in,
+        issues=["x"],
+        jd_text="jd",
+        lane={"label": "PMM"},
+        project_bank=[],
+    )
+    assert result_resume is resume_in
+    assert result_cover is cover_in
+
+
+def test_l1_iter2_auto_fix_returns_originals_when_root_is_string(monkeypatch):
+    """Symmetric coverage: JSON string root (e.g. `"hello"`) must fall back."""
+    from qa import checker
+
+    monkeypatch.setattr(
+        checker,
+        "call_claude",
+        lambda prompt, model=None: '"just a string"',
+    )
+    resume_in = {"lane": "PMM"}
+    cover_in = {"body": "orig"}
+    r, c = checker.auto_fix(
+        tailored_resume=resume_in,
+        cover_letter=cover_in,
+        issues=["x"],
+        jd_text="jd",
+        lane={"label": "PMM"},
+        project_bank=[],
+    )
+    assert r is resume_in
+    assert c is cover_in
+
+
+def test_m14_iter2_private_get_or_create_label_uses_cache():
+    """M14 iter-2: the PRIVATE _get_or_create_label (called by
+    mark_processed on the per-alert hot path) must delegate to the
+    public cached form so it doesn't bypass the cache."""
+    labels_resource = _FakeLabelsResource()
+    service = _FakeService(labels_resource)
+    client = _make_gmail_client_with_fake_service(service)
+
+    # Prime cache via the public path.
+    client.get_or_create_label("hiring-agent/apply/pending")
+    baseline = labels_resource.list_calls
+
+    # Now hit the PRIVATE path — must NOT issue another labels.list().
+    client._get_or_create_label("hiring-agent/apply/pending")
+    assert labels_resource.list_calls == baseline, (
+        "M14 iter-2: _get_or_create_label bypassed the cache — "
+        "should delegate to get_or_create_label"
+    )
+
+
 def test_l1_auto_fix_returns_originals_when_cover_letter_wrong_shape(monkeypatch):
     """Symmetric coverage: cover_letter as list should also fall back cleanly."""
     from qa import checker

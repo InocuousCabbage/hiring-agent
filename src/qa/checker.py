@@ -200,11 +200,16 @@ Only return valid JSON. No explanation."""
         log.error("qa.auto_fix_parse_error", error=str(e))
         return tailored_resume, cover_letter
 
-    # L1 (Phase 6 audit): shape guard — valid JSON with wrong root shape
-    # (e.g. {"resume": [], "cover_letter": []}) previously raised TypeError
-    # at `fixed_resume["lane"] = ...` and escaped the try/except. Fall back
-    # to originals on either side that isn't a dict, so a malformed LLM
-    # response never crashes the tailoring pipeline.
+    # L1 (Phase 6 audit + iter-2 refinement): shape guard covers both the
+    # ROOT and each sub-value. Pre-fix: `fixed_resume["lane"] = ...` raised
+    # TypeError when a sub-value wasn't a dict. Iter-1 fix: guard sub-values.
+    # Iter-2 fix: also guard the ROOT — a non-object JSON root
+    # (`raw = "[]"` or `"\"foo\""`) makes `fixed.get(...)` raise
+    # AttributeError, which was NOT caught by the JSONDecodeError branch
+    # above. Any non-dict root → fall back to originals.
+    if not isinstance(fixed, dict):
+        log.warning("qa.auto_fix_wrong_root_shape", got=type(fixed).__name__)
+        return tailored_resume, cover_letter
     fixed_resume = fixed.get("resume", tailored_resume)
     fixed_cl = fixed.get("cover_letter", cover_letter)
     if not isinstance(fixed_resume, dict):
