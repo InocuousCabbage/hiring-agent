@@ -25,6 +25,7 @@ Skills table (Table 0):  3 rows × 3 cols
     run[1]  ' Skill Name '  Times New Roman 10pt  ← REPLACE TEXT ONLY
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -479,6 +480,43 @@ def _insert_paragraph_after(ref_para: Paragraph, text: str) -> Paragraph:
 
 
 def _safe_filename(text: str) -> str:
+    """Sanitize `text` for use as a filename component.
+
+    Applies two transforms:
+      1. Strip filesystem-unsafe chars via `[^\\w\\s-]`.
+      2. Collapse whitespace to `_`, then truncate to 50 chars.
+
+    PR #12 finding #12 (altitude-fix scope-out): the `[^\\w\\s-]` regex
+    strips ALL Unicode Cf (format) chars — including ZWJ (U+200D) and
+    ZWNJ (U+200C) — because Python's `\\w` character class excludes
+    the Cf category. `email_parser._strip_format_chars` deliberately
+    PRESERVES ZWJ/ZWNJ upstream because they are semantically load-
+    bearing in Persian/Urdu (ZWNJ) and Devanagari/emoji (ZWJ). Two
+    Persian company names that differ only in mid-name ZWNJ position
+    (`"شرکت‌الف"` vs `"شرکتالف"`) reach this function as distinct
+    strings but collapse to identical sanitized shapes. When both
+    companies also share a title, the renderer produces
+    `{company}_{title}_Resume.docx` on the same path for both jobs
+    and the second render silently overwrites the first — a per-alert
+    downstream cascade of the M7 same-shape-collision class the
+    altitude fix targets.
+
+    Post-hardening: append a short hash of the ORIGINAL input text as
+    a disambiguating suffix. The hash is derived from `text` BEFORE
+    sanitization so invisible-char differences the regex erases
+    (ZWNJ position, mid-name BOM, non-`\\w` scripts stripped to '')
+    are preserved in the discriminator.
+
+    Format: `{sanitized-or-'unnamed'}_{4-hex}` — 4 hex chars = 65,536
+    buckets. Per-alert P(collision) ~= n(n-1)/(2 * 65536); for the
+    pipeline's max_jobs=99 upper bound that is ~0.075 per alert, and
+    filename collisions no longer silently overwrite — they either
+    remain distinct or, on the extreme hash-collision case, land on
+    the same path (indistinguishable from the pre-fix behavior on
+    that one collision only).
+    """
     safe = re.sub(r"[^\w\s-]", "", text)
     safe = re.sub(r"\s+", "_", safe.strip())
-    return safe[:50]
+    truncated = safe[:50] or "unnamed"
+    suffix = hashlib.blake2b(text.encode("utf-8"), digest_size=2).hexdigest()
+    return f"{truncated}_{suffix}"

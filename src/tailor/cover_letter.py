@@ -81,7 +81,7 @@ def write_cover_letter(
 <job>
 Title: {job['title']}
 Company: {job['company']}
-Location: {job.get('location', 'Not specified')}
+Location: {job.get('location') or 'Not specified'}
 </job>
 
 <job_description>

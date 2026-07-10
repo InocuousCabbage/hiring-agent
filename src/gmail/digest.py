@@ -120,7 +120,13 @@ def _render_legacy_body(
     lines.append(f"Processed ({len(processed)})")
     lines.append("=" * 40)
     for job in processed:
-        location = job.get("location", "Unknown")
+        # PR #12 finding #11 (altitude-fix scope-out sweep): parser
+        # returns `location=""` for trailing-dash raws like `"Acme —"`.
+        # `.get("location", "Unknown")` returns `""` (not the default)
+        # when the key exists with an empty value — same class as the
+        # company-side sentinel PR #11 fixed. `.get(...) or default`
+        # coerces both empty-string and None to the fallback.
+        location = job.get("location") or "Unknown"
         lines.append(f"  {job['title']} — {job['company']} ({location})")
         lines.append(f"  Lane: {job.get('lane', 'N/A')}")
         lines.append(f"  URL: {job['url']}")

@@ -709,11 +709,27 @@ def main_root_with_config():
         # OR on `apply: null` in settings.yaml — either would crash
         # `settings_data.setdefault(...)` with AttributeError. Coerce
         # missing/None values to {} defensively at every level we touch.
+        #
+        # PR #12 finding #10: `safe_load(...) or {}` is over-broad — it
+        # coerces every falsy YAML root (`False`, `0`, `''`, `[]`) to
+        # `{}`. The valid missing-root shape is exactly `None` (empty
+        # file or `apply: null`), so narrow the coercion to `is None`.
+        # A non-None non-dict root (a scalar or list at the root of
+        # settings.yaml) is a bug in the caller's config file — bubble
+        # the AttributeError from the ensuing `.setdefault()` so the
+        # miscoerced value doesn't silently mask a config typo.
         settings_data = _yaml_local.safe_load(
             (real_root / "config" / "settings.yaml").read_text()
-        ) or {}
+        )
+        if settings_data is None:
+            settings_data = {}
         apply_block = settings_data.setdefault("apply", {})
-        if apply_block is None:
+        # PR #12 finding #6: guard covers `apply: null` (None) but a
+        # scalar shape (`apply: false`, `apply: 0`, `apply: "off"`) also
+        # cannot receive `["enabled"] = False`. Broaden the guard to any
+        # non-dict shape — a scalar or list under `apply:` is
+        # semantically a "no config" case and coerces to {}.
+        if not isinstance(apply_block, dict):
             apply_block = {}
             settings_data["apply"] = apply_block
         apply_block["enabled"] = False

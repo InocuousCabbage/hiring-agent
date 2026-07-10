@@ -306,6 +306,14 @@ def parse_alert_email(
         # validated. When the parser could not identify a real company,
         # key on URL instead so distinct-URL jobs both surface.
         #
+        # PR #12 finding #7: `company` is already stripped upstream in
+        # both `_split_company_location` (parts[0].strip()) and the
+        # `elif` fallback (raw.strip()). The historical `not company.strip()`
+        # disjunct is therefore redundant — `not company` is sufficient
+        # (empty string is falsy). Retaining the .strip() suggests to
+        # future readers that unstripped company values reach this line,
+        # which is not the case post-altitude-fix.
+        #
         # Post-CRITICAL#5 altitude fix, `company` is guaranteed to be
         # either "Unknown" (fallback sentinel) or a non-empty/non-invisible
         # string — the extraction block above establishes that invariant
@@ -315,7 +323,7 @@ def parse_alert_email(
         # in depth: if a future refactor of the extraction block drops the
         # invariant, this line still degrades safely to the (title, url)
         # dedup key rather than silently colliding.
-        no_real_company = (company == "Unknown") or (not company.strip())
+        no_real_company = (company == "Unknown") or (not company)
         dedup_key = (title, url) if no_real_company else (title, company)
         if dedup_key in seen_title_company:
             continue
