@@ -296,22 +296,21 @@ def test_render_cover_letter_returns_pdf_and_docx_tuple(tmp_path):
     assert pdf_path is None or pdf_path.exists()
 
 
-def test_render_resume_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
+def test_render_resume_returns_none_pdf_on_fallback(tmp_path, _no_pdf_converter):
     """HIGH-3 (structural fix): When no PDF converter is available, render_resume
     must return (None, docx_path) — NOT (docx_path, docx_path).
 
     Returning the same Path twice loses the ops signal that PDF conversion failed.
     None in the PDF slot lets callers detect fallback unambiguously.
+
+    iter-3 (finding #5): stub extraction. The inline `monkeypatch.setattr(
+    renderer_mod, "_find_libreoffice", ...) + sys.platform = "linux"` block
+    duplicated the `_no_pdf_converter` fixture defined below — a drift
+    hazard if the platform check moves off `sys.platform`. Both tests
+    now go through the fixture so a single edit keeps them in sync.
     """
     if _TEMPLATE_MISSING:
         pytest.skip(_TEMPLATE_SKIP_REASON)
-
-    # Force the no-converter path by stubbing both LibreOffice + docx2pdf.
-    import pdf_gen.renderer as renderer_mod
-    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
-    # Block docx2pdf via sys.platform — non-darwin skips it; force darwin path to ImportError
-    import sys
-    monkeypatch.setattr(sys, "platform", "linux")  # skips the docx2pdf branch entirely
 
     pdf_path, docx_path = render_resume(
         tailored_resume=SAMPLE_TAILORED_RESUME,
@@ -329,13 +328,11 @@ def test_render_resume_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
     assert docx_path.suffix == ".docx"
 
 
-def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, monkeypatch):
-    """HIGH-3: cover letter renderer must return (None, docx_path) on fallback."""
-    import pdf_gen.renderer as renderer_mod
-    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
-    import sys
-    monkeypatch.setattr(sys, "platform", "linux")  # skip docx2pdf branch
+def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, _no_pdf_converter):
+    """HIGH-3: cover letter renderer must return (None, docx_path) on fallback.
 
+    iter-3 (finding #5): uses _no_pdf_converter fixture — see paired
+    test_render_resume_returns_none_pdf_on_fallback for the rationale."""
     pdf_path, docx_path = render_cover_letter(
         cover_letter=SAMPLE_COVER_LETTER,
         job=SAMPLE_JOB,
@@ -347,6 +344,150 @@ def test_render_cover_letter_returns_none_pdf_on_fallback(tmp_path, monkeypatch)
         f"Expected pdf_path = None on fallback, got {pdf_path}"
     )
     assert docx_path is not None and docx_path.exists()
+    assert docx_path.suffix == ".docx"
+
+
+# ── M23: renderer content assertions ──────────────────────────────────────────
+# Prior state: the renderer tests asserted only zip validity + paragraph
+# count > 20 — an untailored base_resume.docx (all paragraphs untouched)
+# passed. If _fill_resume_template silently no-op'd (broken .runs walk, empty
+# section handler, etc.), the shipped DOCX would be the un-tailored template
+# and the tests would never notice.
+#
+# These tests read the DOCX text back and assert the tailored summary +
+# bullet content is actually present. Mutation check: no-op the placeholder
+# fill loop in renderer._fill_resume_template — the summary text vanishes
+# from the DOCX and this test fails.
+
+
+def _docx_full_text(docx_path: Path) -> str:
+    """Extract concatenated paragraph text from a DOCX (including tables)."""
+    doc = Document(str(docx_path))
+    parts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    parts.append(p.text)
+    return "\n".join(parts)
+
+
+@pytest.fixture
+def _no_pdf_converter(monkeypatch):
+    """Phase 5 iter-2 (finding #12): stub the LibreOffice + docx2pdf paths
+    so renderer tests that only assert DOCX content don't spawn a real
+    LibreOffice subprocess (which can take up to 60s per call — see
+    _find_libreoffice's subprocess.TimeoutExpired handler). Same pattern
+    the pre-existing `test_render_resume_returns_none_pdf_on_fallback`
+    test uses; applied here to the M21 + M23 tests that call render_*
+    without stubbing.
+    """
+    import pdf_gen.renderer as renderer_mod
+    monkeypatch.setattr(renderer_mod, "_find_libreoffice", lambda: None)
+    # Non-darwin platform skips the docx2pdf branch entirely.
+    monkeypatch.setattr(sys, "platform", "linux")
+
+
+@pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
+def test_render_resume_docx_contains_tailored_summary_and_bullets(tmp_path, _no_pdf_converter):
+    """M23: the rendered DOCX must contain the tailored summary + a
+    signature phrase from at least one bullet. If the fill loop no-ops,
+    the DOCX ships the base template and this test fails."""
+    _, docx_path = render_resume(
+        tailored_resume=SAMPLE_TAILORED_RESUME,
+        lane=SAMPLE_LANE,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+    text = _docx_full_text(docx_path)
+
+    # Tailored summary must be present verbatim (or nearly so — the fill
+    # process may reflow whitespace, so we check a distinctive substring).
+    summary_marker = "translate complex business requirements"
+    assert summary_marker in text, (
+        f"Tailored summary substring {summary_marker!r} missing from rendered "
+        f"DOCX. Renderer likely no-op'd the summary fill.\n"
+        f"First 400 chars of DOCX text:\n{text[:400]}"
+    )
+
+    # At least one distinctive bullet phrase from SAMPLE_TAILORED_RESUME
+    # must be present.
+    bullet_marker = "223% average improvement in funnel conversion"
+    assert bullet_marker in text, (
+        f"Tailored bullet substring {bullet_marker!r} missing from rendered "
+        f"DOCX. Renderer likely dropped role bullets."
+    )
+
+
+def test_render_cover_letter_docx_contains_tailored_paragraphs(tmp_path, _no_pdf_converter):
+    """M23: cover letter DOCX must contain the tailored paragraph body,
+    not just the applicant name header. If _create_cover_letter_docx
+    silently dropped the paragraphs, this test fails."""
+    _, docx_path = render_cover_letter(
+        cover_letter=SAMPLE_COVER_LETTER,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=tmp_path,
+    )
+    text = _docx_full_text(docx_path)
+
+    # A distinctive phrase from the first SAMPLE_COVER_LETTER paragraph.
+    marker = "Telecom offer implementation is one of the more technically demanding"
+    assert marker in text, (
+        f"Cover-letter tailored paragraph missing from rendered DOCX. "
+        f"First 400 chars:\n{text[:400]}"
+    )
+    # And a second-paragraph phrase to prove multi-paragraph rendering.
+    marker2 = "generated $1M+ in pipeline"
+    assert marker2 in text, (
+        f"Second cover-letter paragraph missing. First 400 chars:\n{text[:400]}"
+    )
+
+
+# ── M21: chdir render test ────────────────────────────────────────────────────
+# Prior guard (`test_render_resume_pdf_uses_root_based_path` in
+# test_review_fixes.py) is a source-text grep — it lints for the _ROOT/
+# pattern but does NOT verify runtime behavior. A CWD-relative regression
+# under a different spelling (e.g. `os.path.join(os.getcwd(), lane[...])`)
+# would still ship.
+#
+# This test chdirs into a scratch dir, then invokes render_resume — a
+# renderer that reads its template relative to CWD (not _ROOT) crashes with
+# FileNotFoundError. Passes today because renderer resolves against _ROOT.
+
+
+@pytest.mark.skipif(_TEMPLATE_MISSING, reason=_TEMPLATE_SKIP_REASON)
+def test_render_resume_finds_template_from_arbitrary_cwd(tmp_path, monkeypatch, _no_pdf_converter):
+    """M21: render_resume must resolve its template against the repo root,
+    not the process CWD. Chdir into a scratch dir with no template beneath
+    it and verify the render still succeeds.
+
+    Mutation check: revert renderer.py's template_path to
+    `Path(lane['template'])`. This test fails with FileNotFoundError,
+    proving the guard is behavioral rather than source-grep."""
+    # A scratch dir with NO templates/ subtree.
+    scratch = tmp_path / "scratch_cwd"
+    scratch.mkdir()
+    output_dir = tmp_path / "out"
+
+    monkeypatch.chdir(scratch)
+
+    pdf_path, docx_path = render_resume(
+        tailored_resume=SAMPLE_TAILORED_RESUME,
+        lane=SAMPLE_LANE,
+        job=SAMPLE_JOB,
+        date_str=date.today().isoformat(),
+        output_dir=output_dir,
+    )
+    # DOCX must exist under output_dir; renderer must NOT have raised
+    # FileNotFoundError on the template.
+    assert docx_path.exists(), (
+        f"DOCX not rendered from arbitrary CWD — template likely resolved "
+        f"against CWD instead of _ROOT.\n"
+        f"CWD was: {scratch}\n"
+        f"Expected output: {docx_path}"
+    )
     assert docx_path.suffix == ".docx"
 
 

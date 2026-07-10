@@ -217,8 +217,17 @@ def test_greenhouse_full_flow_with_demo_fixture(tmp_path, monkeypatch):
     adapter = GreenhouseAdapter()
 
     # First run: no prior dedup entry → adapter goes through review path.
+    # M22 fix: on an empty dedup DB, the soft-dup gate CANNOT fire — there
+    # are no prior rows to fuzzy-match against, so 'soft_dup_warn' is not a
+    # possible outcome. The pre-fix `in (..., 'soft_dup_warn')` alternation
+    # accepted a wrong-branch result on an empty DB, defeating the guard;
+    # the exact-status assertion below fails deterministically if the
+    # dispatcher ever routes an empty-DB job through the soft-dup lane.
     result = adapter.apply(_Page(), _Ctx())
-    assert result.status in ("review_required", "soft_dup_warn"), result
+    assert result.status == "review_required", (
+        f"Empty-DB first run must be review_required (no rows to soft-match "
+        f"against). Got: {result.status!r}"
+    )
 
     # Seed the dedup DB directly with a submission for this URL to test H5.
     from src.apply.types import ApplyResult as _AR
