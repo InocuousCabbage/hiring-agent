@@ -758,7 +758,17 @@ def main() -> None:
                 print(f"    Cover Letter DOCX                      : {p['cover_letter_docx']}")
             hm = p.get("hiring_manager")
             if hm:
-                print(f"    Hiring Manager       : {hm['name']} — {hm.get('title', 'N/A')} ({hm['confidence']})")
+                # PR #12 iter-2 sweep: same L2 class as digest.py hm-block.
+                # `.get('title', 'N/A')` returns '' (not the default) when
+                # the key exists with an empty value — same class the
+                # digest sweep fixed. `hm['name']` and `hm['confidence']`
+                # would also render blank tails on empty-string LLM output;
+                # coerce all three to a fallback for --test print parity
+                # with the production digest.
+                hm_name = hm.get("name") or "Unknown"
+                hm_title = hm.get("title") or "N/A"
+                hm_conf = hm.get("confidence") or "N/A"
+                print(f"    Hiring Manager       : {hm_name} — {hm_title} ({hm_conf})")
                 if hm.get("linkedin_url"):
                     print(f"    LinkedIn             : {hm['linkedin_url']}")
                 if hm.get("outreach_note"):

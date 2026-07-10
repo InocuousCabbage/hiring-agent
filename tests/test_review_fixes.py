@@ -908,11 +908,20 @@ class TestNoopGmailClientContract:
         },
     }
 
+    @pytest.mark.filterwarnings("error::UserWarning")
     def test_seam_gmail_methods_all_covered_by_METHODS(self):
         """iter-3 (finding #3): if the seam adds a new `gmail.<method>()`
         call and _CONTRACT doesn't stub it, --test mode crashes but the
         signature/callable tests both stay green (they only iterate what
         _CONTRACT already lists — the mirror image of the M17 drift bug).
+
+        PR #12 iter-3 (CI-teeth): the stale-methods `warnings.warn` at the
+        end of this test was previously toothless under pytest's default
+        warning filter — a stale-drift produced a warning that CI runners
+        silently swallowed. The `filterwarnings("error::UserWarning")`
+        marker scoped to THIS test converts the warning into a test
+        failure so stale drift blocks a PR. The happy-path (no stale)
+        emits no warning and the test stays green.
 
         Discover every `gmail.<method>(...)` call site in the SEAM
         (src/apply/*) — the code path that receives _NoopGmailClient in
@@ -1409,7 +1418,7 @@ class TestEmailParserCompanyNormalizationAtExtraction:
         )
         jobs = parse_alert_email(html_body=html, max_jobs=99)
         # Both jobs must surface — if ZWSP leaked past the fallback,
-        # `no_real_company = (company == "Unknown") or (not company.strip())`
+        # `no_real_company = (company == "Unknown") or (not company)`
         # would evaluate False (both) and dedup would key on
         # (title, '​') for BOTH cards → silent M7-class drop.
         assert len(jobs) == 2, (
@@ -1519,9 +1528,9 @@ class TestEmailParserCompanyNormalizationAtExtraction:
         `_strip_format_chars` correctly preserves ZWJ for legitimate
         script/emoji use, so the sweep does NOT remove it. The `.strip()
         or "Unknown"` fallback saw a truthy value and passed it through.
-        The `no_real_company` guard's `not company.strip()` disjunct
-        evaluates False. Two same-title distinct-URL cards dedup to
-        `(title, "‍")` → silent M7 drop.
+        The `no_real_company` guard's `not company` disjunct
+        evaluates False (truthy). Two same-title distinct-URL cards
+        dedup to `(title, "‍")` → silent M7 drop.
 
         Fix: `_has_meaningful_content` rejects strings composed only of
         Cf/whitespace chars, so ZWJ-only OR ZWNJ-only prefixes fall
@@ -2011,7 +2020,7 @@ class TestLocationEmptyStringDownstream:
         against parser output.
 
         The cover-letter prompt is constructed via an f-string inside
-        `tailor_cover_letter`. Rather than invoke the full function
+        `write_cover_letter`. Rather than invoke the full function
         (which requires a project bank + LLM call), we mirror the
         f-string via `inspect.getsource` + AST parse of the target
         module: extract the exact prompt template as it appears in the
@@ -2035,23 +2044,31 @@ class TestLocationEmptyStringDownstream:
         )
         assert "Location: \n" not in prompt_snippet
 
-        # AST-based mirror check (quote-agnostic). Parse the module,
-        # find the `Location:` f-string literal inside the prompt, and
-        # assert the f-string expression node uses `.get(...) or ...`
-        # form — NOT `.get(k, default)` (which regresses on empty
-        # string).
+        # AST-based mirror check (quote-agnostic + scope-restricted).
+        # PR #12 iter-3 (precision fix): the prior version walked EVERY
+        # JoinedStr in the module — an unrelated log or debug f-string
+        # elsewhere in cover_letter.py that used `.get('location', ...)`
+        # would false-trigger `found_default_form`. Now we restrict the
+        # walk to the `write_cover_letter` function body — the sole
+        # site the sweep targets. A future maintainer adding a new
+        # helper function with its own `.get('location', ...)` won't
+        # cause a spurious failure here; a regression to the target
+        # prompt line still surfaces.
         source = (ROOT / "src" / "tailor" / "cover_letter.py").read_text()
         tree = ast.parse(source)
-        # Find every JoinedStr (f-string). A JoinedStr contains
-        # FormattedValue nodes. The prompt f-string carries a
-        # FormattedValue whose expression is `job.get('location') or
-        # 'Not specified'` — a BoolOp(Or) whose left operand is a
-        # `job.get('location')` Call. Any mutation to
-        # `.get('location', default)` shows up as a Call with 2 args
-        # inside a bare FormattedValue (no BoolOp wrapper).
+        target_fn = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef)
+             and n.name == "write_cover_letter"),
+            None,
+        )
+        assert target_fn is not None, (
+            "write_cover_letter function not found in cover_letter.py — "
+            "the sweep target moved; update this test."
+        )
         found_or_form = False
         found_default_form = False
-        for node in ast.walk(tree):
+        for node in ast.walk(target_fn):
             if not isinstance(node, ast.JoinedStr):
                 continue
             for fv in node.values:
@@ -2083,12 +2100,12 @@ class TestLocationEmptyStringDownstream:
                 ):
                     found_default_form = True
         assert found_or_form, (
-            f"src/tailor/cover_letter.py f-string must use `job.get("
-            f"'location') or 'Not specified'` — no matching JoinedStr "
-            f"expression found in the module AST."
+            f"src/tailor/cover_letter.py::write_cover_letter must use "
+            f"`job.get('location') or 'Not specified'` in an f-string — "
+            f"no matching JoinedStr expression found in the function AST."
         )
         assert not found_default_form, (
-            f"src/tailor/cover_letter.py f-string uses "
+            f"src/tailor/cover_letter.py::write_cover_letter f-string uses "
             f"`job.get('location', 'Not specified')` — the two-arg .get "
             f"form returns '' when the key exists with an empty value, "
             f"reintroducing the blank-tail regression."
@@ -2275,10 +2292,20 @@ class TestComposeOutputBaseUrlDiscriminator:
             job, "Resume"
         ), "_compose_output_base is non-deterministic on repeat calls"
 
-    def test_compose_output_base_shape_is_company_title_disc_kind(self):
+    @pytest.mark.parametrize("kind", ["Resume", "Cover_Letter"])
+    def test_compose_output_base_shape_is_company_title_disc_kind(self, kind):
         """Shape contract: `{company}_{title}_{hex4}_{kind}`. Downstream
         consumers rely on the readable prefix being human-scannable — the
         4-hex tail is a tail discriminator, not a wholesale hash filename.
+
+        Parametrized over BOTH production kinds — `render_resume` passes
+        `'Resume'` (single-word) and `render_cover_letter` passes
+        `'Cover_Letter'` (underscore-containing). PR #12 iter-2 finding:
+        the prior `rsplit('_', 2)` shape-parser only worked for single-
+        word kinds; `Cover_Letter` decomposed as `[prefix, 'Cover',
+        'Letter']` and `parts[1]='Cover'` failed the hex check. The
+        shape-parser here anchors on the kind suffix explicitly instead
+        of counting underscores.
         """
         from pdf_gen.renderer import _compose_output_base
         job = {
@@ -2286,22 +2313,67 @@ class TestComposeOutputBaseUrlDiscriminator:
             "title": "Product Marketing Manager",
             "url": "https://example.com/shape",
         }
-        base = _compose_output_base(job, "Resume")
+        base = _compose_output_base(job, kind)
         # Anchor on the human-scannable prefix + suffix boundaries.
         assert base.startswith("Acme_Corp_Product_Marketing_Manager_"), (
             f"human-readable prefix must survive the discriminator; "
+            f"kind={kind!r}, got {base!r}"
+        )
+        assert base.endswith(f"_{kind}"), (
+            f"kind suffix must survive the discriminator; kind={kind!r}, "
             f"got {base!r}"
         )
-        assert base.endswith("_Resume"), (
-            f"kind suffix must survive the discriminator; got {base!r}"
-        )
-        # Discriminator is the second-to-last underscore-delimited chunk.
-        parts = base.rsplit("_", 2)  # [prefix, disc, kind]
-        assert len(parts) == 3
-        assert re.fullmatch(r"[0-9a-f]{4}", parts[1]), (
+        # Kind-aware shape parse: strip the `_{kind}` suffix then take
+        # the last underscore chunk as the disc — this works whether
+        # kind contains 0 or N underscores.
+        without_kind = base[: -len(f"_{kind}")]
+        disc = without_kind.rsplit("_", 1)[-1]
+        assert re.fullmatch(r"[0-9a-f]{4}", disc), (
             f"discriminator must be exactly 4 lowercase hex chars; got "
-            f"{parts[1]!r} in {base!r}"
+            f"{disc!r} in {base!r} (kind={kind!r})"
         )
+
+    def test_compose_output_base_raises_valueerror_on_missing_url(self):
+        """PR #12 iter-3: `_compose_output_base` REQUIRES a non-empty
+        `job['url']`. Silent fallback to `blake2b(b'')` would map every
+        URL-less job to the same fixed disc — same-company/same-title
+        URL-less jobs would still collide, reintroducing the exact M7
+        class the pivot targets. The helper raises ValueError so the
+        caller (test fixture, upstream refactor bypassing the parser)
+        fails loud rather than silently overwriting.
+
+        Mutation check: revert `_compose_output_base` to
+        `url = job.get('url') or ''`. This test's ValueError expectation
+        fails silently (returns a well-formed base with fixed disc).
+        """
+        from pdf_gen.renderer import _compose_output_base
+        for bad_url in (None, ""):
+            job = {
+                "company": "Acme",
+                "title": "PMM",
+                "url": bad_url,
+            }
+            with pytest.raises(ValueError, match=r"non-empty job\['url'\]"):
+                _compose_output_base(job, "Resume")
+        # Missing key case — same failure class
+        with pytest.raises(ValueError, match=r"non-empty job\['url'\]"):
+            _compose_output_base({"company": "Acme", "title": "PMM"}, "Resume")
+
+    def test_compose_output_base_raises_typeerror_on_non_str_url(self):
+        """Defensive TypeError when caller passes a `Path` / `URL` object
+        instead of a str. `.encode()` on Path raises AttributeError deep
+        inside blake2b; catching at the composition boundary gives the
+        caller a clearer signal.
+        """
+        from pathlib import Path
+        from pdf_gen.renderer import _compose_output_base
+        job = {
+            "company": "Acme",
+            "title": "PMM",
+            "url": Path("/tmp/foo.html"),
+        }
+        with pytest.raises(TypeError, match=r"job\['url'\] to be a str"):
+            _compose_output_base(job, "Resume")
 
     def test_compose_output_base_handles_lone_surrogate_url(self):
         """PR #12 iter-2 (finding #4): `surrogatepass` encode. If the
@@ -2469,12 +2541,14 @@ class TestDigestHmEmptyStringSweep:
         assert " ()" not in body
 
     def test_hm_none_values_still_render_fallbacks(self):
-        """Sibling assertion — `.get(k, default)` DID fire on `None`
-        because the key is absent (dict.get returns the default when the
-        key is missing OR when it's present with any value INCLUDING
-        None depends on version — dict.get returns the value, so if
-        value is None, returns None). Sweep must handle both None + "".
-        """
+        """Sibling assertion — `dict.get(k, default)` returns the value
+        AS-IS when the key is present with any value (including None) —
+        the default only fires when the key is MISSING entirely. So the
+        pre-sweep `hm.get('name', 'Unknown')` returned literal None when
+        `hm = {'name': None, ...}`, not the "Unknown" fallback. The
+        `.get(k) or default` sweep handles both empty-string AND None
+        because both are falsy. This test locks the None branch of the
+        sweep contract."""
         from gmail.digest import compose_digest
         job = self._job_with_hm({
             "name": None,
@@ -2519,6 +2593,115 @@ class TestDigestHmEmptyStringSweep:
             f"{body!r}"
         )
         assert "Reason: \n" not in body
+
+
+class TestBootstrapNeededDedupPreservesRawAtsDistinction:
+    """PR #12 iter-3 (multi-angle finding): `_render_bootstrap_needed`
+    dedup KEY must preserve the None/"" distinction, even though the
+    render LABEL coerces both to the same placeholder.
+
+    Pre-iter-2 shape: `.get("ats", "<ats>")` returned literal None for
+    `ats=None` rows and "" for `ats=""` rows; both survived as distinct
+    set members. Iter-2's naive sweep (`.get("ats") or "<ats>"; seen.add`)
+    collapsed both to `"<ats>"` — TWO legitimately-distinct bootstrap
+    failures rendered as ONE line, silently dropping one from the
+    operator's view. Iter-3 splits: dedup on raw `.get("ats")`, coerce
+    only for render.
+
+    Mutation check: revert `_render_bootstrap_needed` to
+    `ats = row.get("ats") or "<ats>"; seen.add(ats)`. This test's
+    two-line assertion fails (returns one line instead of two).
+    """
+
+    def test_mixed_none_and_empty_string_ats_surface_as_two_lines(self):
+        from gmail.digest import compose_digest
+        # Simulate the failure surface: two Decision-shape rows, one
+        # carrying ats=None (Decision.ats getattr default) and one
+        # carrying ats="" (a partial ATS-classification result).
+        # Bootstrap-needed rows are triggered by skipped-status +
+        # reason="session_expired" via the apply-result path.
+        from collections import namedtuple
+        FakeApplyResult = namedtuple(
+            "FakeApplyResult",
+            ["status", "reason", "ats", "application_id", "review_id",
+             "gmail_thread_id", "confirmation_screenshot", "company",
+             "similar_role"],
+        )
+        row_none = {
+            "title": "R1", "company": "C1", "url": "https://c1.example",
+            "lane": "l1",
+            "apply_result": FakeApplyResult(
+                status="skipped", reason="session_expired",
+                ats=None, application_id=None, review_id="rev1",
+                gmail_thread_id=None, confirmation_screenshot=None,
+                company="C1", similar_role=None,
+            ),
+        }
+        row_empty = {
+            "title": "R2", "company": "C2", "url": "https://c2.example",
+            "lane": "l2",
+            "apply_result": FakeApplyResult(
+                status="skipped", reason="session_expired",
+                ats="", application_id=None, review_id="rev2",
+                gmail_thread_id=None, confirmation_screenshot=None,
+                company="C2", similar_role=None,
+            ),
+        }
+        payload = compose_digest(
+            processed=[row_none, row_empty],
+            skipped=[],
+            apply_events=[],
+        )
+        body = payload.body
+        # Both placeholder-shape rows must surface as two distinct lines
+        # even though the render label collapses to the same string.
+        bootstrap_lines = [
+            line for line in body.splitlines()
+            if line.startswith("- Bootstrap needed")
+        ]
+        assert len(bootstrap_lines) == 2, (
+            f"mixed None/'' ats must produce 2 bootstrap lines "
+            f"(preserve raw distinction), got {len(bootstrap_lines)}: "
+            f"{bootstrap_lines!r}"
+        )
+
+    def test_two_none_ats_still_dedup_as_one_line(self):
+        """Regression guard on the dedup side: two rows with the SAME
+        raw ats (both None) still dedup as one, matching pre-iter-2
+        behavior. If iter-3 accidentally broke dedup entirely, this
+        surfaces the over-fix."""
+        from gmail.digest import compose_digest
+        from collections import namedtuple
+        FakeApplyResult = namedtuple(
+            "FakeApplyResult",
+            ["status", "reason", "ats", "application_id", "review_id",
+             "gmail_thread_id", "confirmation_screenshot", "company",
+             "similar_role"],
+        )
+        row_a = {
+            "title": "R1", "company": "C1", "url": "https://c1.example",
+            "lane": "l1",
+            "apply_result": FakeApplyResult(
+                status="skipped", reason="session_expired",
+                ats=None, application_id=None, review_id="rev1",
+                gmail_thread_id=None, confirmation_screenshot=None,
+                company="C1", similar_role=None,
+            ),
+        }
+        row_b = dict(row_a)
+        row_b["title"] = "R2"
+        row_b["url"] = "https://c2.example"
+        payload = compose_digest(
+            processed=[row_a, row_b], skipped=[], apply_events=[],
+        )
+        bootstrap_lines = [
+            line for line in payload.body.splitlines()
+            if line.startswith("- Bootstrap needed")
+        ]
+        assert len(bootstrap_lines) == 1, (
+            f"two None-ats rows must dedup to one line; got "
+            f"{len(bootstrap_lines)}: {bootstrap_lines!r}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -146,6 +146,15 @@ def _render_legacy_body(
             # confidence with a blank field. Coerce empty-string and
             # None to the human-readable fallback so the digest never
             # renders 'Hiring Manager:  — ()' with blank tails.
+            #
+            # iter-3 note (confidence field): the `.get('confidence') or
+            # 'N/A'` sweep coerces ANY falsy value to 'N/A'. `hm_finder`
+            # currently pins confidence to the string enum
+            # `{'high','medium','low'}` (see hm_finder.py:166), so the
+            # `or` sweep is semantically safe today. If a future refactor
+            # migrates confidence to a numeric score, a legitimate `0`
+            # would silently render 'N/A'; the sweep would need to
+            # narrow to `X if X is not None else 'N/A'` at that point.
             lines.append(
                 f"  Hiring Manager: {hm.get('name') or 'Unknown'} — "
                 f"{hm.get('title') or 'N/A'} ({hm.get('confidence') or 'N/A'})"
@@ -464,19 +473,33 @@ def _render_soft_dup(rows: list[dict]) -> str:
 def _render_bootstrap_needed(rows: list[dict]) -> str:
     """Deduplicated by ATS per spec Acceptance #8.
 
-    PR #12 iter-2 sweep-for-same-class: `_apply_result_to_row` unconditionally
-    sets `"ats": get("ats")` in the row shape — so `.get("ats", default)` here
-    returns the LITERAL None when the underlying object carries no `ats`
-    (the default never fires). Same L2-class fix pattern applied throughout
-    the other per-block renderers: `.get(...) or default` coerces both `None`
-    and `""` to the human-readable fallback.
+    PR #12 iter-2 sweep-for-same-class: BOTH row-shape helpers can
+    produce ats=None — `_apply_result_to_row` at digest.py:325 sets
+    `"ats": get("ats")` and `_decision_to_row` at digest.py:296 sets
+    `"ats": getattr(dec, "ats", None)`. Either path can propagate None
+    or "" into this renderer. Same L2-class fix pattern applied
+    throughout the other per-block renderers.
+
+    Iter-3 hardening (dedup key correctness): dedup by the RAW ats value
+    (None / "" / actual string) rather than the placeholder-coerced value.
+    Prior shape (`ats = .get("ats") or "<ats>"; seen.add(ats)`) merged
+    None-ats rows and ""-ats rows into the same `<ats>` bucket — dropping
+    one of two legitimately distinct bootstrap failures. Now:
+      - Dedup key is `row.get("ats")` (preserves None/"" distinction)
+      - Render label coerces None/"" to the "<ats>" placeholder
+    So two rows with mixed None+"" ats surface as TWO placeholder lines
+    (correct: operator sees the count of unknown-ATS bootstraps) while
+    two rows with the SAME concrete ats string still dedup as one.
     """
     lines = ["## Bootstrap needed"]
-    seen_ats: set[str] = set()
+    seen_ats: set = set()
     for row in rows:
-        ats = row.get("ats") or "<ats>"
-        if ats in seen_ats:
+        raw_ats = row.get("ats")
+        if raw_ats in seen_ats:
             continue
-        seen_ats.add(ats)
-        lines.append(f"- Bootstrap needed — {ats} session expired")
+        seen_ats.add(raw_ats)
+        # Placeholder coercion is a render-time cosmetic — the dedup key
+        # above already preserved None/"" as distinct set members.
+        ats_label = raw_ats or "<ats>"
+        lines.append(f"- Bootstrap needed — {ats_label} session expired")
     return "\n".join(lines)

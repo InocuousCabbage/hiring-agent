@@ -508,14 +508,17 @@ def _compose_output_base(job: dict, kind: str) -> str:
     per-job-url discriminator derived via ``blake2b(job['url'])``.
 
     Altitude rationale (PR #12 iter-2 pivot):
-      - The parser's dedup contract (M7 + Phase 5 iter-2/iter-3) makes
-        `job['url']` the canonical per-job identifier: two distinct
-        jobs are guaranteed to carry distinct URLs after the
-        `(title, url)` fallback dedup for `company == "Unknown"` /
-        empty-shape company. The discriminator therefore inherits the
-        parser's uniqueness guarantee — two same-title
-        `company='Unknown'` jobs render to distinct paths because
-        their URLs differ.
+      - The parser's dedup contract (M7 + Phase 5 iter-2/iter-3) uses
+        `(title, url)` as the fallback dedup key when
+        `company == "Unknown"` (or empty-shape company). So two
+        distinct URL-less-company jobs are guaranteed distinct URLs.
+        The renderer path that most needs disambiguation — two same-
+        title `company='Unknown'` jobs — is directly addressed by the
+        URL-derived tail. For real-company jobs the parser's
+        `(title, company)` dedup key already eliminates same-name
+        collisions upstream, so the URL tail is defense-in-depth
+        against non-parser code paths (test fixtures, future
+        ingestion) that might not have run the same dedup.
       - The prior altitude (hash appended inside `_safe_filename`)
         used `text` (the company/title string) as the hash input,
         so two `company='Unknown'` jobs produced the same hash tail
@@ -527,6 +530,16 @@ def _compose_output_base(job: dict, kind: str) -> str:
         `ENAMETOOLONG` see a single trailing discriminator instead
         of one per component.
 
+    URL contract (iter-3 hardening): `_compose_output_base` REQUIRES
+    a non-empty `job['url']` and raises `ValueError` if absent.
+    Silent fallback (`.get('url') or ''`) would map every URL-less job
+    to a fixed `blake2b(b'').hexdigest()[:4]` disc — so two same-
+    company, same-title, URL-less jobs would still collide and
+    silently overwrite each other. This is the exact M7 class the
+    pivot targets, and any caller producing job dicts without a URL
+    (test fixtures, upstream refactors bypassing the parser) needs
+    to fail loud rather than degrade to a shared-path silent write.
+
     `errors='surrogatepass'` on `job['url'].encode(...)` handles the
     corner case where the URL string contains an isolated Unicode
     surrogate (BeautifulSoup can produce these under specific
@@ -535,7 +548,24 @@ def _compose_output_base(job: dict, kind: str) -> str:
     round-trips them into the hash input so the discriminator remains
     computable rather than exploding at render time.
     """
-    url = job.get("url") or ""
+    url = job.get("url")
+    if not url:
+        raise ValueError(
+            "_compose_output_base requires a non-empty job['url']. Missing "
+            "or empty URL would produce a fixed discriminator "
+            "(blake2b(b'')) that silently collides with every other URL-"
+            "less job at the same (company, title) — the M7 class this "
+            "helper was written to prevent. Callers constructing job "
+            "dicts outside the parser must populate a URL identifier."
+        )
+    if not isinstance(url, str):
+        # Defensive: `Path` / `URL` objects don't expose `.encode(...)`.
+        # A caller passing a non-str URL is a bug at the composition
+        # boundary — raise loud rather than crash inside blake2b.
+        raise TypeError(
+            f"_compose_output_base requires job['url'] to be a str; got "
+            f"{type(url).__name__}: {url!r}"
+        )
     disc = blake2b(
         url.encode("utf-8", errors="surrogatepass"),
         digest_size=2,

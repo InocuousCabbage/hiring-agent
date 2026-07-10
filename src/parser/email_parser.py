@@ -306,19 +306,21 @@ def parse_alert_email(
         # validated. When the parser could not identify a real company,
         # key on URL instead so distinct-URL jobs both surface.
         #
-        # PR #12 finding #7 (resolved): `company` is already stripped
-        # upstream on every branch — `_split_company_location` returns
-        # `parts[0].strip()`, and the `elif` fallback stores
-        # `raw_stripped`. `not company` (empty string is falsy) is the
-        # only test needed. The historical `not company.strip()` disjunct
-        # is removed rather than kept as belt-and-suspenders: retaining
-        # it suggested unstripped values reach this line and drifted the
-        # code from the comment. Post-CRITICAL#5 the extraction block's
-        # invariant (company is either "Unknown" or a stripped non-empty
-        # value) is the anchor; if a future refactor drops that
-        # invariant, the fix is at the extraction block, not a defensive
-        # `.strip()` here.
-        no_real_company = (company == "Unknown") or (not company)
+        # PR #12 iter-3 (belt-and-suspenders restored): `company` is
+        # already stripped upstream on every branch —
+        # `_split_company_location` returns `parts[0].strip()`, and the
+        # `elif` fallback stores `raw_stripped`. `not company` catches
+        # the empty-string case. The `not company.strip()` disjunct is
+        # kept as runtime defense-in-depth: if a future refactor of the
+        # extraction block introduces a new dash-delimiter branch that
+        # forgets to strip, this line still degrades to the (title, url)
+        # dedup key rather than silently colliding on a whitespace-
+        # shaped company. Comment and code are now consistent — the
+        # earlier drift (code=`not company`, comment=`not company.strip()`
+        # retention rationale) is resolved by keeping both in the code.
+        no_real_company = (
+            (company == "Unknown") or (not company) or (not company.strip())
+        )
         dedup_key = (title, url) if no_real_company else (title, company)
         if dedup_key in seen_title_company:
             continue
