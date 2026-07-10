@@ -153,6 +153,31 @@ def test_l1_iter2_auto_fix_returns_originals_when_root_is_string(monkeypatch):
     assert c is cover_in
 
 
+def test_m14_iter3_private_get_or_create_label_has_no_stacked_retry():
+    """M14 iter-3: the PRIVATE _get_or_create_label must NOT wrap another
+    @navigation_retry — its callers (mark_processed) are already decorated,
+    and nesting decorators amplifies transient-failure retries 3x3.
+    The public form keeps its decorator for standalone callers."""
+    from gmail.client import GmailClient
+    import inspect
+
+    private_src = inspect.getsource(GmailClient._get_or_create_label)
+    core_src = inspect.getsource(GmailClient._get_or_create_label_core)
+    # The private form (called from decorated mark_processed) must not
+    # stack a second retry decorator — check that the SOURCE lines
+    # immediately preceding the def do not carry @navigation_retry.
+    # Verify by inspecting the function's source: the wrapper attribute
+    # `__wrapped__` is added by tenacity.retry; its absence proves
+    # the method wasn't wrapped.
+    assert not hasattr(GmailClient._get_or_create_label, "__wrapped__"), (
+        "M14 iter-3: _get_or_create_label appears to be decorated with "
+        "@navigation_retry — this stacks retries inside mark_processed's own"
+    )
+    # The core (undecorated) must contain the cache-aware logic that both
+    # public and private forms delegate to.
+    assert "_label_cache" in core_src
+
+
 def test_m14_iter2_private_get_or_create_label_uses_cache():
     """M14 iter-2: the PRIVATE _get_or_create_label (called by
     mark_processed on the per-alert hot path) must delegate to the

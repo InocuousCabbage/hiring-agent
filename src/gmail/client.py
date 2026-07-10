@@ -292,14 +292,45 @@ class GmailClient:
     def _get_or_create_label(self, label_name: str) -> str:
         """Get label ID by name, creating it if it doesn't exist.
 
-        M14 iter-2 refinement: routed through the public cached
-        ``get_or_create_label`` so ``mark_processed`` (called per alert
-        on the hot path) also benefits from the per-instance label cache.
-        Pre-refinement, this private method issued a fresh labels.list()
-        RPC per alert cycle. The public method has identical
-        create-body semantics, so the delegation is behavior-preserving.
+        M14 iter-2/iter-3: shares the cache-aware core with the public
+        ``get_or_create_label`` via ``_get_or_create_label_core`` but
+        does NOT stack a second ``@navigation_retry``. ``mark_processed``
+        already carries the retry decorator; delegating this private
+        method to the DECORATED public form would nest retries and
+        amplify a transient-error round-trip count 3x3x3 (the same
+        anti-pattern the M11 fix removed from send_urgent).
         """
-        return self.get_or_create_label(label_name)
+        return self._get_or_create_label_core(label_name)
+
+    def _get_or_create_label_core(self, label_name: str) -> str:
+        """Cache-aware label resolution WITHOUT retry decoration.
+
+        Shared implementation used by the DECORATED public
+        ``get_or_create_label`` and the UNDECORATED private
+        ``_get_or_create_label``. Both delegate here so the caching
+        behavior is identical; only the retry surface differs.
+        """
+        # Fast path: cache hit.
+        if self._label_cache is not None and label_name in self._label_cache:
+            return self._label_cache[label_name]
+        # Miss: refresh via list_labels, which populates the cache.
+        for label in self.list_labels():
+            if label.get("name") == label_name:
+                return label["id"]
+        # Not found — create + memo.
+        body = {
+            "name": label_name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show",
+        }
+        created = (
+            self.service.users().labels().create(userId="me", body=body).execute()
+        )
+        new_id = created["id"]
+        if self._label_cache is None:
+            self._label_cache = {}
+        self._label_cache[label_name] = new_id
+        return new_id
 
     @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
     def get_unread_alerts(
@@ -452,31 +483,13 @@ class GmailClient:
 
         M14: first checks the per-instance label cache before calling
         ``list_labels()``. On create, the new (name, id) is written to
-        the cache so a subsequent lookup skips another round-trip."""
-        # Fast path: cache hit.
-        if self._label_cache is not None and name in self._label_cache:
-            return self._label_cache[name]
-        # Miss (either cache empty or name absent): refresh via list_labels,
-        # which populates the cache as a side effect.
-        for label in self.list_labels():
-            if label.get("name") == name:
-                return label["id"]
-        # Not found — create + memo.
-        body = {
-            "name": name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
-        created = (
-            self.service.users().labels().create(userId="me", body=body).execute()
-        )
-        new_id = created["id"]
-        # Cache the just-created label so the next lookup is a hit even if
-        # another get_or_create_label call follows without a list_labels.
-        if self._label_cache is None:
-            self._label_cache = {}
-        self._label_cache[name] = new_id
-        return new_id
+        the cache so a subsequent lookup skips another round-trip.
+
+        Delegates the cache-aware core to ``_get_or_create_label_core``
+        so the private ``_get_or_create_label`` (called by the already-
+        decorated ``mark_processed``) can share the same caching
+        behavior WITHOUT stacking a second retry decorator (iter-3)."""
+        return self._get_or_create_label_core(name)
 
     @navigation_retry
     def apply_label(self, msg_id: str, label_id: str) -> None:
