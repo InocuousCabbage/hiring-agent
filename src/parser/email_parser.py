@@ -306,23 +306,18 @@ def parse_alert_email(
         # validated. When the parser could not identify a real company,
         # key on URL instead so distinct-URL jobs both surface.
         #
-        # PR #12 finding #7: `company` is already stripped upstream in
-        # both `_split_company_location` (parts[0].strip()) and the
-        # `elif` fallback (raw.strip()). The historical `not company.strip()`
-        # disjunct is therefore redundant — `not company` is sufficient
-        # (empty string is falsy). Retaining the .strip() suggests to
-        # future readers that unstripped company values reach this line,
-        # which is not the case post-altitude-fix.
-        #
-        # Post-CRITICAL#5 altitude fix, `company` is guaranteed to be
-        # either "Unknown" (fallback sentinel) or a non-empty/non-invisible
-        # string — the extraction block above establishes that invariant
-        # via `_strip_format_chars` + the `or "Unknown"` fallback on every
-        # branch. The `not company.strip()` disjunct is therefore
-        # unreachable at runtime but kept as belt-and-suspenders defense
-        # in depth: if a future refactor of the extraction block drops the
-        # invariant, this line still degrades safely to the (title, url)
-        # dedup key rather than silently colliding.
+        # PR #12 finding #7 (resolved): `company` is already stripped
+        # upstream on every branch — `_split_company_location` returns
+        # `parts[0].strip()`, and the `elif` fallback stores
+        # `raw_stripped`. `not company` (empty string is falsy) is the
+        # only test needed. The historical `not company.strip()` disjunct
+        # is removed rather than kept as belt-and-suspenders: retaining
+        # it suggested unstripped values reach this line and drifted the
+        # code from the comment. Post-CRITICAL#5 the extraction block's
+        # invariant (company is either "Unknown" or a stripped non-empty
+        # value) is the anchor; if a future refactor drops that
+        # invariant, the fix is at the extraction block, not a defensive
+        # `.strip()` here.
         no_real_company = (company == "Unknown") or (not company)
         dedup_key = (title, url) if no_real_company else (title, company)
         if dedup_key in seen_title_company:

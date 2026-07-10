@@ -25,13 +25,13 @@ Skills table (Table 0):  3 rows × 3 cols
     run[1]  ' Skill Name '  Times New Roman 10pt  ← REPLACE TEXT ONLY
 """
 
-import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 from copy import deepcopy
+from hashlib import blake2b
 from pathlib import Path
 from typing import Optional
 
@@ -102,7 +102,7 @@ def render_resume(
         raise FileNotFoundError(f"Resume template not found: {template_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{_safe_filename(job['company'])}_{_safe_filename(job['title'])}_Resume"
+    base = _compose_output_base(job, "Resume")
     docx_path = output_dir / f"{base}.docx"
     pdf_path  = output_dir / f"{base}.pdf"
 
@@ -135,7 +135,7 @@ def render_cover_letter(
     render_resume() docstring for rationale.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{_safe_filename(job['company'])}_{_safe_filename(job['title'])}_Cover_Letter"
+    base = _compose_output_base(job, "Cover_Letter")
     docx_path = output_dir / f"{base}.docx"
     pdf_path  = output_dir / f"{base}.pdf"
 
@@ -482,41 +482,64 @@ def _insert_paragraph_after(ref_para: Paragraph, text: str) -> Paragraph:
 def _safe_filename(text: str) -> str:
     """Sanitize `text` for use as a filename component.
 
-    Applies two transforms:
+    Pure sanitizer — no hashing, no per-input discrimination. Applies:
       1. Strip filesystem-unsafe chars via `[^\\w\\s-]`.
       2. Collapse whitespace to `_`, then truncate to 50 chars.
+      3. Fall back to the "unnamed" sentinel when the sanitized value
+         is empty (whitespace-only input, Cf-only input the regex
+         erased, etc.).
 
-    PR #12 finding #12 (altitude-fix scope-out): the `[^\\w\\s-]` regex
-    strips ALL Unicode Cf (format) chars — including ZWJ (U+200D) and
-    ZWNJ (U+200C) — because Python's `\\w` character class excludes
-    the Cf category. `email_parser._strip_format_chars` deliberately
-    PRESERVES ZWJ/ZWNJ upstream because they are semantically load-
-    bearing in Persian/Urdu (ZWNJ) and Devanagari/emoji (ZWJ). Two
-    Persian company names that differ only in mid-name ZWNJ position
-    (`"شرکت‌الف"` vs `"شرکتالف"`) reach this function as distinct
-    strings but collapse to identical sanitized shapes. When both
-    companies also share a title, the renderer produces
-    `{company}_{title}_Resume.docx` on the same path for both jobs
-    and the second render silently overwrites the first — a per-alert
-    downstream cascade of the M7 same-shape-collision class the
-    altitude fix targets.
-
-    Post-hardening: append a short hash of the ORIGINAL input text as
-    a disambiguating suffix. The hash is derived from `text` BEFORE
-    sanitization so invisible-char differences the regex erases
-    (ZWNJ position, mid-name BOM, non-`\\w` scripts stripped to '')
-    are preserved in the discriminator.
-
-    Format: `{sanitized-or-'unnamed'}_{4-hex}` — 4 hex chars = 65,536
-    buckets. Per-alert P(collision) ~= n(n-1)/(2 * 65536); for the
-    pipeline's max_jobs=99 upper bound that is ~0.075 per alert, and
-    filename collisions no longer silently overwrite — they either
-    remain distinct or, on the extreme hash-collision case, land on
-    the same path (indistinguishable from the pre-fix behavior on
-    that one collision only).
+    Per-input collision discrimination is the caller's responsibility —
+    see `_compose_output_base` for how the renderer combines the
+    sanitizer output with a per-job-url discriminator. Making
+    discrimination a caller concern keeps this helper reusable for
+    future callers (log slugs, Notion page slugs, arbitrary user-
+    input path segments) that do NOT want a mandatory `_XXXX` hash
+    tail on English-language happy-path inputs.
     """
     safe = re.sub(r"[^\w\s-]", "", text)
     safe = re.sub(r"\s+", "_", safe.strip())
-    truncated = safe[:50] or "unnamed"
-    suffix = hashlib.blake2b(text.encode("utf-8"), digest_size=2).hexdigest()
-    return f"{truncated}_{suffix}"
+    return safe[:50] or "unnamed"
+
+
+def _compose_output_base(job: dict, kind: str) -> str:
+    """Compose the renderer's output filename base as
+    ``{company}_{title}_{disc}_{kind}`` — where `disc` is a 4-hex
+    per-job-url discriminator derived via ``blake2b(job['url'])``.
+
+    Altitude rationale (PR #12 iter-2 pivot):
+      - The parser's dedup contract (M7 + Phase 5 iter-2/iter-3) makes
+        `job['url']` the canonical per-job identifier: two distinct
+        jobs are guaranteed to carry distinct URLs after the
+        `(title, url)` fallback dedup for `company == "Unknown"` /
+        empty-shape company. The discriminator therefore inherits the
+        parser's uniqueness guarantee — two same-title
+        `company='Unknown'` jobs render to distinct paths because
+        their URLs differ.
+      - The prior altitude (hash appended inside `_safe_filename`)
+        used `text` (the company/title string) as the hash input,
+        so two `company='Unknown'` jobs produced the same hash tail
+        and silently overwrote each other. Moving the hash to the
+        composite base with the URL as input eliminates that class.
+      - Only ONE `_XXXX` tail lands on the base (not two — one per
+        `_safe_filename` call), so multibyte inputs where per-
+        component truncation could push the composite over
+        `ENAMETOOLONG` see a single trailing discriminator instead
+        of one per component.
+
+    `errors='surrogatepass'` on `job['url'].encode(...)` handles the
+    corner case where the URL string contains an isolated Unicode
+    surrogate (BeautifulSoup can produce these under specific
+    malformed-HTML paths). `blake2b` requires bytes, and default
+    utf-8 encoding raises on a lone surrogate; `surrogatepass`
+    round-trips them into the hash input so the discriminator remains
+    computable rather than exploding at render time.
+    """
+    url = job.get("url") or ""
+    disc = blake2b(
+        url.encode("utf-8", errors="surrogatepass"),
+        digest_size=2,
+    ).hexdigest()
+    company = _safe_filename(job["company"])
+    title = _safe_filename(job["title"])
+    return f"{company}_{title}_{disc}_{kind}"

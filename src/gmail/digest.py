@@ -128,13 +128,27 @@ def _render_legacy_body(
         # coerces both empty-string and None to the fallback.
         location = job.get("location") or "Unknown"
         lines.append(f"  {job['title']} — {job['company']} ({location})")
-        lines.append(f"  Lane: {job.get('lane', 'N/A')}")
+        # PR #12 iter-2 sweep: same L2 class as location/hm fields. `lane`
+        # is populated by main.py from `lane["label"]` (config-side); an
+        # empty label from a misconfigured lane row leaks a blank
+        # 'Lane: ' line pre-sweep. `.get(...) or default` is belt-and-
+        # suspenders defense against the empty-string branch.
+        lines.append(f"  Lane: {job.get('lane') or 'N/A'}")
         lines.append(f"  URL: {job['url']}")
         hm = job.get("hiring_manager")
         if hm:
+            # PR #12 iter-2 sweep (same class as location empty-string
+            # sentinel above). `.get(k, default)` returns the empty
+            # string when the key exists with an empty value — same
+            # class as the parser's `location=""` trailing-dash case.
+            # The LLM-emitted `hiring_manager` dict can carry `""` for
+            # any of these keys when the HM finder returned "partial"
+            # confidence with a blank field. Coerce empty-string and
+            # None to the human-readable fallback so the digest never
+            # renders 'Hiring Manager:  — ()' with blank tails.
             lines.append(
-                f"  Hiring Manager: {hm.get('name', 'Unknown')} — "
-                f"{hm.get('title', 'N/A')} ({hm.get('confidence', 'N/A')})"
+                f"  Hiring Manager: {hm.get('name') or 'Unknown'} — "
+                f"{hm.get('title') or 'N/A'} ({hm.get('confidence') or 'N/A'})"
             )
             if hm.get("linkedin_url"):
                 lines.append(f"  LinkedIn: {hm['linkedin_url']}")
@@ -150,7 +164,11 @@ def _render_legacy_body(
         for job in skipped:
             lines.append(f"  {job['title']} — {job['company']}")
             lines.append(f"  URL: {job['url']}")
-            lines.append(f"  Reason: {job.get('reason', 'Unknown')}")
+            # PR #12 iter-2 sweep — same L2 class. `reason` is code-
+            # generated in main.py but an f-string with empty substitution
+            # (e.g. `f"Poor fit — confidence /100"` when confidence is None)
+            # would leak a partial-blank tail.
+            lines.append(f"  Reason: {job.get('reason') or 'Unknown'}")
             lines.append("")
 
     lines.append("\n— Hiring Agent (automated)")
@@ -411,9 +429,11 @@ def _render_review_required(rows: list[dict]) -> tuple[str, list[Path]]:
         else:
             # L7-safe log: identify by review_id, never leak the path (which
             # could belong to another user's workspace).
+            # PR #12 iter-2 sweep — same L2 class: `.get()` returns None
+            # when the key exists with value None (Decision-shape rows).
             _log.info(
                 "digest.screenshot_missing review_id=%s",
-                row.get("review_id", "<unknown>"),
+                row.get("review_id") or "<unknown>",
             )
     return "\n".join(lines), attachments
 
@@ -442,11 +462,19 @@ def _render_soft_dup(rows: list[dict]) -> str:
 
 
 def _render_bootstrap_needed(rows: list[dict]) -> str:
-    """Deduplicated by ATS per spec Acceptance #8."""
+    """Deduplicated by ATS per spec Acceptance #8.
+
+    PR #12 iter-2 sweep-for-same-class: `_apply_result_to_row` unconditionally
+    sets `"ats": get("ats")` in the row shape — so `.get("ats", default)` here
+    returns the LITERAL None when the underlying object carries no `ats`
+    (the default never fires). Same L2-class fix pattern applied throughout
+    the other per-block renderers: `.get(...) or default` coerces both `None`
+    and `""` to the human-readable fallback.
+    """
     lines = ["## Bootstrap needed"]
     seen_ats: set[str] = set()
     for row in rows:
-        ats = row.get("ats", "<ats>")
+        ats = row.get("ats") or "<ats>"
         if ats in seen_ats:
             continue
         seen_ats.add(ats)

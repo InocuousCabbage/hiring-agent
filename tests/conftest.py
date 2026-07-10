@@ -723,6 +723,21 @@ def main_root_with_config():
         )
         if settings_data is None:
             settings_data = {}
+        # PR #12 iter-2 (clarify TypeError): a list or scalar root
+        # (e.g. `- key: val` at the top of settings.yaml — a real
+        # copy-paste mistake) would produce a `list`/`bool`/`int`/`str`
+        # root that `.setdefault(...)` can't accept. Rather than let
+        # the ensuing AttributeError bubble with a generic message
+        # ("'list' object has no attribute 'setdefault'"), raise a
+        # TypeError that names the offending file + observed type so
+        # future maintainers can locate the config typo immediately.
+        if not isinstance(settings_data, dict):
+            raise TypeError(
+                f"config/settings.yaml root must be a mapping (dict), "
+                f"got {type(settings_data).__name__}: {settings_data!r}. "
+                f"Check that the file begins with `key: value` pairs, "
+                f"not a list (`- key: value`) or scalar."
+            )
         apply_block = settings_data.setdefault("apply", {})
         # PR #12 finding #6: guard covers `apply: null` (None) but a
         # scalar shape (`apply: false`, `apply: 0`, `apply: "off"`) also
