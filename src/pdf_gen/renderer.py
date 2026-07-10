@@ -549,22 +549,30 @@ def _compose_output_base(job: dict, kind: str) -> str:
     computable rather than exploding at render time.
     """
     url = job.get("url")
-    if not url:
-        raise ValueError(
-            "_compose_output_base requires a non-empty job['url']. Missing "
-            "or empty URL would produce a fixed discriminator "
-            "(blake2b(b'')) that silently collides with every other URL-"
-            "less job at the same (company, title) — the M7 class this "
-            "helper was written to prevent. Callers constructing job "
-            "dicts outside the parser must populate a URL identifier."
-        )
-    if not isinstance(url, str):
-        # Defensive: `Path` / `URL` objects don't expose `.encode(...)`.
-        # A caller passing a non-str URL is a bug at the composition
-        # boundary — raise loud rather than crash inside blake2b.
+    # Iter-3: check TYPE first so misleading "populate a URL" errors don't
+    # fire for numeric-0 / False / bytes / Path callers whose actual bug
+    # is the type, not the emptiness. TypeError names the wrong shape;
+    # ValueError names the missing/whitespace content.
+    if url is not None and not isinstance(url, str):
         raise TypeError(
             f"_compose_output_base requires job['url'] to be a str; got "
             f"{type(url).__name__}: {url!r}"
+        )
+    # Iter-3: `not url` catches empty string + None, but `url=' '` (or
+    # any whitespace-only str) is truthy and would collapse to the fixed
+    # `blake2b(b' ').hexdigest()[:4]` disc — same M7 class the guard was
+    # written to prevent, just with a whitespace sentinel. Strip before
+    # the emptiness check so whitespace-only URLs trip the ValueError arm
+    # instead of silently colliding downstream.
+    if not url or not url.strip():
+        raise ValueError(
+            "_compose_output_base requires a non-empty job['url']. Missing "
+            "or whitespace-only URL would produce a fixed discriminator "
+            "(blake2b of empty/whitespace bytes) that silently collides "
+            "with every other URL-less job at the same (company, title) — "
+            "the M7 class this helper was written to prevent. Callers "
+            "constructing job dicts outside the parser must populate a "
+            "URL identifier."
         )
     disc = blake2b(
         url.encode("utf-8", errors="surrogatepass"),

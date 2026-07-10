@@ -306,21 +306,16 @@ def parse_alert_email(
         # validated. When the parser could not identify a real company,
         # key on URL instead so distinct-URL jobs both surface.
         #
-        # PR #12 iter-3 (belt-and-suspenders restored): `company` is
-        # already stripped upstream on every branch —
-        # `_split_company_location` returns `parts[0].strip()`, and the
-        # `elif` fallback stores `raw_stripped`. `not company` catches
-        # the empty-string case. The `not company.strip()` disjunct is
-        # kept as runtime defense-in-depth: if a future refactor of the
-        # extraction block introduces a new dash-delimiter branch that
-        # forgets to strip, this line still degrades to the (title, url)
-        # dedup key rather than silently colliding on a whitespace-
-        # shaped company. Comment and code are now consistent — the
-        # earlier drift (code=`not company`, comment=`not company.strip()`
-        # retention rationale) is resolved by keeping both in the code.
-        no_real_company = (
-            (company == "Unknown") or (not company) or (not company.strip())
-        )
+        # PR #12 iter-3 (contrarian + sweep review consensus): `company`
+        # is stripped upstream on every branch — `_split_company_location`
+        # returns `parts[0].strip()` post `_has_meaningful_content` gate,
+        # and the `elif` fallback stores `raw_stripped` post the same
+        # gate. `not company` alone catches the empty-string case;
+        # `not company.strip()` disjunct was proven dead (no producer
+        # path yields whitespace-shaped truthy company). Removed to keep
+        # the invariant anchored at the extraction block rather than
+        # scattered defensive OR-chains downstream.
+        no_real_company = (company == "Unknown") or (not company)
         dedup_key = (title, url) if no_real_company else (title, company)
         if dedup_key in seen_title_company:
             continue
