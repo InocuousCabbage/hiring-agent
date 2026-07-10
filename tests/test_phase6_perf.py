@@ -153,6 +153,41 @@ def test_l1_iter2_auto_fix_returns_originals_when_root_is_string(monkeypatch):
     assert c is cover_in
 
 
+def test_m14_iter4_get_or_create_label_core_uses_undecorated_list():
+    """M14 iter-4: _get_or_create_label_core must call the UNDECORATED
+    _list_labels_core, not the decorated list_labels. Iter-3 undecorated
+    the private _get_or_create_label but the core still called the
+    DECORATED list_labels, so mark_processed's retry surface stacked
+    into list_labels's retry surface (3x3=9 attempts on transient fail).
+    """
+    from gmail.client import GmailClient
+    import inspect
+
+    core_src = inspect.getsource(GmailClient._get_or_create_label_core)
+    # Must NOT call self.list_labels() — that would stack retries.
+    # (Comments containing 'list_labels' are fine — check for the CALL.)
+    call_lines = [
+        line for line in core_src.split("\n")
+        if "list_labels" in line and not line.lstrip().startswith("#")
+        and '"""' not in line and "'''" not in line
+    ]
+    # Must call _list_labels_core.
+    has_core_call = any("_list_labels_core()" in ln for ln in call_lines)
+    # Must NOT call the bare list_labels() (which is decorated).
+    has_bare_call = any(
+        "self.list_labels()" in ln for ln in call_lines
+    )
+    assert has_core_call and not has_bare_call, (
+        f"M14 iter-4: _get_or_create_label_core must delegate to "
+        f"_list_labels_core, not the decorated list_labels. "
+        f"Found lines: {call_lines}"
+    )
+    # Assert the core itself is not decorated.
+    assert not hasattr(GmailClient._list_labels_core, "__wrapped__"), (
+        "M14 iter-4: _list_labels_core must be undecorated"
+    )
+
+
 def test_m14_iter3_private_get_or_create_label_has_no_stacked_retry():
     """M14 iter-3: the PRIVATE _get_or_create_label must NOT wrap another
     @navigation_retry — its callers (mark_processed) are already decorated,

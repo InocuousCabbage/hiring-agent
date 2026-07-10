@@ -309,12 +309,20 @@ class GmailClient:
         ``get_or_create_label`` and the UNDECORATED private
         ``_get_or_create_label``. Both delegate here so the caching
         behavior is identical; only the retry surface differs.
+
+        iter-4: uses ``_list_labels_core`` (undecorated) rather than
+        ``list_labels`` (decorated) so a cold-cache
+        ``mark_processed`` doesn't stack ``mark_processed`` (3) ×
+        ``list_labels`` (3) = 9 attempts on a transient labels.list
+        failure. Post-iter-4 the single retry surface is
+        ``mark_processed`` at 3 attempts total.
         """
         # Fast path: cache hit.
         if self._label_cache is not None and label_name in self._label_cache:
             return self._label_cache[label_name]
-        # Miss: refresh via list_labels, which populates the cache.
-        for label in self.list_labels():
+        # Miss: refresh via _list_labels_core (undecorated), which
+        # populates the cache.
+        for label in self._list_labels_core():
             if label.get("name") == label_name:
                 return label["id"]
         # Not found — create + memo.
@@ -458,7 +466,23 @@ class GmailClient:
         on first call, so subsequent lookups via ``get_or_create_label``
         skip the round-trip. The raw list is returned unchanged; cache
         drift is only possible if labels are created outside this client
-        (call ``refresh_labels()`` to force re-fetch)."""
+        (call ``refresh_labels()`` to force re-fetch).
+
+        Delegates to ``_list_labels_core`` so callers already inside a
+        ``@navigation_retry`` decorator (e.g. mark_processed via
+        _get_or_create_label_core) can invoke the core directly without
+        stacking a second retry surface (iter-4)."""
+        return self._list_labels_core()
+
+    def _list_labels_core(self) -> list[dict]:
+        """Undecorated label-roster fetch + cache refresh.
+
+        Shared implementation used by the DECORATED public ``list_labels``
+        (for standalone callers) and by the UNDECORATED
+        ``_get_or_create_label_core`` (invoked from the already-retried
+        ``mark_processed`` hot path). Keeping this undecorated ensures
+        that a ``labels.list()`` transient failure inside a cold-cache
+        mark_processed cycle burns 3 attempts total — not 3×3 (iter-4)."""
         results = self.service.users().labels().list(userId="me").execute()
         labels = results.get("labels", [])
         # Refresh cache from the authoritative response.
