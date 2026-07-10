@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 from copy import deepcopy
+from hashlib import blake2b
 from pathlib import Path
 from typing import Optional
 
@@ -101,7 +102,7 @@ def render_resume(
         raise FileNotFoundError(f"Resume template not found: {template_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{_safe_filename(job['company'])}_{_safe_filename(job['title'])}_Resume"
+    base = _compose_output_base(job, "Resume")
     docx_path = output_dir / f"{base}.docx"
     pdf_path  = output_dir / f"{base}.pdf"
 
@@ -134,7 +135,7 @@ def render_cover_letter(
     render_resume() docstring for rationale.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{_safe_filename(job['company'])}_{_safe_filename(job['title'])}_Cover_Letter"
+    base = _compose_output_base(job, "Cover_Letter")
     docx_path = output_dir / f"{base}.docx"
     pdf_path  = output_dir / f"{base}.pdf"
 
@@ -479,6 +480,104 @@ def _insert_paragraph_after(ref_para: Paragraph, text: str) -> Paragraph:
 
 
 def _safe_filename(text: str) -> str:
+    """Sanitize `text` for use as a filename component.
+
+    Pure sanitizer — no hashing, no per-input discrimination. Applies:
+      1. Strip filesystem-unsafe chars via `[^\\w\\s-]`.
+      2. Collapse whitespace to `_`, then truncate to 50 chars.
+      3. Fall back to the "unnamed" sentinel when the sanitized value
+         is empty (whitespace-only input, Cf-only input the regex
+         erased, etc.).
+
+    Per-input collision discrimination is the caller's responsibility —
+    see `_compose_output_base` for how the renderer combines the
+    sanitizer output with a per-job-url discriminator. Making
+    discrimination a caller concern keeps this helper reusable for
+    future callers (log slugs, Notion page slugs, arbitrary user-
+    input path segments) that do NOT want a mandatory `_XXXX` hash
+    tail on English-language happy-path inputs.
+    """
     safe = re.sub(r"[^\w\s-]", "", text)
     safe = re.sub(r"\s+", "_", safe.strip())
-    return safe[:50]
+    return safe[:50] or "unnamed"
+
+
+def _compose_output_base(job: dict, kind: str) -> str:
+    """Compose the renderer's output filename base as
+    ``{company}_{title}_{disc}_{kind}`` — where `disc` is a 4-hex
+    per-job-url discriminator derived via ``blake2b(job['url'])``.
+
+    Altitude rationale (PR #12 iter-2 pivot):
+      - The parser's dedup contract (M7 + Phase 5 iter-2/iter-3) uses
+        `(title, url)` as the fallback dedup key when
+        `company == "Unknown"` (or empty-shape company). So two
+        distinct URL-less-company jobs are guaranteed distinct URLs.
+        The renderer path that most needs disambiguation — two same-
+        title `company='Unknown'` jobs — is directly addressed by the
+        URL-derived tail. For real-company jobs the parser's
+        `(title, company)` dedup key already eliminates same-name
+        collisions upstream, so the URL tail is defense-in-depth
+        against non-parser code paths (test fixtures, future
+        ingestion) that might not have run the same dedup.
+      - The prior altitude (hash appended inside `_safe_filename`)
+        used `text` (the company/title string) as the hash input,
+        so two `company='Unknown'` jobs produced the same hash tail
+        and silently overwrote each other. Moving the hash to the
+        composite base with the URL as input eliminates that class.
+      - Only ONE `_XXXX` tail lands on the base (not two — one per
+        `_safe_filename` call), so multibyte inputs where per-
+        component truncation could push the composite over
+        `ENAMETOOLONG` see a single trailing discriminator instead
+        of one per component.
+
+    URL contract (iter-3 hardening): `_compose_output_base` REQUIRES
+    a non-empty `job['url']` and raises `ValueError` if absent.
+    Silent fallback (`.get('url') or ''`) would map every URL-less job
+    to a fixed `blake2b(b'').hexdigest()[:4]` disc — so two same-
+    company, same-title, URL-less jobs would still collide and
+    silently overwrite each other. This is the exact M7 class the
+    pivot targets, and any caller producing job dicts without a URL
+    (test fixtures, upstream refactors bypassing the parser) needs
+    to fail loud rather than degrade to a shared-path silent write.
+
+    `errors='surrogatepass'` on `job['url'].encode(...)` handles the
+    corner case where the URL string contains an isolated Unicode
+    surrogate (BeautifulSoup can produce these under specific
+    malformed-HTML paths). `blake2b` requires bytes, and default
+    utf-8 encoding raises on a lone surrogate; `surrogatepass`
+    round-trips them into the hash input so the discriminator remains
+    computable rather than exploding at render time.
+    """
+    url = job.get("url")
+    # Iter-3: check TYPE first so misleading "populate a URL" errors don't
+    # fire for numeric-0 / False / bytes / Path callers whose actual bug
+    # is the type, not the emptiness. TypeError names the wrong shape;
+    # ValueError names the missing/whitespace content.
+    if url is not None and not isinstance(url, str):
+        raise TypeError(
+            f"_compose_output_base requires job['url'] to be a str; got "
+            f"{type(url).__name__}: {url!r}"
+        )
+    # Iter-3: `not url` catches empty string + None, but `url=' '` (or
+    # any whitespace-only str) is truthy and would collapse to the fixed
+    # `blake2b(b' ').hexdigest()[:4]` disc — same M7 class the guard was
+    # written to prevent, just with a whitespace sentinel. Strip before
+    # the emptiness check so whitespace-only URLs trip the ValueError arm
+    # instead of silently colliding downstream.
+    if not url or not url.strip():
+        raise ValueError(
+            "_compose_output_base requires a non-empty job['url']. Missing "
+            "or whitespace-only URL would produce a fixed discriminator "
+            "(blake2b of empty/whitespace bytes) that silently collides "
+            "with every other URL-less job at the same (company, title) — "
+            "the M7 class this helper was written to prevent. Callers "
+            "constructing job dicts outside the parser must populate a "
+            "URL identifier."
+        )
+    disc = blake2b(
+        url.encode("utf-8", errors="surrogatepass"),
+        digest_size=2,
+    ).hexdigest()
+    company = _safe_filename(job["company"])
+    title = _safe_filename(job["title"])
+    return f"{company}_{title}_{disc}_{kind}"

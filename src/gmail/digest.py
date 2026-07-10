@@ -120,15 +120,33 @@ def _render_legacy_body(
     lines.append(f"Processed ({len(processed)})")
     lines.append("=" * 40)
     for job in processed:
-        location = job.get("location", "Unknown")
+        # PR #12 finding #11 (altitude-fix scope-out sweep): parser
+        # returns `location=""` for trailing-dash raws like `"Acme —"`.
+        # `.get("location", "Unknown")` returns `""` (not the default)
+        # when the key exists with an empty value — same class as the
+        # company-side sentinel PR #11 fixed. `.get(...) or default`
+        # coerces both empty-string and None to the fallback.
+        location = job.get("location") or "Unknown"
         lines.append(f"  {job['title']} — {job['company']} ({location})")
-        lines.append(f"  Lane: {job.get('lane', 'N/A')}")
+        # PR #12 iter-2 sweep: same L2 class as location/hm fields. `lane`
+        # is populated by main.py from `lane["label"]` (config-side); an
+        # empty label from a misconfigured lane row leaks a blank
+        # 'Lane: ' line pre-sweep. `.get(...) or default` is belt-and-
+        # suspenders defense against the empty-string branch.
+        lines.append(f"  Lane: {job.get('lane') or 'N/A'}")
         lines.append(f"  URL: {job['url']}")
         hm = job.get("hiring_manager")
         if hm:
+            # PR #12 L2-class sweep: `.get(k, default)` returns `""` when
+            # the key exists with an empty value. LLM-emitted `hm` dict
+            # can carry `""` on partial-confidence matches — coerce to
+            # the human-readable fallback via `.get(...) or default`.
+            # Constraint: hm['confidence'] is str enum {high, medium, low}
+            # per hm_finder.py:166 — a future numeric-confidence migration
+            # would need to narrow this sweep to `is not None`.
             lines.append(
-                f"  Hiring Manager: {hm.get('name', 'Unknown')} — "
-                f"{hm.get('title', 'N/A')} ({hm.get('confidence', 'N/A')})"
+                f"  Hiring Manager: {hm.get('name') or 'Unknown'} — "
+                f"{hm.get('title') or 'N/A'} ({hm.get('confidence') or 'N/A'})"
             )
             if hm.get("linkedin_url"):
                 lines.append(f"  LinkedIn: {hm['linkedin_url']}")
@@ -144,7 +162,11 @@ def _render_legacy_body(
         for job in skipped:
             lines.append(f"  {job['title']} — {job['company']}")
             lines.append(f"  URL: {job['url']}")
-            lines.append(f"  Reason: {job.get('reason', 'Unknown')}")
+            # PR #12 iter-2 sweep — same L2 class. `reason` is code-
+            # generated in main.py but an f-string with empty substitution
+            # (e.g. `f"Poor fit — confidence /100"` when confidence is None)
+            # would leak a partial-blank tail.
+            lines.append(f"  Reason: {job.get('reason') or 'Unknown'}")
             lines.append("")
 
     lines.append("\n— Hiring Agent (automated)")
@@ -405,9 +427,11 @@ def _render_review_required(rows: list[dict]) -> tuple[str, list[Path]]:
         else:
             # L7-safe log: identify by review_id, never leak the path (which
             # could belong to another user's workspace).
+            # PR #12 iter-2 sweep — same L2 class: `.get()` returns None
+            # when the key exists with value None (Decision-shape rows).
             _log.info(
                 "digest.screenshot_missing review_id=%s",
-                row.get("review_id", "<unknown>"),
+                row.get("review_id") or "<unknown>",
             )
     return "\n".join(lines), attachments
 
@@ -436,11 +460,26 @@ def _render_soft_dup(rows: list[dict]) -> str:
 
 
 def _render_bootstrap_needed(rows: list[dict]) -> str:
-    """Deduplicated by ATS per spec Acceptance #8."""
+    """Deduplicated by ATS per spec Acceptance #8.
+
+    PR #12 iter-2 sweep: `_apply_result_to_row` at digest.py sets
+    `"ats": get("ats")` — so `.get("ats", default)` returned literal
+    None when the underlying object carried no `ats`. Same L2-class fix
+    pattern applied throughout the other per-block renderers:
+    `.get(...) or default` coerces both None and "" to the operator-
+    facing placeholder.
+
+    Dedup semantics: rows with unknown ATS (None or "") collapse into a
+    SINGLE `<ats>` line — the operator's actionable signal is "at least
+    one ATS session expired with no identifiable name; investigate."
+    Two `<ats>`-placeholder lines would be identical bytes and carry no
+    additional signal (iter-3 review: contrarian + pessimist + sweep
+    consensus). The dedup key IS the render label so both stay in sync.
+    """
     lines = ["## Bootstrap needed"]
     seen_ats: set[str] = set()
     for row in rows:
-        ats = row.get("ats", "<ats>")
+        ats = row.get("ats") or "<ats>"
         if ats in seen_ats:
             continue
         seen_ats.add(ats)

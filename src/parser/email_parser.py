@@ -306,16 +306,16 @@ def parse_alert_email(
         # validated. When the parser could not identify a real company,
         # key on URL instead so distinct-URL jobs both surface.
         #
-        # Post-CRITICAL#5 altitude fix, `company` is guaranteed to be
-        # either "Unknown" (fallback sentinel) or a non-empty/non-invisible
-        # string — the extraction block above establishes that invariant
-        # via `_strip_format_chars` + the `or "Unknown"` fallback on every
-        # branch. The `not company.strip()` disjunct is therefore
-        # unreachable at runtime but kept as belt-and-suspenders defense
-        # in depth: if a future refactor of the extraction block drops the
-        # invariant, this line still degrades safely to the (title, url)
-        # dedup key rather than silently colliding.
-        no_real_company = (company == "Unknown") or (not company.strip())
+        # PR #12 iter-3 (contrarian + sweep review consensus): `company`
+        # is stripped upstream on every branch — `_split_company_location`
+        # returns `parts[0].strip()` post `_has_meaningful_content` gate,
+        # and the `elif` fallback stores `raw_stripped` post the same
+        # gate. `not company` alone catches the empty-string case;
+        # `not company.strip()` disjunct was proven dead (no producer
+        # path yields whitespace-shaped truthy company). Removed to keep
+        # the invariant anchored at the extraction block rather than
+        # scattered defensive OR-chains downstream.
+        no_real_company = (company == "Unknown") or (not company)
         dedup_key = (title, url) if no_real_company else (title, company)
         if dedup_key in seen_title_company:
             continue

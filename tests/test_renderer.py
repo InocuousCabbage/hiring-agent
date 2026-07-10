@@ -39,6 +39,12 @@ SAMPLE_JOB = {
     "company": "Group O",
     "location": "United States (Remote)",
     "salary": "$55–$62.5/hr",
+    # PR #12 iter-3: `_compose_output_base` now REQUIRES a non-empty URL
+    # to derive the per-job discriminator (parser-guaranteed unique per job).
+    # Prior fixture had no `url` — silently invoked `blake2b(b'')` producing
+    # a fixed discriminator across all renders. A caller test that rendered
+    # two jobs with this fixture would collide on the same disk path.
+    "url": "https://example.com/sample-alert/group-o-pmm",
 }
 
 SAMPLE_LANE = {

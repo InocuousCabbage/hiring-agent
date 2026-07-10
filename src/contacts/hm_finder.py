@@ -99,7 +99,7 @@ def _build_prompt(job: dict, jd_text: str, lane: str, clues: dict,
 <job>
 Title: {job['title']}
 Company: {job['company']}
-Location: {job.get('location', 'Not specified')}
+Location: {job.get('location') or 'Not specified'}
 Department/Lane: {lane}
 </job>
 
