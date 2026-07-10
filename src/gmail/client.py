@@ -143,6 +143,14 @@ class GmailClient:
     def __init__(self):
         self.creds = self._authenticate()
         self.service = build("gmail", "v1", credentials=self.creds)
+        # M14 (Phase 6 audit): per-client label cache. Pre-fix,
+        # get_or_create_label re-fetched the full label roster per call,
+        # and ensure_labels calls it 3x per tick — 3(N+1) labels.list
+        # round-trips where 1 cached call suffices. Populated lazily on
+        # first list_labels() call; kept in sync by get_or_create_label
+        # on label creation. Callers can force invalidation via
+        # refresh_labels().
+        self._label_cache: dict[str, str] | None = None
 
     def _authenticate(self) -> Credentials:
         """OAuth2 flow — opens browser on first run, then reuses token."""
@@ -282,20 +290,55 @@ class GmailClient:
         ).execute()
 
     def _get_or_create_label(self, label_name: str) -> str:
-        """Get label ID by name, creating it if it doesn't exist."""
-        results = self.service.users().labels().list(userId="me").execute()
-        for label in results.get("labels", []):
-            if label["name"] == label_name:
-                return label["id"]
+        """Get label ID by name, creating it if it doesn't exist.
 
-        # Create it
+        M14 iter-2/iter-3: shares the cache-aware core with the public
+        ``get_or_create_label`` via ``_get_or_create_label_core`` but
+        does NOT stack a second ``@navigation_retry``. ``mark_processed``
+        already carries the retry decorator; delegating this private
+        method to the DECORATED public form would nest retries and
+        amplify a transient-error round-trip count 3x3x3 (the same
+        anti-pattern the M11 fix removed from send_urgent).
+        """
+        return self._get_or_create_label_core(label_name)
+
+    def _get_or_create_label_core(self, label_name: str) -> str:
+        """Cache-aware label resolution WITHOUT retry decoration.
+
+        Shared implementation used by the DECORATED public
+        ``get_or_create_label`` and the UNDECORATED private
+        ``_get_or_create_label``. Both delegate here so the caching
+        behavior is identical; only the retry surface differs.
+
+        iter-4: uses ``_list_labels_core`` (undecorated) rather than
+        ``list_labels`` (decorated) so a cold-cache
+        ``mark_processed`` doesn't stack ``mark_processed`` (3) ×
+        ``list_labels`` (3) = 9 attempts on a transient labels.list
+        failure. Post-iter-4 the single retry surface is
+        ``mark_processed`` at 3 attempts total.
+        """
+        # Fast path: cache hit.
+        if self._label_cache is not None and label_name in self._label_cache:
+            return self._label_cache[label_name]
+        # Miss: refresh via _list_labels_core (undecorated), which
+        # populates the cache.
+        for label in self._list_labels_core():
+            if label.get("name") == label_name:
+                return label["id"]
+        # Not found — create + memo.
         body = {
             "name": label_name,
             "labelListVisibility": "labelShow",
             "messageListVisibility": "show",
         }
-        created = self.service.users().labels().create(userId="me", body=body).execute()
-        return created["id"]
+        created = (
+            self.service.users().labels().create(userId="me", body=body).execute()
+        )
+        new_id = created["id"]
+        if self._label_cache is None:
+            self._label_cache = {}
+        self._label_cache[label_name] = new_id
+        return new_id
 
     @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
     def get_unread_alerts(
@@ -417,26 +460,60 @@ class GmailClient:
 
     @navigation_retry
     def list_labels(self) -> list[dict]:
-        """Return the raw label roster ``[{"id": ..., "name": ...}, ...]``."""
+        """Return the raw label roster ``[{"id": ..., "name": ...}, ...]``.
+
+        M14 (Phase 6 audit): populates the per-instance ``_label_cache``
+        on first call, so subsequent lookups via ``get_or_create_label``
+        skip the round-trip. The raw list is returned unchanged; cache
+        drift is only possible if labels are created outside this client
+        (call ``refresh_labels()`` to force re-fetch).
+
+        Delegates to ``_list_labels_core`` so callers already inside a
+        ``@navigation_retry`` decorator (e.g. mark_processed via
+        _get_or_create_label_core) can invoke the core directly without
+        stacking a second retry surface (iter-4)."""
+        return self._list_labels_core()
+
+    def _list_labels_core(self) -> list[dict]:
+        """Undecorated label-roster fetch + cache refresh.
+
+        Shared implementation used by the DECORATED public ``list_labels``
+        (for standalone callers) and by the UNDECORATED
+        ``_get_or_create_label_core`` (invoked from the already-retried
+        ``mark_processed`` hot path). Keeping this undecorated ensures
+        that a ``labels.list()`` transient failure inside a cold-cache
+        mark_processed cycle burns 3 attempts total — not 3×3 (iter-4)."""
         results = self.service.users().labels().list(userId="me").execute()
-        return results.get("labels", [])
+        labels = results.get("labels", [])
+        # Refresh cache from the authoritative response.
+        self._label_cache = {
+            lbl.get("name"): lbl.get("id")
+            for lbl in labels
+            if lbl.get("name") and lbl.get("id")
+        }
+        return labels
+
+    def refresh_labels(self) -> None:
+        """Discard the cached label roster; the next lookup will re-fetch.
+
+        M14: call this when a label was created out-of-band (another client
+        instance or the Gmail UI) so the cache reflects reality."""
+        self._label_cache = None
 
     @navigation_retry
     def get_or_create_label(self, name: str) -> str:
         """Return the label ID for ``name``, creating it (with nested-label
-        visibility defaults) if it doesn't already exist. Idempotent."""
-        for label in self.list_labels():
-            if label.get("name") == name:
-                return label["id"]
-        body = {
-            "name": name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
-        created = (
-            self.service.users().labels().create(userId="me", body=body).execute()
-        )
-        return created["id"]
+        visibility defaults) if it doesn't already exist. Idempotent.
+
+        M14: first checks the per-instance label cache before calling
+        ``list_labels()``. On create, the new (name, id) is written to
+        the cache so a subsequent lookup skips another round-trip.
+
+        Delegates the cache-aware core to ``_get_or_create_label_core``
+        so the private ``_get_or_create_label`` (called by the already-
+        decorated ``mark_processed``) can share the same caching
+        behavior WITHOUT stacking a second retry decorator (iter-3)."""
+        return self._get_or_create_label_core(name)
 
     @navigation_retry
     def apply_label(self, msg_id: str, label_id: str) -> None:
@@ -470,6 +547,13 @@ class GmailClient:
 
         `internal_date` is also included so the latest-non-self selection
         in the review poller can compare message age robustly.
+
+        M13 (Phase 6 audit): message payload fetches are batched through
+        ``service.new_batch_http_request()``. Pre-fix, this method issued
+        one sequential ``messages.get(format=full)`` per result — a
+        10-result search became 11 sequential ~200-400 ms round-trips
+        (~2-4 s). Post-fix: 1 list + 1 batched HTTP round-trip regardless
+        of ``max_results``.
         """
         results = (
             self.service.users()
@@ -477,14 +561,74 @@ class GmailClient:
             .list(userId="me", q=query, maxResults=max_results)
             .execute()
         )
-        out: list[dict] = []
-        for ref in results.get("messages", []) or []:
-            msg = (
-                self.service.users()
-                .messages()
-                .get(userId="me", id=ref["id"], format="full")
-                .execute()
+        refs = results.get("messages", []) or []
+        if not refs:
+            return []
+
+        # Preserve list-order in the result set so latest-wins ordering
+        # downstream is deterministic across runs.
+        ordered_ids = [ref["id"] for ref in refs]
+        payloads: dict[str, dict] = {}
+        errors: dict[str, Exception] = {}
+
+        def _cb(request_id, response, exception):
+            if exception is not None:
+                errors[request_id] = exception
+                return
+            if response is not None:
+                payloads[request_id] = response
+
+        batch = self.service.new_batch_http_request(callback=_cb)
+        for mid in ordered_ids:
+            batch.add(
+                self.service.users().messages().get(
+                    userId="me", id=mid, format="full"
+                ),
+                request_id=mid,
             )
+        # iter-1 refinement: guard batch.execute() itself. Pre-fix's
+        # per-message loop only lost the ONE failing message on transient
+        # error; a bare batch.execute() propagates the top-level failure
+        # and starves the entire review-poll tick. On failure, fall
+        # through to sequential fetches — same shape, same round-trip
+        # count as pre-fix, but keeps the poll alive.
+        try:
+            batch.execute()
+        except Exception as exc:
+            log.warning(
+                "gmail.search_batch_execute_failed",
+                error_type=type(exc).__name__,
+                fallback="sequential",
+            )
+            payloads.clear()
+            errors.clear()
+            for mid in ordered_ids:
+                try:
+                    payloads[mid] = (
+                        self.service.users()
+                        .messages()
+                        .get(userId="me", id=mid, format="full")
+                        .execute()
+                    )
+                except Exception as inner_exc:
+                    errors[mid] = inner_exc
+
+        # Log-and-drop per-message errors so a single 404 (deleted mid-poll)
+        # never sinks the whole search. The poll caller already tolerates
+        # missing messages via the H1/H3 filter, so a smaller returned
+        # list is a benign degradation.
+        for mid, exc in errors.items():
+            log.warning(
+                "gmail.search_batch_item_failed",
+                message_id=mid,
+                error_type=type(exc).__name__,
+            )
+
+        out: list[dict] = []
+        for mid in ordered_ids:
+            msg = payloads.get(mid)
+            if msg is None:
+                continue
             # Pull the From header off the payload's headers list.
             from_hdr = ""
             in_reply_to = ""
