@@ -1094,6 +1094,601 @@ class TestEmailParserDedupByTitleAndCompany:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 5 iter-3 CRITICAL #5 — M7-class altitude fix at parser extraction.
+#
+# The parser is the sole choke point through which the empty-string sentinel
+# entered the pipeline (em-/en-dash split with a leading dash on the raw div
+# text produces `parts[0].strip() == ""`). Every downstream consumer of
+# `job['company']` — renderer filename, cover-letter LLM prompt, HM-finder
+# LLM prompt, apply/review notify subject line, apply/notify body line, and
+# the auto-apply dedup index — reads its value from this choke point.
+#
+# Fixing at parser extraction (`parts[0].strip() or "Unknown"`) eliminates
+# the empty-string cascade class at a single site rather than patching each
+# downstream consumer independently. Two review-hardened refinements:
+#   1. `_strip_format_chars(raw)` catches Unicode Cf (format) chars — ZWSP,
+#      BOM, LRM/RLM, ZWJ/ZWNJ — which `str.strip()` alone does NOT touch and
+#      which would otherwise leak an invisible-but-truthy sentinel past the
+#      `.strip() or "Unknown"` fallback (M7-class silent drop reintroduced).
+#   2. `location = parts[1].strip() or None` sweeps the same-class sibling
+#      on the location side — a trailing-dash raw ("Acme —") would otherwise
+#      set `location=""`, which `.get('location', 'Not specified')` does NOT
+#      catch downstream.
+#
+# Tests below prove: (a) no empty/invisible-shaped value ever leaves the
+# parser regardless of raw div shape, and (b) downstream sites read the
+# safely-normalized value without any downstream code change.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestEmailParserCompanyNormalizationAtExtraction:
+    """Altitude fix behavioral regression guard (Phase 5 iter-3 CRITICAL #5).
+
+    Class naming follows the existing `TestEmailParser*` prefix used by the
+    other parser test classes in this file (`TestEmailParserGoldenFromSampleAlert`,
+    `TestEmailParserDedupByTitleAndCompany`).
+    """
+
+    def test_em_dash_leading_normalizes_company_to_unknown(self):
+        """Primary altitude assertion: parser must not return empty string.
+
+        RED on pre-fix branch state: `parts[0].strip()` for raw='— Remote'
+        returns '' (empty string). The (title, url) dedup-fallback (iter-2)
+        surfaces both distinct-URL jobs — with `company=''` silently
+        corrupting downstream filename/prompt/subject-line renderings.
+
+        GREEN after altitude fix: `parts[0].strip() or "Unknown"` normalizes
+        the empty result to the "Unknown" sentinel, matching the default
+        fallback the parser already sets when the company div is missing.
+        """
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>— Remote</div>"  # em-dash split → parts[0].strip()==''
+            '<a href="https://example.com/one">Apply</a>'
+            "</td>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>— Remote</div>"
+            '<a href="https://example.com/two">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 2, (
+            f"iter-2 URL-fallback dedup must still surface both distinct-URL "
+            f"jobs; got {len(jobs)}"
+        )
+        for j in jobs:
+            assert j["company"] == "Unknown", (
+                f"em-dash empty-string case must normalize to 'Unknown' "
+                f"sentinel. Got {j['company']!r}."
+            )
+
+    def test_en_dash_leading_normalizes_company_to_unknown(self):
+        """Sibling of em-dash test — en-dash split path. Same class of
+        bug: `raw='– Remote'` → split gives `parts[0]=''` → `.strip()==''`.
+        """
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Content Manager</span></h3>"
+            "<div>– Remote</div>"  # en-dash split → parts[0].strip()==''
+            '<a href="https://example.com/en1">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 1
+        assert jobs[0]["company"] == "Unknown"
+        assert jobs[0]["location"] == "Remote"
+
+    def test_zero_width_space_prefixed_raw_does_not_bypass_fallback(self):
+        """Iter-1 pessimist proof-of-bug: `str.strip()` does NOT remove
+        Unicode Cf (format) chars — ZERO WIDTH SPACE U+200B, BOM U+FEFF,
+        LRM/RLM, ZWJ/ZWNJ. `isspace()` returns False for all of them.
+
+        Pre-hardening: raw='\\u200b— Remote' → parts[0].strip() = '\\u200b'
+        (length 1, truthy). The `or "Unknown"` fallback is bypassed and
+        `company='\\u200b'` — an invisible-but-truthy sentinel — leaks
+        downstream. `_safe_filename('\\u200b')` returns '' (word-char
+        strip drops it), reintroducing the exact filename-collision
+        cascade the altitude fix targets.
+
+        Post-hardening: `_strip_format_chars(raw)` removes Cf chars once
+        at the top of the extraction block, so every downstream branch
+        (em-dash split, en-dash split, `elif raw:`) inherits the invariant
+        that raw carries no invisibles by the time the `.strip() or "Unknown"`
+        fallback runs.
+
+        Mutation check: remove the `_strip_format_chars(...)` wrapper from
+        the `raw = ...` line in email_parser.py. This test fails: parser
+        returns `company='\\u200b'` and the downstream filename becomes
+        the same underscore-leading collision as the empty-string case.
+        """
+        from parser.email_parser import parse_alert_email
+        from pdf_gen.renderer import _safe_filename
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            # ZWSP (U+200B) prefix — invisible in a rendered email, present
+            # in the DOM raw text. Real hiring.cafe alerts occasionally
+            # include ZWSPs from copy-pasted email templates.
+            "<div>​— Remote</div>"
+            '<a href="https://example.com/zwsp1">Apply</a>'
+            "</td>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>​— Remote</div>"
+            '<a href="https://example.com/zwsp2">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        # Both jobs must surface — if ZWSP leaked past the fallback,
+        # `no_real_company = (company == "Unknown") or (not company.strip())`
+        # would evaluate False (both) and dedup would key on
+        # (title, '​') for BOTH cards → silent M7-class drop.
+        assert len(jobs) == 2, (
+            f"ZWSP-prefixed cards must dedup via the (title, url) fallback "
+            f"— parser leaked the ZWSP sentinel and reintroduced M7 silent "
+            f"drop. Got {len(jobs)} jobs: "
+            f"{[(j['title'], repr(j['company'])) for j in jobs]}"
+        )
+        for j in jobs:
+            assert j["company"] == "Unknown", (
+                f"parser leaked ZWSP (U+200B) sentinel for job {j!r}. "
+                f"`_strip_format_chars` at extraction top must remove all "
+                f"Cf-category chars before the `.strip() or 'Unknown'` "
+                f"fallback runs."
+            )
+            # Also verify the downstream _safe_filename check: the ZWSP
+            # bypass produced `_safe_filename('​') == ''` in the
+            # pessimist proof-of-bug. After the fix, the filename must be
+            # a well-formed 'Unknown_...' prefix.
+            fname_base = _safe_filename(j["company"])
+            assert fname_base == "Unknown", (
+                f"downstream renderer filename must receive a well-formed "
+                f"company component after altitude fix + Cf sweep; got "
+                f"_safe_filename({j['company']!r}) = {fname_base!r}."
+            )
+
+    def test_hostile_cf_and_cc_chars_all_stripped_at_extraction(self):
+        """Sweep across the denylist-inverted invisible strip
+        (`_strip_format_chars`). Under the iter-3 policy every Cf char
+        EXCEPT ZWJ/ZWNJ is stripped, so this matrix covers:
+
+        Category Cf — attack-class chars historically used to smuggle
+        invisible sentinels:
+          - ZWSP  (U+200B) — zero-width space
+          - LRM   (U+200E) / RLM (U+200F) — direction marks
+          - WJ    (U+2060) — word joiner
+          - BOM   (U+FEFF) — zero-width no-break space
+          - RLO   (U+202E) — right-to-left override (bidi attack surface)
+          - LRO   (U+202A) — left-to-right embed
+          - PDI   (U+2069) — pop directional isolate
+          - RLI   (U+2067) — right-to-left isolate
+          - SHY   (U+00AD) — soft hyphen (may render as `-` in some contexts)
+          - ALM   (U+061C) — arabic letter mark
+          - MVS   (U+180E) — mongolian vowel separator
+
+        Category Cc — non-isspace controls that survive `str.strip()`:
+          - BEL   (U+0007) — a Cc char that survives lxml roundtrip
+                            (NUL is normalized by lxml so we can't
+                            exercise it through the parser)
+
+        Any of these — including a codepoint added to Unicode Cf AFTER
+        this code shipped — could otherwise smuggle a truthy invisible
+        past `.strip()` and reintroduce the M7 silent-drop cascade.
+        Iter-2 shipped a curated allowlist that missed 12 Cf chars in
+        this class (bidi override/isolate, SHY, ALM, MVS); the iter-3
+        denylist inversion eliminates the "did we remember this one?"
+        maintenance risk.
+        """
+        from parser.email_parser import parse_alert_email
+        hostile = [
+            "​",  # ZWSP
+            "‎",  # LRM
+            "‏",  # RLM
+            "⁠",  # WORD JOINER
+            "﻿",  # BOM
+            "‮",  # RLO — bidi override (iter-3 security repro)
+            "‪",  # LRO
+            "⁩",  # PDI — bidi isolate
+            "⁧",  # RLI
+            "­",  # SOFT HYPHEN (iter-3 correctness repro)
+            "؜",  # ARABIC LETTER MARK
+            "᠎",  # MONGOLIAN VOWEL SEPARATOR
+            "\x07",    # BEL — Cc non-isspace; NUL is eaten by lxml so
+                       #  BEL exercises the Cc branch through the DOM
+        ]
+        card_html = "".join(
+            f"<td><h3><span>Role {i}</span></h3>"
+            f"<div>{ch}— Remote</div>"
+            f'<a href="https://example.com/cf{i}">Apply</a>'
+            "</td>"
+            for i, ch in enumerate(hostile)
+        )
+        html = f"<html><body><table>{card_html}</table></body></html>"
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == len(hostile), (
+            f"expected {len(hostile)} distinct-title cards to surface, "
+            f"got {len(jobs)}: "
+            f"{[(j['title'], repr(j['company'])) for j in jobs]}"
+        )
+        for j in jobs:
+            assert j["company"] == "Unknown", (
+                f"parser leaked a hostile invisible: {j!r}. "
+                f"`_strip_format_chars` must strip ALL Cf except "
+                f"ZWJ/ZWNJ. If this fails on a specific card, the "
+                f"invisible codepoint slipped the denylist."
+            )
+
+    def test_zwj_only_prefix_does_not_bypass_fallback(self):
+        """Iter-4 correctness reviewer surfaced residual M7 silent-drop
+        attack on the two Cf chars we PRESERVE (ZWJ U+200D, ZWNJ U+200C).
+
+        A raw div like `"‍— Remote"` — ZWJ-prefixed — leaves
+        `parts[0].strip() = "‍"` (length 1, truthy, non-whitespace).
+        `_strip_format_chars` correctly preserves ZWJ for legitimate
+        script/emoji use, so the sweep does NOT remove it. The `.strip()
+        or "Unknown"` fallback saw a truthy value and passed it through.
+        The `no_real_company` guard's `not company.strip()` disjunct
+        evaluates False. Two same-title distinct-URL cards dedup to
+        `(title, "‍")` → silent M7 drop.
+
+        Fix: `_has_meaningful_content` rejects strings composed only of
+        Cf/whitespace chars, so ZWJ-only OR ZWNJ-only prefixes fall
+        through to the "Unknown" fallback the same as empty results.
+        Meaningful content anywhere in the string (mid-name ZWJ in a real
+        Persian company name) still passes through untouched.
+        """
+        from parser.email_parser import parse_alert_email
+        # ZWJ-prefix pair
+        html_zwj = (
+            "<html><body><table>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>‍— Remote</div>"  # ZWJ prefix
+            '<a href="https://example.com/zwj1">Apply</a>'
+            "</td>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            "<div>‍— Remote</div>"
+            '<a href="https://example.com/zwj2">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html_zwj, max_jobs=99)
+        assert len(jobs) == 2, (
+            f"ZWJ-prefixed cards must dedup via (title, url) fallback; "
+            f"got {len(jobs)} jobs: "
+            f"{[(j['title'], repr(j['company'])) for j in jobs]}"
+        )
+        for j in jobs:
+            assert j["company"] == "Unknown", (
+                f"parser leaked a ZWJ-only company sentinel: {j!r}. "
+                f"`_has_meaningful_content` must reject Cf-preserved-only "
+                f"strings."
+            )
+        # ZWNJ-prefix pair — same attack, different preserved char.
+        html_zwnj = (
+            "<html><body><table>"
+            "<td><h3><span>Content Manager</span></h3>"
+            "<div>‌— Remote</div>"  # ZWNJ prefix
+            '<a href="https://example.com/zwnj1">Apply</a>'
+            "</td>"
+            "<td><h3><span>Content Manager</span></h3>"
+            "<div>‌— Remote</div>"
+            '<a href="https://example.com/zwnj2">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html_zwnj, max_jobs=99)
+        assert len(jobs) == 2
+        for j in jobs:
+            assert j["company"] == "Unknown", (
+                f"parser leaked a ZWNJ-only company sentinel: {j!r}"
+            )
+
+    def test_short_title_of_only_zwnj_is_rejected(self):
+        """Iter-4 correctness warning: `title` participates in the
+        `(title, company)` dedup key, so the same invisible-sentinel
+        hardening the company field carries.
+
+        Pre-fix: a title of three ZWNJ chars ('\\u200c\\u200c\\u200c') has
+        `len(title) == 3` so passes the `len < 3` guard, then flows
+        through to the LLM cover-letter prompt as `Title: ‌‌‌`. Same
+        cascade class as company. Title is now swept + meaningful-content
+        checked at the same choke point.
+        """
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>‌‌‌</span></h3>"
+            "<div>Acme — Remote</div>"
+            '<a href="https://example.com/badtitle">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 0, (
+            f"parser accepted a Cf-only title of length 3: {jobs!r}. "
+            f"`_has_meaningful_content` must reject titles composed only "
+            f"of ZWJ/ZWNJ/whitespace."
+        )
+
+    def test_zwj_and_zwnj_preserved_in_legitimate_company_names(self):
+        """Iter-2 security review: `_strip_format_chars` MUST preserve
+        ZWJ (U+200D) and ZWNJ (U+200C). Both are semantically load-bearing:
+          - ZWNJ is required for Persian/Urdu word segmentation
+          - ZWJ controls Devanagari/Bengali/Tamil conjunct rendering AND
+            is the glue in every multi-codepoint emoji sequence
+        A blanket Cf strip would silently corrupt legitimate non-English
+        company names.
+
+        Mutation check: change `_strip_format_chars` to strip the entire
+        Cf category. This test fails: the Persian company name loses its
+        ZWNJ boundaries and the emoji sequence loses its ZWJ glue.
+        """
+        from parser.email_parser import parse_alert_email
+        # A Persian company name using ZWNJ as a word boundary. If the
+        # ZWNJ is stripped, the two morphemes concatenate and the name
+        # is silently corrupted.
+        persian_name = "دیجی‌کالا"  # Digikala, ZWNJ between morphemes
+        # A ZWJ-glued emoji sequence — family emoji is a canonical case.
+        # If the ZWJ is stripped, the sequence decomposes into individual
+        # emoji (silent corruption of a company logo).
+        emoji_name = "Foo‍Corp"  # arbitrary ZWJ-preservation case
+        html = (
+            "<html><body><table>"
+            f"<td><h3><span>Role Persian</span></h3>"
+            f"<div>{persian_name} — Tehran</div>"
+            f'<a href="https://example.com/fa">Apply</a>'
+            "</td>"
+            f"<td><h3><span>Role Zwj</span></h3>"
+            f"<div>{emoji_name} — Remote</div>"
+            f'<a href="https://example.com/zwj">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 2
+        by_title = {j["title"]: j for j in jobs}
+        assert by_title["Role Persian"]["company"] == persian_name, (
+            f"ZWNJ stripped from Persian company name — "
+            f"`_CF_PRESERVE` (the denylist-inversion carve-out in "
+            f"`_strip_format_chars`) must include U+200C. "
+            f"Got {by_title['Role Persian']['company']!r}."
+        )
+        assert by_title["Role Zwj"]["company"] == emoji_name, (
+            f"ZWJ stripped from company name — `_CF_PRESERVE` must "
+            f"include U+200D. "
+            f"Got {by_title['Role Zwj']['company']!r}."
+        )
+
+    def test_elif_raw_branch_normalizes_cf_only_input(self):
+        """Third extraction site (`elif raw:` — no dash present).
+
+        Pre-hardening: raw was assigned directly to `company` after just
+        the `elif raw:` truthy check. A raw like '\\u200b' (single ZWSP)
+        was truthy AND had no dash, so `company='\\u200b'` leaked.
+
+        Post-hardening: `_strip_format_chars` removes the ZWSP before the
+        `elif raw:` check even runs, and the fallback branch checks
+        `elif raw.strip():` so pure-whitespace remnants (e.g. Cf sweep
+        left ` `) also fall through to the default `Unknown`.
+        """
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Role Cf Only</span></h3>"
+            "<div>​</div>"  # ZWSP only, no dash, no real content
+            '<a href="https://example.com/cfonly">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 1
+        assert jobs[0]["company"] == "Unknown", (
+            f"`elif raw:` branch leaked a ZWSP-only company: "
+            f"{jobs[0]['company']!r}"
+        )
+
+    def test_trailing_dash_leaves_empty_location_as_empty_string(self):
+        """Location field sweep — deferred to PR #12.
+
+        Iter-1 arch + correctness reviewers flagged the `parts[1].strip()`
+        empty-string case as a same-class sibling. Iter-2 correctness
+        reviewer countered that coercing to `None` REGRESSES downstream
+        rendering: `{'location': None}.get('location', 'Not specified')`
+        returns `None` (not the default), causing `src/tailor/cover_letter.py`
+        and `src/contacts/hm_finder.py` to render literal `"Location: None"`.
+        Both a `""` and `None` value are cosmetic downstream issues (LLM
+        prompt renders a blank or literal-word tail), neither cascades to
+        renderer filename collision — the empty-location case is NOT part
+        of the M7 class the altitude fix targets.
+
+        Correct scope-out: leave `location = parts[1].strip()` unchanged
+        for this PR. A proper fix requires touching the three downstream
+        consumers (`cover_letter.py`, `hm_finder.py`, `digest.py`) to use
+        `.get('location') or 'Not specified'` — deferred to PR #12.
+
+        This test documents the intentional scope-out so a future
+        contributor can see why the location sibling was NOT swept here.
+        """
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Trailing Dash</span></h3>"
+            "<div>Acme —</div>"  # em-dash trailing → parts[1].strip()==''
+            '<a href="https://example.com/td">Apply</a>'
+            "</td>"
+            "</table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 1
+        assert jobs[0]["company"] == "Acme"
+        # Intentional scope-out: PR #12 will sweep the downstream trio
+        # (cover_letter/hm_finder/digest) to `.get('location') or default`,
+        # at which point this test can either flip to `is None` or use
+        # `or 'Not specified'`. Leaving as-is here documents the boundary.
+        assert jobs[0]["location"] == "", (
+            f"trailing-dash empty-location sibling is intentionally NOT "
+            f"swept in this PR (see docstring). Got "
+            f"{jobs[0]['location']!r}."
+        )
+
+
+class TestEmailParserCompanyNormalizationDownstream:
+    """Altitude proof — downstream sites receive safely-shaped company
+    values WITHOUT any downstream code change. Each test exercises the
+    real downstream template/function against parser output.
+
+    Downstream consumers verified:
+      - src/pdf_gen/renderer.py:_safe_filename (renderer filenames)
+      - src/tailor/cover_letter.py:79-83 (LLM prompt Company: line)
+
+    Not exercised here (reasonable extension for a follow-up sweep):
+      - src/contacts/hm_finder.py LLM prompt Company: line
+      - src/apply/review.py notify subject line
+      - src/apply/notify.py notify body company: line
+    All three read the same `company` field via the same shape, so the
+    parser altitude fix inoculates them too.
+    """
+
+    def _job_from_html(self, div_content: str) -> dict:
+        from parser.email_parser import parse_alert_email
+        html = (
+            "<html><body><table>"
+            "<td><h3><span>Product Marketing Manager</span></h3>"
+            f"<div>{div_content}</div>"
+            '<a href="https://example.com/dw">Apply</a>'
+            "</td></table></body></html>"
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == 1
+        return jobs[0]
+
+    def test_renderer_filename_gets_non_empty_company_prefix(self):
+        """`_safe_filename(company)` must return a non-empty, well-formed
+        string for every extraction path — otherwise the resume filename
+        `{company}_{title}_Resume.docx` collides on same-title jobs.
+        """
+        from pdf_gen.renderer import _safe_filename
+        for div in ("— Remote", "– Remote", "​— Remote", "﻿– Remote"):
+            job = self._job_from_html(div)
+            fname_prefix = _safe_filename(job["company"])
+            assert fname_prefix == "Unknown", (
+                f"div={div!r}: renderer filename received unsafe company "
+                f"prefix {fname_prefix!r} (expected 'Unknown')."
+            )
+
+    def test_cover_letter_llm_prompt_gets_named_company(self):
+        """The cover-letter LLM prompt template (src/tailor/cover_letter.py
+        lines 79-83) is:
+            Title: {job['title']}
+            Company: {job['company']}
+            Location: ...
+
+        Pre-fix + pre-hardening: `Company: ` (empty) or `Company: \\u200b`
+        (invisible). Both malform the prompt — the LLM sees a Company:
+        field with no value or an invisible-only value and generates
+        arbitrary output that may reference a hallucinated company name.
+
+        Correctness reviewer flagged that testing the line-118 fallback
+        text is misleading because `_clean_text` scrubs the double-space
+        artifact in production. The LLM PROMPT (line 83) is where the
+        actual harm lands — unscrubbed, un-clean_text'd, sent directly
+        to the model.
+        """
+        for div in ("— Remote", "– Remote", "​— Remote"):
+            job = self._job_from_html(div)
+            # Same template as src/tailor/cover_letter.py:79-84 prompt.
+            prompt_snippet = (
+                f"Title: {job['title']}\n"
+                f"Company: {job['company']}\n"
+                f"Location: {job.get('location', 'Not specified')}"
+            )
+            assert "Company: Unknown" in prompt_snippet, (
+                f"div={div!r}: LLM prompt Company: line malformed: "
+                f"{prompt_snippet!r}"
+            )
+            # Neither an empty tail (`Company: \n`) nor an invisible-only
+            # tail (`Company: ​\n`) should appear.
+            assert "Company: \n" not in prompt_snippet
+            assert "Company: ​" not in prompt_snippet
+
+
+class TestEmailParserCompanyNormalizationBehavioralGuard:
+    """Behavioral mutation guard — asserts the invariant that no
+    empty/whitespace/Cf-only company value ever leaves the parser,
+    regardless of raw div shape.
+
+    (Superseded the earlier source-grep guard test which the iter-1
+    reviewers flagged as brittle to legitimate refactors — helper
+    extraction, quote-style reflow, multi-line wrap. The behavioral
+    sweep here catches the same mutations via observable output.)
+    """
+
+    def test_parser_never_returns_empty_or_invisible_company(self):
+        """Property sweep across every extraction path that could
+        previously leak an unsafe-shaped company value.
+
+        Mutation matrix:
+          - Drop `_strip_format_chars` at extraction top → ZWSP/BOM/LRM
+            cards leak Cf-shaped company.
+          - Drop `or "Unknown"` from em-dash branch → em-dash cards leak
+            empty company.
+          - Drop `or "Unknown"` from en-dash branch → en-dash cards leak
+            empty company.
+          - Drop the `elif raw.strip():` guard → all-whitespace remnants
+            after Cf sweep leak whitespace-only company.
+        Each mutation surfaces here via the invariant assertion.
+        """
+        import unicodedata
+        from parser.email_parser import parse_alert_email
+        # Distinct titles to avoid dedup fallback; each card exercises a
+        # different extraction path that historically could leak.
+        cards = [
+            ("Role Em", "— Remote"),
+            ("Role En", "– Remote"),
+            ("Role EmNbsp", "\xa0—\xa0Remote"),
+            ("Role EnNbsp", "\xa0–\xa0Remote"),
+            ("Role EmZwsp", "​— Remote"),
+            ("Role EnZwsp", "​– Remote"),
+            ("Role Bom", "﻿— Remote"),
+            ("Role Rlo", "‮— Remote"),   # bidi override (iter-3)
+            ("Role Shy", "­— Remote"),   # soft hyphen (iter-3)
+            ("Role Alm", "؜— Remote"),   # arabic letter mark
+            ("Role Bel", "\x07— Remote"),     # Cc, not isspace, lxml-safe
+            ("Role CfOnlyElif", "​"),    # elif raw: branch
+        ]
+        card_html = "".join(
+            f"<td><h3><span>{title}</span></h3>"
+            f"<div>{div}</div>"
+            f'<a href="https://example.com/{i}">Apply</a>'
+            "</td>"
+            for i, (title, div) in enumerate(cards)
+        )
+        html = f"<html><body><table>{card_html}</table></body></html>"
+        jobs = parse_alert_email(html_body=html, max_jobs=99)
+        assert len(jobs) == len(cards), (
+            f"expected {len(cards)} distinct-title jobs, got {len(jobs)}"
+        )
+        for j in jobs:
+            c = j["company"]
+            # Invariant: no empty, no whitespace-only, no invisible-only
+            # value ever leaves the parser. Empty-string check is
+            # explicit before the `all` check to avoid the empty-iterable
+            # false-positive (all([]) == True).
+            assert c, f"parser leaked empty company for job {j!r}"
+            assert c.strip(), (
+                f"parser leaked whitespace-only company for job {j!r}"
+            )
+            assert not all(
+                unicodedata.category(ch) in ("Cf", "Cc") for ch in c
+            ), f"parser leaked invisible-only company for job {j!r}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Warning #11: Gmail query sanitization
 # ═══════════════════════════════════════════════════════════════════════════════
 
