@@ -11,11 +11,14 @@ Flow:
 
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator, Optional
+
 import httpx
 import structlog
 from urllib.parse import quote_plus
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Browser, sync_playwright, TimeoutError as PlaywrightTimeout
 
 from parser.email_parser import resolve_sendgrid_url
 
@@ -95,12 +98,40 @@ def _infer_ats_name(url: str | None) -> str | None:
     return None
 
 
+@contextmanager
+def _browser_or_launch(browser: Browser | None) -> Iterator[Browser]:
+    """Yield a Browser: use ``browser`` if provided, else launch + tear down.
+
+    H15 (Phase 6 audit): call sites use::
+
+        with _browser_or_launch(shared_browser) as b:
+            context = b.new_context(...)
+            ...
+
+    When ``shared_browser`` is not None, this is a no-op passthrough so
+    the caller's shared instance is used and its lifecycle is not touched.
+    When None, we do the historical per-call ``sync_playwright()`` +
+    ``chromium.launch()`` + ``browser.close()`` inside a wrapping
+    try/finally so the callers stay backward-compatible.
+    """
+    if browser is not None:
+        yield browser
+        return
+    with sync_playwright() as p:
+        b = p.chromium.launch(headless=True)
+        try:
+            yield b
+        finally:
+            b.close()
+
+
 def fetch_job_description(
     url: str,
     timeout: int = 30,
     min_length: int = 200,
     job_title: str = "",
     company: str = "",
+    browser: Browser | None = None,
 ) -> JDFetchResult | None:
     """
     Fetch and return a JDFetchResult for a job URL, or None on failure.
@@ -132,10 +163,10 @@ def fetch_job_description(
     """
     # Step 1: Try Google search for direct ATS posting
     if job_title and company:
-        ats_url = _search_for_jd(job_title, company)
+        ats_url = _search_for_jd(job_title, company, browser=browser)
         if ats_url:
             log.info("jd_fetcher.google_found_ats", url=ats_url)
-            ats_text = _fetch_ats_page(ats_url, timeout)
+            ats_text = _fetch_ats_page(ats_url, timeout, browser=browser)
             if ats_text and len(ats_text) >= min_length and _has_jd_sections(ats_text):
                 log.info("jd_fetcher.success", url=ats_url, chars=len(ats_text), source="google_ats")
                 return JDFetchResult(
@@ -146,10 +177,10 @@ def fetch_job_description(
             log.debug("jd_fetcher.google_ats_insufficient", chars=len(ats_text) if ats_text else 0)
 
         # Step 1b: Broader Google search
-        broad_url = _search_for_jd_broad(job_title, company)
+        broad_url = _search_for_jd_broad(job_title, company, browser=browser)
         if broad_url and broad_url != ats_url:
             log.info("jd_fetcher.google_broad_found", url=broad_url)
-            broad_text = _fetch_ats_page(broad_url, timeout)
+            broad_text = _fetch_ats_page(broad_url, timeout, browser=browser)
             if broad_text and len(broad_text) >= min_length and _has_jd_sections(broad_text):
                 log.info("jd_fetcher.success", url=broad_url, chars=len(broad_text), source="google_broad")
                 # broad_url is an ATS URL only when _infer_ats_name recognizes
@@ -167,7 +198,7 @@ def fetch_job_description(
     resolved = _resolve_if_sendgrid(url, timeout)
     if resolved:
         log.debug("jd_fetcher.trying_hiring_cafe", url=resolved)
-        text, hiring_cafe_ats_url = _fetch_with_playwright(resolved, timeout)
+        text, hiring_cafe_ats_url = _fetch_with_playwright(resolved, timeout, browser=browser)
 
         # Check if hiring.cafe rendered valid content
         if text and len(text) >= min_length and _has_jd_sections(text):
@@ -191,7 +222,7 @@ def fetch_job_description(
 
         # Try ATS link found on the hiring.cafe page
         if hiring_cafe_ats_url:
-            ats_text = _fetch_ats_page(hiring_cafe_ats_url, timeout)
+            ats_text = _fetch_ats_page(hiring_cafe_ats_url, timeout, browser=browser)
             if ats_text and len(ats_text) >= min_length and _has_jd_sections(ats_text):
                 log.info("jd_fetcher.success", url=hiring_cafe_ats_url, chars=len(ats_text), source="hiring_cafe_ats")
                 # _find_ats_link may return a non-ATS "Apply" URL (any off-site
@@ -268,13 +299,16 @@ def _extract_urls_from_html(html: str, filter_domains: list[str] | None = None) 
     return urls
 
 
-def _web_search(query: str, label: str) -> str | None:
+def _web_search(query: str, label: str, browser: Browser | None = None) -> str | None:
     """
     Execute a web search using DuckDuckGo HTML (no JS required).
 
     DuckDuckGo is much more permissive than Google for automated queries.
     Falls back to Google via Playwright if DDG fails.
     Returns the page HTML, or None on failure.
+
+    H15 (Phase 6 audit): ``browser``, when provided, is reused for the
+    Google Playwright fallback instead of launching a fresh Chromium.
     """
     # DuckDuckGo HTML-only endpoint (no JS needed)
     ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
@@ -303,33 +337,40 @@ def _web_search(query: str, label: str) -> str | None:
     google_url = f"https://www.google.com/search?q={quote_plus(query)}&num=10&hl=en"
     try:
         _rate_limit_google()
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with _browser_or_launch(browser) as b:
+            context = b.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
             try:
-                context = browser.new_context(
-                    user_agent=HEADERS["User-Agent"],
-                    viewport={"width": 1280, "height": 800},
-                    locale="en-US",
-                )
                 page = context.new_page()
                 try:
                     page.goto(google_url, wait_until="domcontentloaded", timeout=15000)
                 except PlaywrightTimeout:
                     return None
-                page.wait_for_timeout(1500)
+                # M16 (Phase 6 audit): the 1500ms unconditional sleep is
+                # replaced by a bounded wait for #search (Google's results
+                # container) — races through the moment the DOM is
+                # queryable and gives up quickly on captcha/interstitial.
+                try:
+                    page.wait_for_selector("#search, form[action*='sorry']",
+                                           state="attached", timeout=3000)
+                except PlaywrightTimeout:
+                    pass
                 body_text = page.inner_text("body") or ""
                 if "unusual traffic" in body_text.lower() or "captcha" in body_text.lower():
                     log.debug(f"jd_fetcher.google_{label}_captcha")
                     return None
                 return page.content()
             finally:
-                browser.close()
+                context.close()
     except Exception as e:
         log.warning(f"jd_fetcher.google_{label}_error", error=str(e))
         return None
 
 
-def _search_for_jd(job_title: str, company: str) -> str | None:
+def _search_for_jd(job_title: str, company: str, browser: Browser | None = None) -> str | None:
     """
     Search for the job posting on known ATS platforms via web search.
 
@@ -338,7 +379,7 @@ def _search_for_jd(job_title: str, company: str) -> str | None:
     ats_site_query = " OR ".join(f"site:{domain}" for domain in ATS_DOMAINS)
     query = f'"{job_title}" "{company}" {ats_site_query}'
 
-    html = _web_search(query, "ats")
+    html = _web_search(query, "ats", browser=browser)
     if html is None:
         return None
 
@@ -351,7 +392,7 @@ def _search_for_jd(job_title: str, company: str) -> str | None:
     return None
 
 
-def _search_for_jd_broad(job_title: str, company: str) -> str | None:
+def _search_for_jd_broad(job_title: str, company: str, browser: Browser | None = None) -> str | None:
     """
     Broader web search for the job posting on any careers page.
 
@@ -359,7 +400,7 @@ def _search_for_jd_broad(job_title: str, company: str) -> str | None:
     """
     query = f'"{job_title}" "{company}" careers apply'
 
-    html = _web_search(query, "broad")
+    html = _web_search(query, "broad", browser=browser)
     if html is None:
         return None
 
@@ -392,21 +433,30 @@ def _resolve_if_sendgrid(url: str, timeout: int) -> str | None:
     return url
 
 
-def _fetch_with_playwright(url: str, timeout: int) -> tuple[str | None, str | None]:
+def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = None) -> tuple[str | None, str | None]:
     """
     Load a hiring.cafe job page with headless Chromium.
 
     Returns (jd_text, ats_apply_url).  Both can be None.
+
+    H15 (Phase 6 audit): when ``browser`` is provided, we reuse it and
+    only allocate a per-fetch ``BrowserContext`` — that skips the ~2-4s
+    Chromium startup that pre-fix paid per call.
+
+    M16 (Phase 6 audit): pre-fix, every fetch paid a hard 3000ms sleep
+    followed by up to four sequential 5000ms selector waits (≥3s floor,
+    ~23s worst-case). Post-fix: one comma-separated CSS ``wait_for_selector``
+    call races all four candidate selectors in a single wait — early-return
+    on the first hit, no unconditional sleep.
     """
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with _browser_or_launch(browser) as b:
+            context = b.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
             try:
-                context = browser.new_context(
-                    user_agent=HEADERS["User-Agent"],
-                    viewport={"width": 1280, "height": 800},
-                    locale="en-US",
-                )
                 page = context.new_page()
                 page.set_extra_http_headers({
                     "Accept": HEADERS["Accept"],
@@ -419,22 +469,27 @@ def _fetch_with_playwright(url: str, timeout: int) -> tuple[str | None, str | No
                     log.warning("jd_fetcher.playwright_goto_timeout", url=url)
                     # Continue — page may be partially loaded and still usable
 
-                # Give the bot check time to clear and JS content to render
-                page.wait_for_timeout(3000)
-
-                # Try to wait for substantive content to appear in the DOM
-                for selector in ["main", "article", "[class*='description']", "h1"]:
-                    try:
-                        page.wait_for_selector(selector, timeout=5000)
-                        break
-                    except PlaywrightTimeout:
-                        continue
+                # M16: race all substantive-content selectors in ONE wait.
+                # Comma-separated CSS gives an OR — the first match releases
+                # us. Cap total wait at 5s (matches the pre-fix per-selector
+                # cap, but the pre-fix loop paid up to 20s). Instantly-rendered
+                # pages return in ms.
+                try:
+                    page.wait_for_selector(
+                        "main, article, [class*='description'], h1",
+                        timeout=5000,
+                    )
+                except PlaywrightTimeout:
+                    # No substantive content within 5s — extract_best_text
+                    # will still try to pull body text; a captcha/interstitial
+                    # will fall through to None + a downstream retry.
+                    pass
 
                 text = _extract_best_text(page)
                 ats_url = _find_ats_link(page)
                 return text, ats_url
             finally:
-                browser.close()
+                context.close()
 
     except Exception as e:
         log.warning("jd_fetcher.playwright_error", error=str(e), url=url)
@@ -503,36 +558,55 @@ def _find_ats_link(page) -> str | None:
 
     Prefers links pointing to known ATS domains, then falls back to any
     off-site "Apply" anchor.
+
+    M15 (Phase 6 audit): the anchor scan is now a single ``eval_on_selector_all``
+    JS eval — the browser returns all (href, text) pairs in one CDP
+    round-trip. Pre-fix, this looped over every anchor with 2 sync
+    round-trips each (``get_attribute("href")`` + ``inner_text()``), so a
+    hiring.cafe page with 200+ anchors paid 400+ sequential IPCs. All
+    filtering runs in Python on the returned list.
     """
     try:
-        links = page.query_selector_all("a[href]")
-        ats_candidates = []
-
-        for link in links:
-            href = link.get_attribute("href") or ""
-            if not href.startswith("http"):
-                continue
-
-            if any(domain in href for domain in ATS_DOMAINS):
-                ats_candidates.append(href)
-                continue
-
-            link_text = (link.inner_text() or "").lower().strip()
-            if "apply" in link_text and "hiring.cafe" not in href:
-                ats_candidates.append(href)
-
-        return ats_candidates[0] if ats_candidates else None
-
+        # Return only href + trimmed text; the trim/lowercase steps stay
+        # in Python for symmetry with the pre-fix filter and to keep the
+        # JS payload small enough for hostile pages that stub text APIs.
+        raw = page.eval_on_selector_all(
+            "a[href]",
+            "elements => elements.map(el => ({href: el.getAttribute('href') || '', text: (el.textContent || '').trim()}))",
+        )
     except Exception:
         return None
 
+    for entry in raw or []:
+        href = entry.get("href") if isinstance(entry, dict) else ""
+        text = entry.get("text") if isinstance(entry, dict) else ""
+        if not href or not href.startswith("http"):
+            continue
+        if any(domain in href for domain in ATS_DOMAINS):
+            return href
+        # Non-ATS off-site anchor: only counts if the visible label contains
+        # "apply". Preserves the pre-fix precedence (first match wins).
+        text_lower = (text or "").lower()
+        if "apply" in text_lower and "hiring.cafe" not in href:
+            return href
 
-def _fetch_ats_page(url: str, timeout: int) -> str | None:
+    return None
+
+
+def _fetch_ats_page(url: str, timeout: int, browser: Browser | None = None) -> str | None:
     """
     Fetch JD content from an external ATS page.
 
     Tries httpx + readability first (fast, works for most ATS).
     Falls back to Playwright for JS-heavy pages.
+
+    H15 (Phase 6 audit): when ``browser`` is provided, the Playwright
+    fallback reuses it instead of launching Chromium per call.
+
+    M16 (Phase 6 audit): the pre-fix unconditional 2-second sleep after
+    goto is dropped — ``networkidle`` (or its timeout) is already a
+    substantive wait, and the body-text extraction is deterministic
+    against the loaded DOM.
     """
     try:
         with httpx.Client(
@@ -560,23 +634,24 @@ def _fetch_ats_page(url: str, timeout: int) -> str | None:
 
     # Playwright fallback for ATS pages with their own bot protection
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with _browser_or_launch(browser) as b:
+            context = b.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+            )
             try:
-                context = browser.new_context(
-                    user_agent=HEADERS["User-Agent"],
-                    viewport={"width": 1280, "height": 800},
-                )
                 page = context.new_page()
                 try:
                     page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
                 except PlaywrightTimeout:
                     pass
-                page.wait_for_timeout(2000)
+                # M16: no unconditional 2000ms sleep — networkidle (or
+                # its timeout above) already gates on network activity
+                # settling, so body-text extraction is stable.
                 text = page.inner_text("body")
                 return text
             finally:
-                browser.close()
+                context.close()
 
     except Exception as e:
         log.debug("jd_fetcher.ats_playwright_error", error=str(e), url=url)

@@ -214,22 +214,21 @@ class TestFindAtsLinkStillWorks:
         """
         _find_ats_link retains its str | None signature and still identifies a
         Greenhouse ATS URL among a page's anchors.
+
+        Post-M15 (Phase 6 audit): the internal call is now a single
+        ``page.eval_on_selector_all`` returning [{href, text}, ...] rather
+        than a Python-side loop over ``query_selector_all`` handles.
         """
-        gh_link = MagicMock()
-        gh_link.get_attribute.return_value = "https://boards.greenhouse.io/acme/jobs/999"
-        gh_link.inner_text.return_value = "Apply Now"
-
-        internal_link = MagicMock()
-        internal_link.get_attribute.return_value = "https://hiring.cafe/somewhere"
-        internal_link.inner_text.return_value = "Home"
-
         page = MagicMock()
-        page.query_selector_all.return_value = [internal_link, gh_link]
+        page.eval_on_selector_all.return_value = [
+            {"href": "https://hiring.cafe/somewhere", "text": "Home"},
+            {"href": "https://boards.greenhouse.io/acme/jobs/999", "text": "Apply Now"},
+        ]
 
         result = _find_ats_link(page)
         assert result == "https://boards.greenhouse.io/acme/jobs/999"
 
     def test_no_ats_link_returns_none(self):
         page = MagicMock()
-        page.query_selector_all.return_value = []
+        page.eval_on_selector_all.return_value = []
         assert _find_ats_link(page) is None

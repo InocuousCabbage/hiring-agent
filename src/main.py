@@ -39,6 +39,7 @@ load_dotenv()
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 
+from browser.session import shared_browser
 from parser.email_parser import parse_alert_from_eml, parse_alert_email
 from scraper.jd_fetcher import fetch_job_description
 from classifier.lane_selector import classify_lane
@@ -490,190 +491,207 @@ def run_pipeline(
     processed = []
     skipped = []
 
-    for i, job in enumerate(jobs):
-        job_log = log.bind(job_index=i, title=job["title"], company=job["company"])
-        job_log.info("step.process_job", status="starting")
+    # H15 (Phase 6 audit): open Chromium ONCE for the whole batch and
+    # thread the shared handle into every fetch. Pre-fix, the three
+    # Playwright call sites inside fetch_job_description each did their
+    # own pw.start() + chromium.launch() + browser.close(), so a 5-job
+    # run with any fallbacks paid ~20-60s of pure startup/teardown. The
+    # shared handle is only opened if there ARE jobs; an empty run
+    # short-circuits and pays no launch cost. The wrapping try/finally
+    # guarantees teardown even on an unexpected exception inside the loop.
+    from contextlib import ExitStack
+    _browser_stack = ExitStack()
+    shared = _browser_stack.enter_context(shared_browser()) if jobs else None
+    try:
+        for i, job in enumerate(jobs):
+            job_log = log.bind(job_index=i, title=job["title"], company=job["company"])
+            job_log.info("step.process_job", status="starting")
 
-        try:
-            # ── Fetch JD ─────────────────────────────────────────────────────
-            jd_result = fetch_job_description(
-                url=job["url"],
-                timeout=config["scraper"]["timeout_seconds"],
-                min_length=config["scraper"]["min_jd_length"],
-                job_title=job.get("title", ""),
-                company=job.get("company", ""),
-            )
-            if jd_result is None:
-                job_log.warning("step.fetch_jd", status="skipped", reason="JD retrieval failed")
-                skipped.append({**job, "reason": "JD retrieval failed"})
-                continue
-            jd = jd_result.text
-            # Surface ATS metadata onto the job dict for Phase 3 auto-apply.
-            # Falls back to None when the JD came from a non-ATS source
-            # (e.g. pure hiring.cafe or a company careers page).
-            job["ats_apply_url"] = jd_result.ats_apply_url
-            job["ats"] = jd_result.ats
-            job_log.info(
-                "step.fetch_jd",
-                status="success",
-                jd_length=len(jd),
-                ats=jd_result.ats,
-                ats_apply_url=jd_result.ats_apply_url,
-            )
-
-            # ── Classify lane ─────────────────────────────────────────────────
-            lane = classify_lane(jd_text=jd, lanes_config=config["lanes"])
-            job_log.info("step.classify_lane", lane=lane["name"])
-
-            # ── Tailor resume ─────────────────────────────────────────────────
-            tailored_resume = tailor_resume(
-                jd_text=jd,
-                lane=lane,
-                project_bank=project_bank,
-                config=config["resume"],
-            )
-
-            confidence = tailored_resume.get("confidence_score", 100)
-            min_confidence = config["resume"].get("min_confidence_score", 30)
-            if confidence < min_confidence:
-                job_log.warning(
-                    "step.tailor_resume",
-                    status="skipped_low_confidence",
-                    confidence=confidence,
-                    threshold=min_confidence,
+            try:
+                # ── Fetch JD ─────────────────────────────────────────────────────
+                jd_result = fetch_job_description(
+                    url=job["url"],
+                    timeout=config["scraper"]["timeout_seconds"],
+                    min_length=config["scraper"]["min_jd_length"],
+                    job_title=job.get("title", ""),
+                    company=job.get("company", ""),
+                    browser=shared,
                 )
-                skipped.append({
-                    **job,
-                    "reason": f"Poor fit — confidence {confidence}/100 (threshold {min_confidence})",
-                })
-                continue
-
-            # ── Write cover letter ────────────────────────────────────────────
-            cover_letter = write_cover_letter(
-                jd_text=jd,
-                job=job,
-                lane=lane,
-                project_bank=project_bank,
-                config=config["cover_letter"],
-            )
-
-            # ── QA + auto-fix loop ────────────────────────────────────────────
-            qa_passed = False
-            for attempt in range(config["qa"]["max_retries"] + 1):
-                qa_result = run_qa(
-                    tailored_resume=tailored_resume,
-                    cover_letter=cover_letter,
+                if jd_result is None:
+                    job_log.warning("step.fetch_jd", status="skipped", reason="JD retrieval failed")
+                    skipped.append({**job, "reason": "JD retrieval failed"})
+                    continue
+                jd = jd_result.text
+                # Surface ATS metadata onto the job dict for Phase 3 auto-apply.
+                # Falls back to None when the JD came from a non-ATS source
+                # (e.g. pure hiring.cafe or a company careers page).
+                job["ats_apply_url"] = jd_result.ats_apply_url
+                job["ats"] = jd_result.ats
+                job_log.info(
+                    "step.fetch_jd",
+                    status="success",
+                    jd_length=len(jd),
+                    ats=jd_result.ats,
+                    ats_apply_url=jd_result.ats_apply_url,
+                )
+    
+                # ── Classify lane ─────────────────────────────────────────────────
+                lane = classify_lane(jd_text=jd, lanes_config=config["lanes"])
+                job_log.info("step.classify_lane", lane=lane["name"])
+    
+                # ── Tailor resume ─────────────────────────────────────────────────
+                tailored_resume = tailor_resume(
                     jd_text=jd,
                     lane=lane,
-                    config=config,
+                    project_bank=project_bank,
+                    config=config["resume"],
                 )
-                if qa_result["pass"]:
-                    qa_passed = True
-                    break
-
-                job_log.warning(
-                    "step.qa",
-                    attempt=attempt + 1,
-                    errors=qa_result["errors"],
+    
+                confidence = tailored_resume.get("confidence_score", 100)
+                min_confidence = config["resume"].get("min_confidence_score", 30)
+                if confidence < min_confidence:
+                    job_log.warning(
+                        "step.tailor_resume",
+                        status="skipped_low_confidence",
+                        confidence=confidence,
+                        threshold=min_confidence,
+                    )
+                    skipped.append({
+                        **job,
+                        "reason": f"Poor fit — confidence {confidence}/100 (threshold {min_confidence})",
+                    })
+                    continue
+    
+                # ── Write cover letter ────────────────────────────────────────────
+                cover_letter = write_cover_letter(
+                    jd_text=jd,
+                    job=job,
+                    lane=lane,
+                    project_bank=project_bank,
+                    config=config["cover_letter"],
                 )
-
-                if attempt < config["qa"]["max_retries"]:
-                    tailored_resume, cover_letter = auto_fix(
+    
+                # ── QA + auto-fix loop ────────────────────────────────────────────
+                qa_passed = False
+                for attempt in range(config["qa"]["max_retries"] + 1):
+                    qa_result = run_qa(
                         tailored_resume=tailored_resume,
                         cover_letter=cover_letter,
-                        issues=qa_result["errors"],
                         jd_text=jd,
                         lane=lane,
-                        project_bank=project_bank,
+                        config=config,
                     )
-
-            if not qa_passed:
-                job_log.error("step.qa", status="failed_after_retries")
-                skipped.append({**job, "reason": "QA failed after retries"})
-                continue
-
-            # ── Render DOCX + PDF ─────────────────────────────────────────────
-            # DOCX is always produced; PDF is Optional (None when no
-            # LibreOffice/docx2pdf is installed). Downstream code (digest body
-            # + attachments) handles the None case explicitly.
-            output_dir.mkdir(parents=True, exist_ok=True)
-            resume_pdf, resume_docx = render_resume(
-                tailored_resume=tailored_resume,
-                lane=lane,
-                job=job,
-                date_str=today,
-                output_dir=output_dir,
-            )
-            cl_pdf, cl_docx = render_cover_letter(
-                cover_letter=cover_letter,
-                job=job,
-                date_str=today,
-                output_dir=output_dir,
-            )
-            job_log.info(
-                "step.render_documents",
-                resume_pdf=str(resume_pdf) if resume_pdf else None,
-                resume_docx=str(resume_docx),
-                cover_letter_pdf=str(cl_pdf) if cl_pdf else None,
-                cover_letter_docx=str(cl_docx),
-            )
-
-            # ── Hiring manager lookup ──────────────────────────────────────
-            hm_info = None
-            contacts_config = config.get("contacts", {})
-            if contacts_config.get("enabled", False):
-                try:
-                    hm_info = find_hiring_manager(
-                        job=job,
-                        jd_text=jd,
-                        lane=lane["label"],
-                        config=contacts_config,
+                    if qa_result["pass"]:
+                        qa_passed = True
+                        break
+    
+                    job_log.warning(
+                        "step.qa",
+                        attempt=attempt + 1,
+                        errors=qa_result["errors"],
                     )
-                    if hm_info:
-                        job_log.info("step.hm_lookup", name=hm_info["name"],
-                                     confidence=hm_info["confidence"])
-                    else:
-                        job_log.info("step.hm_lookup", status="not_found")
-                except Exception as exc:
-                    job_log.warning("step.hm_lookup", status="error", error=str(exc))
-
-            # ── S17 auto-apply seam (per-job) ───────────────────────────────
-            # Runs deferred inside `_apply_seam.run_for_job` — never raises;
-            # returns ApplyResult or None. `apply_result` is stapled onto the
-            # processed[] dict for the S14 digest rollup + downstream shape
-            # stability. When apply.enabled is false, run_for_job returns
-            # None immediately without importing the dispatcher stack.
-            apply_result = _apply_seam.run_for_job(
-                job=job,
-                jd_text=jd,
-                lane=lane,
-                resume_path=resume_pdf,
-                cover_letter_path=cl_pdf,
-                resume_docx_path=resume_docx,
-                cover_letter_docx_path=cl_docx,
-                apply_config=apply_config,
-                job_log=job_log,
-                gmail_client=gmail_client,
-                # SB2: explicit per-call dry_run flag — the seam OR's it with
-                # apply_config.get('dry_run', False). This replaces the pre-fix
-                # `apply_config['dry_run'] = True` one-way ratchet.
-                dry_run=dry_run,
-            )
-
-            processed.append({
-                **job,
-                "lane": lane["label"],
-                "resume_pdf": resume_pdf,
-                "resume_docx": resume_docx,
-                "cover_letter_pdf": cl_pdf,
-                "cover_letter_docx": cl_docx,
-                "hiring_manager": hm_info,
-                "apply_result": apply_result,
-            })
-
-        except Exception as exc:
-            job_log.error("step.process_job", status="error", error=str(exc), exc_info=True)
-            skipped.append({**job, "reason": f"Unexpected error: {exc}"})
+    
+                    if attempt < config["qa"]["max_retries"]:
+                        tailored_resume, cover_letter = auto_fix(
+                            tailored_resume=tailored_resume,
+                            cover_letter=cover_letter,
+                            issues=qa_result["errors"],
+                            jd_text=jd,
+                            lane=lane,
+                            project_bank=project_bank,
+                        )
+    
+                if not qa_passed:
+                    job_log.error("step.qa", status="failed_after_retries")
+                    skipped.append({**job, "reason": "QA failed after retries"})
+                    continue
+    
+                # ── Render DOCX + PDF ─────────────────────────────────────────────
+                # DOCX is always produced; PDF is Optional (None when no
+                # LibreOffice/docx2pdf is installed). Downstream code (digest body
+                # + attachments) handles the None case explicitly.
+                output_dir.mkdir(parents=True, exist_ok=True)
+                resume_pdf, resume_docx = render_resume(
+                    tailored_resume=tailored_resume,
+                    lane=lane,
+                    job=job,
+                    date_str=today,
+                    output_dir=output_dir,
+                )
+                cl_pdf, cl_docx = render_cover_letter(
+                    cover_letter=cover_letter,
+                    job=job,
+                    date_str=today,
+                    output_dir=output_dir,
+                )
+                job_log.info(
+                    "step.render_documents",
+                    resume_pdf=str(resume_pdf) if resume_pdf else None,
+                    resume_docx=str(resume_docx),
+                    cover_letter_pdf=str(cl_pdf) if cl_pdf else None,
+                    cover_letter_docx=str(cl_docx),
+                )
+    
+                # ── Hiring manager lookup ──────────────────────────────────────
+                hm_info = None
+                contacts_config = config.get("contacts", {})
+                if contacts_config.get("enabled", False):
+                    try:
+                        hm_info = find_hiring_manager(
+                            job=job,
+                            jd_text=jd,
+                            lane=lane["label"],
+                            config=contacts_config,
+                        )
+                        if hm_info:
+                            job_log.info("step.hm_lookup", name=hm_info["name"],
+                                         confidence=hm_info["confidence"])
+                        else:
+                            job_log.info("step.hm_lookup", status="not_found")
+                    except Exception as exc:
+                        job_log.warning("step.hm_lookup", status="error", error=str(exc))
+    
+                # ── S17 auto-apply seam (per-job) ───────────────────────────────
+                # Runs deferred inside `_apply_seam.run_for_job` — never raises;
+                # returns ApplyResult or None. `apply_result` is stapled onto the
+                # processed[] dict for the S14 digest rollup + downstream shape
+                # stability. When apply.enabled is false, run_for_job returns
+                # None immediately without importing the dispatcher stack.
+                apply_result = _apply_seam.run_for_job(
+                    job=job,
+                    jd_text=jd,
+                    lane=lane,
+                    resume_path=resume_pdf,
+                    cover_letter_path=cl_pdf,
+                    resume_docx_path=resume_docx,
+                    cover_letter_docx_path=cl_docx,
+                    apply_config=apply_config,
+                    job_log=job_log,
+                    gmail_client=gmail_client,
+                    # SB2: explicit per-call dry_run flag — the seam OR's it with
+                    # apply_config.get('dry_run', False). This replaces the pre-fix
+                    # `apply_config['dry_run'] = True` one-way ratchet.
+                    dry_run=dry_run,
+                )
+    
+                processed.append({
+                    **job,
+                    "lane": lane["label"],
+                    "resume_pdf": resume_pdf,
+                    "resume_docx": resume_docx,
+                    "cover_letter_pdf": cl_pdf,
+                    "cover_letter_docx": cl_docx,
+                    "hiring_manager": hm_info,
+                    "apply_result": apply_result,
+                })
+    
+            except Exception as exc:
+                job_log.error("step.process_job", status="error", error=str(exc), exc_info=True)
+                skipped.append({**job, "reason": f"Unexpected error: {exc}"})
+    finally:
+        # H15: always tear down the shared Chromium — even if the loop
+        # raised an unexpected exception past the inner per-job try/except.
+        _browser_stack.close()
 
     # ── S17 auto-apply seam: finalize once per run_pipeline (retention).
     # Runs S15's `rotate(config)` inside its own try/except so a filesystem

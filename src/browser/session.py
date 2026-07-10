@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Iterator
 
 import structlog
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Browser, Page, sync_playwright
 
 logger = structlog.get_logger(__name__)
 
@@ -157,4 +157,55 @@ def session(
             logger.info("browser.session.closed")
 
 
-__all__ = ["session"]
+@contextmanager
+def shared_browser(*, headless: bool = True) -> Iterator[Browser]:
+    """Open Chromium ONCE and yield a Browser that callers can share across
+    many fetches, then tear it down cleanly on exit.
+
+    H15 (Phase 6 audit): the JD fetch loop previously torn down and
+    re-launched Chromium at three call sites per job (~2-4s each),
+    burning 20-60s of pure startup per pipeline run for a 5-job batch.
+    Wrapping the loop in ``with shared_browser() as b:`` and threading
+    the handle into ``fetch_job_description(browser=b)`` collapses those
+    N launches to 1.
+
+    Contract:
+      * ``sync_playwright().start()`` is called exactly once.
+      * ``browser.close()`` and ``pw.stop()`` always run in the finally,
+        even if the caller raises inside the ``with`` block.
+      * Callers create their own ``BrowserContext`` per fetch (fast — ms
+        vs seconds for launch) so cookies / storage don't cross-contaminate
+        between jobs.
+
+    Not to be confused with ``session()`` — that yields a bound Page in one
+    context and is right-sized for single-shot uses like apply adapters.
+    ``shared_browser()`` yields the Browser handle for callers that want
+    to spin up multiple contexts/pages themselves.
+    """
+    pw = sync_playwright().start()
+    browser = None
+    try:
+        browser = pw.chromium.launch(headless=headless)
+        # L7: name the event only — no URLs or state.
+        logger.info("browser.shared.opened", headless=headless)
+        yield browser
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception as e:
+                logger.warning(
+                    "browser.shared.close_failed",
+                    error_type=type(e).__name__,
+                )
+        try:
+            pw.stop()
+        except Exception as e:
+            logger.warning(
+                "browser.shared.stop_failed",
+                error_type=type(e).__name__,
+            )
+        logger.info("browser.shared.closed")
+
+
+__all__ = ["session", "shared_browser"]

@@ -196,11 +196,25 @@ Only return valid JSON. No explanation."""
 
     try:
         fixed = json.loads(raw)
-        fixed_resume = fixed.get("resume", tailored_resume)
-        fixed_cl = fixed.get("cover_letter", cover_letter)
-        fixed_resume["lane"] = tailored_resume.get("lane")
-        log.info("qa.auto_fix_applied")
-        return fixed_resume, fixed_cl
     except json.JSONDecodeError as e:
         log.error("qa.auto_fix_parse_error", error=str(e))
         return tailored_resume, cover_letter
+
+    # L1 (Phase 6 audit): shape guard — valid JSON with wrong root shape
+    # (e.g. {"resume": [], "cover_letter": []}) previously raised TypeError
+    # at `fixed_resume["lane"] = ...` and escaped the try/except. Fall back
+    # to originals on either side that isn't a dict, so a malformed LLM
+    # response never crashes the tailoring pipeline.
+    fixed_resume = fixed.get("resume", tailored_resume)
+    fixed_cl = fixed.get("cover_letter", cover_letter)
+    if not isinstance(fixed_resume, dict):
+        log.warning("qa.auto_fix_wrong_resume_shape", got=type(fixed_resume).__name__)
+        fixed_resume = tailored_resume
+    if not isinstance(fixed_cl, dict):
+        log.warning("qa.auto_fix_wrong_cover_letter_shape", got=type(fixed_cl).__name__)
+        fixed_cl = cover_letter
+    # Preserve the lane on the (now-dict-guaranteed) tailored resume.
+    if fixed_resume is not tailored_resume:
+        fixed_resume["lane"] = tailored_resume.get("lane")
+    log.info("qa.auto_fix_applied")
+    return fixed_resume, fixed_cl

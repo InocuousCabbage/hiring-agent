@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 from copy import deepcopy
+from functools import lru_cache
 from hashlib import blake2b
 from pathlib import Path
 from typing import Optional
@@ -315,8 +316,16 @@ def _docx_to_pdf(docx_path: Path, output_dir: Path) -> None:
     )
 
 
+@lru_cache(maxsize=1)
 def _find_libreoffice() -> str | None:
-    """Return the path to a working LibreOffice binary, or None."""
+    """Return the path to a working LibreOffice binary, or None.
+
+    L5 (Phase 6 audit): the result is cached for the process lifetime.
+    Pre-fix this ran a `soffice --version` subprocess on every _docx_to_pdf
+    call (2N per run) — a stable fs-probe that never varies within a
+    process. Cache invalidation: none needed — LibreOffice install path
+    doesn't change without a process restart.
+    """
     for candidate in _LO_CANDIDATES:
         if not candidate:
             continue
