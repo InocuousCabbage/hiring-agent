@@ -24,6 +24,7 @@ from pathlib import Path
 import structlog
 
 from llm import call_claude
+from src.utils.llm_json import LLMJsonParseError, extract_json_object
 
 log = structlog.get_logger()
 
@@ -212,21 +213,30 @@ Role 2 — {current_resume['roles'][2]['header']}
 
 Return the tailored resume as JSON."""
 
-    raw = call_claude(prompt, model=_MODEL, system=SYSTEM_PROMPT).strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    raw = call_claude(prompt, model=_MODEL, system=SYSTEM_PROMPT)
 
+    # Robuster extraction via shared helper. Handles prose preamble
+    # (Onbe/Medtronic 8/3 shape: 'Expecting value at char 0'), trailing
+    # prose (Cutover 8/5 shape: 'Extra data at char 2790'), and markdown
+    # fences. Raises LLMJsonParseError only when NO balanced object can
+    # be extracted; the caller distinguishes that from a valid low-match
+    # via the _parse_error sentinel below.
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error("resume_tailor.json_parse_error", error=str(e), raw=raw[:300])
+        result = extract_json_object(raw)
+    except LLMJsonParseError as exc:
+        log.error("resume_tailor.json_parse_error", error=str(exc), raw=raw[:300])
+        # Sentinel: confidence_score=None + _parse_error set so downstream
+        # gating (main.py) can distinguish parser-broke from legit-poor-match.
+        # Silent-0 was the pre-fix bug: a parse error collapsed into "candidate
+        # is a very poor fit" and the class became invisible on the next failure.
         result = {
-            "confidence_score": 0,
+            "confidence_score": None,
+            "_parse_error": str(exc),
             "tagline": "",
             "summary": "",
             "skills": [],
             "roles": [],
-            "gaps_noted": ["Model returned prose instead of JSON — likely a very poor fit"],
+            "gaps_noted": [f"JSON parse failed: {exc}"],
             "keywords_integrated": [],
         }
 
