@@ -754,6 +754,9 @@ def main_root_with_config():
         (tmp_path / "templates" / "project_bank.yaml").write_text(
             (real_root / "templates" / "project_bank.yaml").read_text()
         )
+        (tmp_path / "config" / "settings.local.yaml").write_text(
+            'user:\n  company: "TESTCO-DO-NOT-SHIP"\n'
+        )
         monkeypatch.setattr(main_mod, "ROOT", tmp_path)
         return tmp_path
 
@@ -782,3 +785,46 @@ def run_seam_config(apply_settings) -> dict:
             "output_dir": "output",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped fixture: settings.local.yaml with TESTCO-DO-NOT-SHIP canary.
+#
+# load_project_bank() now requires config/settings.local.yaml with a
+# user.company field. Test suite doesn't ship one (deliberately: real value
+# is per-operator, not test-fixture). This autouse fixture creates a
+# throwaway settings.local.yaml with the canary value for the test run,
+# then removes it on teardown.
+#
+# CANARY VALUE (TESTCO-DO-NOT-SHIP): if this fixture ever leaks into a
+# shipped output (real cover letter, real resume), the canary is visibly
+# wrong + Ben would catch it before applying. Same anti-fixture-authored-
+# by-code-author-blindness pattern from the substitution mechanism itself.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session", autouse=True)
+def _testco_user_company_canary(tmp_path_factory):
+    """Create config/settings.local.yaml with TESTCO-DO-NOT-SHIP for the run.
+
+    Session-scoped so the write happens once, not per-test. Autouse so
+    tests that call load_project_bank don't have to opt in.
+
+    The canary value is DELIBERATELY chosen to be visibly wrong if it
+    ships. Real user.company (parsed from a real settings.local.yaml)
+    would replace this at runtime; in tests the canary makes any
+    accidental fixture-in-prod leak immediately visible.
+    """
+    from src.main import ROOT
+
+    settings_path = ROOT / "config" / "settings.local.yaml"
+    already_existed = settings_path.is_file()
+    original_content = settings_path.read_text() if already_existed else None
+
+    settings_path.write_text('user:\n  company: "TESTCO-DO-NOT-SHIP"\n')
+    try:
+        yield "TESTCO-DO-NOT-SHIP"
+    finally:
+        if already_existed and original_content is not None:
+            settings_path.write_text(original_content)
+        else:
+            settings_path.unlink(missing_ok=True)

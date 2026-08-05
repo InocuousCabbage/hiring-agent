@@ -1,0 +1,18 @@
+# ─── User identity (rendered into cover letters + project bank) ──────────
+#
+# Copy this file to config/settings.local.yaml (gitignored) and fill in
+# your real employer name. project_bank.yaml contains the {{USER_COMPANY}}
+# placeholder token; at load time the token is substituted with the value
+# below.
+#
+# The example file (this one) is checked into the repo; the actual
+# settings.local.yaml is NOT (see .gitignore). Keeping your real employer
+# name out of the tree so any accidental publish (git clone shared) does
+# not expose it.
+#
+# Missing settings.local.yaml OR missing user.company field = FAIL LOUD
+# rather than silently shipping the "{{USER_COMPANY}}" token OR reverting
+# to the previous "Acme Corp" placeholder (which was the pre-fix bug).
+
+user:
+  company: "YOUR_COMPANY_NAME_HERE"

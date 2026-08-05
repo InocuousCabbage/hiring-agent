@@ -346,9 +346,33 @@ def load_config() -> dict:
 
 
 def load_project_bank() -> list[dict]:
+    """Load projects + substitute {{USER_COMPANY}} tokens from settings.local.yaml.
+
+    The template file carries {{USER_COMPANY}} where the user's real employer
+    name should render. Substitution happens here so downstream consumers
+    (resume_tailor + cover_letter) receive projects with the real name
+    already substituted, and the LLM never sees the placeholder token.
+
+    Fail-loud on missing settings.local.yaml OR missing user.company OR
+    a token surviving substitution, per src/utils/user_company. Pre-fix
+    behaviour silently shipped "At Acme Corp I built..." into a real
+    cover letter; this raises rather than shipping the token OR falling
+    back to a placeholder.
+    """
+    from src.utils.user_company import (
+        assert_no_unsubstituted_tokens,
+        load_user_company,
+        substitute_user_company,
+    )
+
     with open(ROOT / "templates" / "project_bank.yaml") as f:
         data = yaml.safe_load(f)
-    return data.get("projects", [])
+    projects = data.get("projects", [])
+
+    user_company = load_user_company(ROOT)
+    substituted = substitute_user_company(projects, user_company)
+    assert_no_unsubstituted_tokens(substituted, context="project_bank after load")
+    return substituted
 
 
 class _NoopGmailClient:
