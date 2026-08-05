@@ -547,6 +547,24 @@ def run_pipeline(
                     config=config["resume"],
                 )
     
+                # Parse-error sentinel (from src/utils/llm_json.LLMJsonParseError
+                # fallback in resume_tailor). Distinct from legit-low-confidence:
+                # parser-broke means we don't know the candidate's fit AT ALL, vs
+                # confidence_score=0 which means we do know + they're a bad match.
+                # Different failure modes with different remediation.
+                parse_error = tailored_resume.get("_parse_error")
+                if parse_error:
+                    job_log.warning(
+                        "step.tailor_resume",
+                        status="skipped_parse_error",
+                        parse_error=parse_error,
+                    )
+                    skipped.append({
+                        **job,
+                        "reason": f"Skipped — resume JSON parse error: {parse_error}",
+                    })
+                    continue
+
                 confidence = tailored_resume.get("confidence_score", 100)
                 min_confidence = config["resume"].get("min_confidence_score", 30)
                 if confidence < min_confidence:

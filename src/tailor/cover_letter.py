@@ -12,6 +12,7 @@ import re
 import structlog
 
 from llm import call_claude
+from src.utils.llm_json import LLMJsonParseError, extract_json_object
 
 log = structlog.get_logger()
 
@@ -105,15 +106,19 @@ Location: {job.get('location') or 'Not specified'}
 
 Return the cover letter as JSON."""
 
-    raw = call_claude(prompt, model=_MODEL, system=SYSTEM_PROMPT).strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    raw = call_claude(prompt, model=_MODEL, system=SYSTEM_PROMPT)
 
+    # Robuster extraction via shared helper; same shape as resume_tailor.py.
+    # Handles prose preamble + trailing prose + markdown fences.
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error("cover_letter.json_parse_error", error=str(e), raw=raw[:300])
+        result = extract_json_object(raw)
+    except LLMJsonParseError as exc:
+        log.error("cover_letter.json_parse_error", error=str(exc), raw=raw[:300])
+        # Sentinel: _parse_error field carries the parser's diagnostic
+        # message so downstream can distinguish parse-error from
+        # "model returned generic fallback paragraphs on purpose."
         result = {
+            "_parse_error": str(exc),
             "paragraphs": [
                 f"Please find my application for the {job['title']} role at {job['company']}.",
                 "My background in digital marketing, CRM integration, and data-driven campaign "
