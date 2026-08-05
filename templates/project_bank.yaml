@@ -6,7 +6,7 @@ projects:
   - id: "proj_001"
     name: "Marketing Automation Platform Migration"
     lane: ["mops", "pmm"]
-    company: "Acme Corp"
+    company: "{{USER_COMPANY}}"
     date_range: "2024–Present"
     summary: >
       Led end-to-end planning, migration, and launch of a new marketing
@@ -14,7 +14,8 @@ projects:
       a custom sync model that preserved sales-cycle integrity and drove
       measurable pipeline creation.
     bullets:
-      - "Led planning, testing, and launch of marketing automation platform within a complex pre-existing CRM ecosystem"
+      - "Led planning, testing, and launch of HubSpot as the marketing automation platform within the existing Dynamics 365 CRM ecosystem"
+      - "Architected bidirectional data flow between HubSpot (marketing automation + secondary CRM) and Dynamics 365 (system-of-record CRM) as the integration owner"
       - "Designed a custom integration strategy to bridge major differences between the two platforms' data models and business logic"
       - "Architected a hybrid data model to support multiple inquiry types rolling up into unified sales cycles"
       - "Built workflow logic to create new records per inquiry, manage active status, and preserve historical data"
@@ -24,16 +25,16 @@ projects:
       - "Migrated 100,000+ customer records with duplicate handling and record matching"
       - "Supported downstream BI reporting by structuring data for funnel, attribution, engagement, and system-health analysis"
     metrics:
-      - "Generated $1M+ in pipeline through the new platform to date"
+      - "Sourced $10.5M+ in closed customer project revenue via HubSpot-generated leads to date"
       - "Migrated 100,000+ customer records"
       - "Integrated marketing automation with CRM across inquiries, contacts, leads, opportunities, and deals"
       - "Reduced duplicate lead risk by enforcing a one-open-lead-per-person model"
     tools_used:
-      - "Marketing Automation Platform"
-      - "CRM"
-      - "ETL / Integration Tool"
-      - "BI Dashboard"
-      - "Project Management Tool"
+      - "HubSpot"
+      - "Dynamics 365"
+      - "Skyvia"
+      - "Power BI"
+      - "Microsoft Planner"
     tags:
       - "marketing automation"
       - "CRM integration"
@@ -44,11 +45,12 @@ projects:
       - "sales lifecycle"
       - "data quality"
       - "pipeline generation"
+      - "dual-CRM environment"
 
   - id: "proj_002"
     name: "Marketing Attribution Infrastructure Implementation"
     lane: ["mops", "pmm"]
-    company: "Acme Corp"
+    company: "{{USER_COMPANY}}"
     date_range: "2024–2025"
     summary: >
       Led planning, scoping, testing, launch, and training for a marketing
@@ -57,6 +59,7 @@ projects:
       first-touch, campaign, category, and referral data.
     bullets:
       - "Led end-to-end implementation of CRM attribution updates connecting marketing activity to pipeline creation and revenue outcomes"
+      - "Extended attribution field mapping across both Dynamics 365 (primary CRM) and HubSpot (marketing automation + secondary CRM) to preserve continuity in a dual-CRM environment"
       - "Designed an attribution framework separating first-touch discovery, qualification-stage touchpoints, campaign attribution, category classification, referral tracking, and brand-awareness inputs"
       - "Implemented discovery channel and platform fields on lead records to capture how prospects reached the company"
       - "Mapped attribution fields from Lead to Opportunity upon qualification to preserve continuity deeper into the funnel"
@@ -70,11 +73,11 @@ projects:
       - "Extended attribution and referral continuity across Lead, Opportunity, and Project records"
       - "Enabled reporting by channel, platform, campaign, category, referral status, and funnel stage"
     tools_used:
-      - "CRM"
-      - "Marketing Automation Platform"
-      - "BI Dashboard"
-      - "Spreadsheet Tool"
-      - "Project Management Tool"
+      - "Dynamics 365"
+      - "HubSpot"
+      - "Power BI"
+      - "Excel"
+      - "Microsoft Planner"
     tags:
       - "marketing attribution"
       - "CRM"
@@ -82,11 +85,12 @@ projects:
       - "marketing operations"
       - "pipeline reporting"
       - "data quality"
+      - "dual-CRM environment"
 
   - id: "proj_003"
     name: "Savings Calculator Lead Generation Campaign"
     lane: ["content", "pmm"]
-    company: "Acme Corp"
+    company: "{{USER_COMPANY}}"
     date_range: "Q1 2025"
     summary: >
       Ideated, built, and launched a gated top-of-funnel lead generation
@@ -103,11 +107,9 @@ projects:
       - "Campaign landing page converting at 15.72%"
       - "Campaign asset mix: 2 landing pages, 2 forms, 5 emails, 5 workflows, 2 CTAs"
     tools_used:
-      - "Marketing Automation Platform"
-      - "Landing Page Builder"
-      - "Form Builder"
-      - "Workflow Automation"
-      - "Campaign Manager"
+      - "HubSpot"
+      - "WordPress"
+      - "HeyFlow"
     tags:
       - "lead generation"
       - "growth marketing"
@@ -121,7 +123,7 @@ projects:
   - id: "proj_004"
     name: "CRO Testing Program + Prioritization App"
     lane: ["content", "mops"]
-    company: "Acme Corp"
+    company: "{{USER_COMPANY}}"
     date_range: "Q3 2024–Present"
     summary: >
       Researched, designed, and launched a repeatable CRO testing program,
@@ -142,11 +144,12 @@ projects:
       - "Above-fold form placement improved conversion rates by 17%"
       - "Form simplification tests improved conversion rates by 298% and 214% (90% confidence)"
     tools_used:
-      - "Heatmap / Session Recording Tool"
+      - "CrazyEgg"
       - "Google Analytics 4"
-      - "Marketing Automation Platform"
-      - "Spreadsheet Tool"
-      - "CMS"
+      - "HubSpot"
+      - "Excel"
+      - "WordPress"
+      - "Concrete5"
     tags:
       - "CRO"
       - "A/B testing"
@@ -160,7 +163,7 @@ projects:
   - id: "proj_005"
     name: "Regional Marketing Strategy Sprint"
     lane: ["pmm", "content"]
-    company: "Acme Corp"
+    company: "{{USER_COMPANY}}"
     date_range: "2025"
     summary: >
       Led a market-specific strategy sprint to define and implement a new
@@ -178,9 +181,9 @@ projects:
       - "Created a reusable strategic planning model applicable to future market launches and regional planning"
     metrics: []
     tools_used:
-      - "Whiteboard Tool"
-      - "Spreadsheet Tool"
-      - "Document Editor"
+      - "Microsoft Whiteboard"
+      - "Excel"
+      - "Word"
     tags:
       - "product marketing"
       - "go-to-market strategy"
@@ -190,3 +193,84 @@ projects:
       - "positioning"
       - "messaging strategy"
       - "market expansion"
+
+  - id: "proj_006"
+    name: "Custom Marketing Data Platform + Reporting"
+    lane: ["mops", "pmm"]
+    company: "{{USER_COMPANY}}"
+    date_range: "Q1 2025–Present"
+    summary: >
+      Built a company-wide marketing data platform in Azure, unifying data
+      from paid ads, marketing automation, and CRM sources into an
+      incrementally-updated SQL warehouse feeding a comprehensive Power BI
+      reporting suite used daily by leadership to steer marketing investment
+      decisions.
+    bullets:
+      - "Designed and built 10 daily-incremental data pipelines in Azure Data Factory pulling from 5 source systems including paid ads, marketing automation, and CRM"
+      - "Architected an Azure SQL Database schema (tables and views) purpose-built for BI consumption"
+      - "Delivered a comprehensive Power BI marketing report suite covering funnel, revenue attribution, and activity ROI"
+      - "Enabled data-driven budget allocation by exposing revenue-per-marketing-activity to leadership"
+      - "Surfaced sales-cycle timing analytics that drove the executive decision to migrate the sales team onto HubSpot as the sales system"
+      - "Used AI-assisted development to accelerate pipeline authoring and QA"
+    metrics:
+      - "10 production data pipelines running daily"
+      - "5 source systems integrated (Google Ads, Meta Ads, HubSpot, Dynamics 365, and additional marketing sources)"
+      - "~30 active users across leadership and cross-functional teams"
+      - "Directly influenced marketing budget allocation across channels"
+      - "Enabled the executive decision to migrate the sales team onto HubSpot"
+    tools_used:
+      - "Azure Data Factory"
+      - "Azure SQL Database"
+      - "Power BI"
+      - "HubSpot"
+      - "Dynamics 365"
+      - "Google Ads"
+      - "Meta Ads"
+      - "Claude (AI-assisted development)"
+    tags:
+      - "data engineering"
+      - "marketing analytics"
+      - "ETL"
+      - "cloud data warehouse"
+      - "business intelligence"
+      - "Power BI"
+      - "Azure"
+      - "marketing operations"
+      - "revenue attribution"
+      - "AI-assisted development"
+
+  - id: "proj_007"
+    name: "AI-Built Production CRM Deduplication Tool"
+    lane: ["mops"]
+    company: "{{USER_COMPANY}}"
+    date_range: "2025 (launch target Q3 2025)"
+    summary: >
+      Designed and built a production CRM deduplication tool that identifies,
+      scores, and merges duplicate records using multi-attribute matching and
+      completeness-based canonical selection. Built AI-assisted in Python for
+      deployment on the company's Dynamics 365 environment.
+    bullets:
+      - "Designed multi-attribute matching logic identifying duplicates by email, phone, name similarity, and address"
+      - "Built a record-completeness scoring model incorporating HubSpot sync status, NetSuite sync status, field-fill coverage, and related-entity connections (opportunities, projects)"
+      - "Implemented canonical-record selection based on completeness score, with automated merge for clear score gaps"
+      - "Designed a manual-review flagging path for close-score duplicates that require human judgment"
+      - "Deployed against the production Dynamics 365 CRM environment"
+      - "Built end-to-end in Python using AI-assisted development"
+    metrics:
+      - "Identified ~30,000 duplicate records in the production CRM"
+      - "Automated merge logic for high-confidence duplicates, manual-review flag for close-score cases"
+      - "Reduces long-standing CRM data quality debt affecting marketing outreach accuracy"
+    tools_used:
+      - "Python"
+      - "Dynamics 365"
+      - "HubSpot"
+      - "NetSuite"
+      - "Claude (AI-assisted development)"
+    tags:
+      - "data quality"
+      - "CRM hygiene"
+      - "AI-assisted development"
+      - "deduplication"
+      - "Python"
+      - "production tooling"
+      - "internal tools"

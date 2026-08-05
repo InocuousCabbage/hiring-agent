@@ -34,3 +34,6 @@ test_data/*.eml
 
 # Local code-review + planning scratch (per-run reviewer outputs, not shipped)
 reviews/
+
+# User-local overrides (contain real employer name; kept out of the tree)
+*.local.yaml
