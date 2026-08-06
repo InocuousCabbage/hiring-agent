@@ -562,7 +562,21 @@ def run_pipeline(
                 # ── Classify lane ─────────────────────────────────────────────────
                 lane = classify_lane(jd_text=jd, lanes_config=config["lanes"])
                 job_log.info("step.classify_lane", lane=lane["name"])
-    
+
+                # NO WORK-AUTHORISATION GATE HERE, DELIBERATELY (Ben, 2026-08-06).
+                # A gate belongs at this point: after the lane is known, before we
+                # spend a tailoring call. It is absent because the hiring.cafe email
+                # alerts that feed this pipeline already filter to US postings, where
+                # Ben is authorised, so a gate here would re-check a condition the
+                # source has already enforced.
+                #
+                # THE SAFETY THEREFORE LIVES IN A THIRD-PARTY FILTER SETTING THAT
+                # NOTHING IN THIS CODEBASE CAN SEE OR ASSERT ON. Two changes put it
+                # back on the table, and neither one will announce itself here:
+                #   1. the hiring.cafe alert criteria are edited to drop the US condition
+                #   2. jobs start arriving from any source other than those alerts
+                # If you are adding a new job source, this is the comment you needed.
+
                 # ── Tailor resume ─────────────────────────────────────────────────
                 tailored_resume = tailor_resume(
                     jd_text=jd,
