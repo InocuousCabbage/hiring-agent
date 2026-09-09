@@ -194,12 +194,16 @@ def fetch_job_description(
     # apply_url in its #__NEXT_DATA__ JSON one page load away. Skip the Google
     # search (which can surface the WRONG posting and pays a rate-limited
     # round-trip) and go straight to the JSON fetch; fall through to the
-    # Google/legacy strategy only if it yields no usable JD. Host-gated so
-    # non-hiring.cafe URLs (and the SendGrid-wrapped alert path) are untouched.
-    if _is_hiringcafe_job_url(url):
-        text, hc_ats_url = _fetch_with_playwright(url, timeout, browser=browser)
+    # Google/legacy strategy only if it yields no usable JD. Gated on the
+    # RESOLVED url so the SendGrid-wrapped alert path — whose link is a /job
+    # posting only once resolved — also skips the wasted Google round-trip.
+    # _resolve_if_sendgrid passes non-sendgrid URLs straight through with no
+    # network, so a non-sendgrid, non-/job URL is untouched here.
+    resolved_url = _resolve_if_sendgrid(url, timeout) or url
+    if _is_hiringcafe_job_url(resolved_url):
+        text, hc_ats_url = _fetch_with_playwright(resolved_url, timeout, browser=browser)
         if text and len(text) >= min_length and _has_jd_sections(text):
-            log.info("jd_fetcher.success", url=url, chars=len(text), source="hiring.cafe_direct")
+            log.info("jd_fetcher.success", url=resolved_url, chars=len(text), source="hiring.cafe_direct")
             inferred = _infer_ats_name(hc_ats_url)
             return JDFetchResult(
                 text=_clean_text(text),
@@ -208,7 +212,7 @@ def fetch_job_description(
             )
         log.debug(
             "jd_fetcher.direct_job_insufficient",
-            url=url,
+            url=resolved_url,
             chars=len(text) if text else 0,
         )
 

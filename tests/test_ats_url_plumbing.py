@@ -85,7 +85,12 @@ class TestFetchJobDescriptionSurfacesAts:
     def test_google_ats_path_surfaces_ats_url_and_name(self):
         """When _search_for_jd finds a Greenhouse URL, the result carries it."""
         gh_url = "https://boards.greenhouse.io/acme/jobs/12345"
-        with patch.object(jd_fetcher, "_search_for_jd", return_value=gh_url), \
+        # Step 0 now resolves the url first; patch resolve (NEVER real network)
+        # to a NON-/job destination so Step 0 does NOT short-circuit and the
+        # Google-ATS path this test exercises still runs.
+        with patch.object(jd_fetcher, "_resolve_if_sendgrid",
+                          return_value="https://acme-careers.example.com/openings"), \
+             patch.object(jd_fetcher, "_search_for_jd", return_value=gh_url), \
              patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
              patch.object(jd_fetcher, "_fetch_ats_page", return_value=_GOOD_JD_TEXT):
             result = fetch_job_description(
@@ -363,11 +368,52 @@ class TestDirectJobUrlShortCircuit:
         assert result is not None
         assert "JSON_SOURCED_JD" in result.text
 
+    def test_sendgrid_wrapped_job_url_skips_google_search(self):
+        """A SendGrid-wrapped alert link that RESOLVES to a hiring.cafe /job URL
+        must ALSO skip the Google search — the JSON short-circuit is gated on the
+        RESOLVED url, so _search_for_jd raising proves it is never called.
+
+        Same shape as test_direct_job_url_skips_google_search, but the /job URL is
+        reached only after _resolve_if_sendgrid (patched, NEVER real network)."""
+        browser, _page = _mock_browser_with_page()
+        next_data = {
+            "title": "Marketing Ops Lead",
+            "company": "Acme",
+            "description": _JSON_JD,
+            "apply_url": None,
+            "source": "saashr",
+            "board_token": "7612",
+        }
+        with patch.object(jd_fetcher, "_resolve_if_sendgrid",
+                          return_value="https://hiring.cafe/job/marketing-ops-lead-acme-abc123"), \
+             patch.object(jd_fetcher, "_search_for_jd",
+                          side_effect=AssertionError("Google must not run for a resolved /job alert link")), \
+             patch.object(jd_fetcher, "_search_for_jd_broad",
+                          side_effect=AssertionError("Broad Google must not run for a resolved /job alert link")), \
+             patch.object(jd_fetcher, "_extract_next_data", return_value=next_data), \
+             patch.object(jd_fetcher, "_extract_best_text", return_value=None), \
+             patch.object(jd_fetcher, "_find_ats_link", return_value=None):
+            result = fetch_job_description(
+                url="https://sendgrid.net/wf/click?abc",  # RAW alert link, not a /job URL
+                timeout=5,
+                min_length=200,
+                job_title="Marketing Ops Lead",  # present -> Google WOULD run absent the short-circuit
+                company="Acme",
+                browser=browser,
+            )
+        assert result is not None
+        assert "JSON_SOURCED_JD" in result.text
+
     def test_non_hiringcafe_url_still_uses_google_first(self):
         """A non-hiring.cafe URL still goes through the Google strategy first
         (regression guard for the alert-era path)."""
         gh_url = "https://boards.greenhouse.io/acme/jobs/12345"
-        with patch.object(jd_fetcher, "_search_for_jd", return_value=gh_url) as mock_search, \
+        # Step 0 now resolves the url first; patch resolve (NEVER real network)
+        # to a NON-/job destination so Step 0 does NOT short-circuit — the whole
+        # point of this regression guard is that Google STILL runs first here.
+        with patch.object(jd_fetcher, "_resolve_if_sendgrid",
+                          return_value="https://acme-careers.example.com/openings"), \
+             patch.object(jd_fetcher, "_search_for_jd", return_value=gh_url) as mock_search, \
              patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
              patch.object(jd_fetcher, "_fetch_ats_page", return_value=_GOOD_JD_TEXT):
             result = fetch_job_description(
