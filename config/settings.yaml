@@ -7,6 +7,12 @@ gmail:
   processed_label: "hiring-agent-processed"
   digest_subject_template: "Hiring.cafe Applications — {date}"
 
+  # HALF 2 — user link-submission intake (SECOND Gmail path, mutually
+  # exclusive from the alert above: dedicated subject marker + its OWN
+  # processed label, so the two paths never consume or mark each other's mail).
+  link_submission_subject_contains: "[apply]"   # user includes this in the subject
+  link_submission_processed_label: "hiring-agent-links-processed"
+
 # ─── Job Processing ────────────────────────────────────────
 jobs:
   max_per_run: 5

@@ -376,6 +376,68 @@ class GmailClient:
             })
         return out
 
+    @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
+    def find_link_submissions(
+        self,
+        subject_marker: str,
+        processed_label: str,
+        max_results: int = 10,
+    ) -> list[dict]:
+        """Return unprocessed user link-submission emails (HALF 2 intake path).
+
+        This is the SECOND Gmail intake path, kept MUTUALLY EXCLUSIVE from the
+        ali@hiring.cafe alert reader (Global constraint 4): it matches a
+        dedicated ``subject_marker`` and excludes a dedicated
+        ``processed_label``, so neither path ever consumes or marks the other's
+        mail. The alert path stays on its own subject + ``processed_label``.
+
+        Each dict surfaces the reply target (``from``) and the original
+        ``subject`` for the ``Re:`` reply (T8), plus BOTH bodies
+        (``body_text`` = text/plain, ``html`` = text/html) so the link
+        extractor can read links out of either (T6). Modeled on
+        ``get_unread_alerts`` (own list + full-get per message, reusing
+        ``_extract_body``) with ``search``'s header-surfacing added, so a
+        single message fetch yields everything the caller needs::
+
+            {"id", "thread_id", "from", "subject", "body_text", "html"}
+        """
+        query = (
+            f'subject:"{_sanitize_query(subject_marker)}" '
+            f'-label:{_sanitize_query(processed_label)}'
+        )
+        results = (
+            self.service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=max_results)
+            .execute()
+        )
+        out: list[dict] = []
+        for m in results.get("messages", []):
+            msg = (
+                self.service.users()
+                .messages()
+                .get(userId="me", id=m["id"], format="full")
+                .execute()
+            )
+            from_hdr = ""
+            subject_hdr = ""
+            headers = (msg.get("payload") or {}).get("headers") or []
+            for h in headers:
+                name = h.get("name", "").lower()
+                if name == "from":
+                    from_hdr = h.get("value", "")
+                elif name == "subject":
+                    subject_hdr = h.get("value", "")
+            out.append({
+                "id": m["id"],
+                "thread_id": msg.get("threadId"),
+                "from": from_hdr,
+                "subject": subject_hdr,
+                "body_text": self._extract_body(msg, "text/plain"),
+                "html": self._extract_body(msg, "text/html"),
+            })
+        return out
+
     # ── Send ────────────────────────────────────────────────────
 
     # MIME type dispatch for outbound attachments. Keyed on the lowercase
