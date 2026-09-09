@@ -9,6 +9,7 @@ Flow:
   5. Clean and return the text, or None on failure
 """
 
+import json
 import re
 import time
 from contextlib import contextmanager
@@ -81,6 +82,12 @@ _ATS_DOMAIN_TO_NAME: dict[str, str] = {
 }
 # Preserved as a list for existing filter_domains callers.
 ATS_DOMAINS: list[str] = list(_ATS_DOMAIN_TO_NAME.keys())
+
+# hiring.cafe hosts. The modern posting shape is
+# ``hiring.cafe/job/{slug}-{id}`` (also served from hiringcafe.com), where the
+# JD, title, company, and apply URL all live in the embedded ``#__NEXT_DATA__``
+# JSON rather than in class-tagged DOM nodes. Used to gate the JSON-first fetch.
+_HIRINGCAFE_HOSTS: tuple[str, ...] = ("hiring.cafe", "hiringcafe.com")
 
 
 def _infer_ats_name(url: str | None) -> str | None:
@@ -507,6 +514,98 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
     except Exception as e:
         log.warning("jd_fetcher.playwright_error", error=str(e), url=url)
         return None, None
+
+
+def _dig(obj, *keys):
+    """Descend ``obj`` through ``keys`` defensively.
+
+    Returns None the instant any intermediate value is not a dict (a None,
+    a list, a scalar) — so a hiring.cafe schema drift degrades to None rather
+    than raising AttributeError/TypeError on a ``.get`` against a non-dict.
+    """
+    cur = obj
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _parse_next_data(raw_json: str) -> dict | None:
+    """
+    Parse a hiring.cafe ``#__NEXT_DATA__`` JSON payload into a normalized job dict.
+
+    Confirmed key path (captured 2026-09-09, see tests/fixtures/hiringcafe):
+      props.pageProps.job.{
+        job_information.title,
+        job_information.description,   # JD *HTML*
+        apply_url,                     # direct ATS/careers URL
+        source, board_token,          # ATS vendor hints
+      }
+    with company from ``enriched_company_data.name`` falling back to
+    ``v5_processed_job_data.company_name``.
+
+    Returns None (never raises) on missing / non-JSON / wrong-shape input so
+    callers fall back cleanly to the class-selector text path. hiring.cafe's
+    schema is external and unversioned, so every access is a defensive
+    ``.get`` chain via ``_dig`` — no ``[]`` indexing.
+    """
+    if not raw_json or not isinstance(raw_json, str):
+        return None
+    try:
+        data = json.loads(raw_json)
+    except (ValueError, TypeError):
+        return None
+
+    job = _dig(data, "props", "pageProps", "job")
+    if not isinstance(job, dict) or not job:
+        return None
+
+    title = _dig(job, "job_information", "title") or _dig(
+        job, "job_information", "job_title_raw"
+    )
+    company = _dig(job, "enriched_company_data", "name") or _dig(
+        job, "v5_processed_job_data", "company_name"
+    )
+    description = _dig(job, "job_information", "description")
+    apply_url = job.get("apply_url")
+
+    # A usable parse needs at least the JD body or a title; a valid-JSON-but-
+    # wrong-shape payload yields none of these and returns None so the caller
+    # falls through to _extract_best_text.
+    if not (description or title):
+        return None
+
+    return {
+        "title": title,
+        "company": company,
+        "description": description,  # JD HTML — caller strips to text
+        "apply_url": apply_url,
+        "source": job.get("source"),
+        "board_token": job.get("board_token"),
+    }
+
+
+def _extract_next_data(page) -> dict | None:
+    """
+    Read and parse the ``#__NEXT_DATA__`` script from a rendered page.
+
+    ``#__NEXT_DATA__`` is server-rendered into the initial HTML, so it is
+    present right after ``domcontentloaded`` (no selector race needed).
+    Returns None (never raises) when the node is absent or unparseable so
+    callers fall back to the class-selector text path.
+    """
+    try:
+        el = page.query_selector("#__NEXT_DATA__")
+    except Exception:
+        return None
+    if not el:
+        return None
+    try:
+        raw = el.text_content()
+    except Exception:
+        return None
+    return _parse_next_data(raw)
 
 
 def _extract_best_text(page) -> str | None:
