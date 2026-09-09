@@ -207,6 +207,128 @@ class TestFetchJobDescriptionSurfacesAts:
         assert result is None
 
 
+# ── T2: __NEXT_DATA__ JSON wiring in _fetch_with_playwright ───────────────────
+
+# JD bodies carry a unique marker so a test can prove WHICH extraction path
+# produced result.text — the JSON path vs the class-selector fallback.
+_JSON_JD = (
+    "About the role\n\nJSON_SOURCED_JD — we are hiring a Marketing Ops Lead.\n\n"
+    "Responsibilities\n- Own the CRM data model\n\n"
+    "Requirements\n- 5+ years in marketing ops\n\n"
+    "Benefits\n- Competitive compensation and equity\n"
+    * 4
+)
+_OLD_PATH_JD = (
+    "About the role\n\nOLD_PATH_JD — class-selector fallback content.\n\n"
+    "Responsibilities\n- Own the CRM data model\n\n"
+    "Requirements\n- 5+ years in marketing ops\n\n"
+    "Benefits\n- Competitive compensation and equity\n"
+    * 4
+)
+
+
+def _mock_browser_with_page():
+    """A MagicMock Browser whose new_context().new_page() is a no-op page —
+    lets _fetch_with_playwright run fully offline (no Chromium, no network)."""
+    page = MagicMock(name="page")
+    browser = MagicMock(name="browser")
+    browser.new_context.return_value.new_page.return_value = page
+    return browser, page
+
+
+class TestHiringCafeNextDataWiring:
+    def test_hiringcafe_job_page_apply_url_from_json(self):
+        """A hiring.cafe /job page whose #__NEXT_DATA__ carries a Greenhouse
+        apply_url surfaces that URL + vendor name — apply_url now comes from
+        JSON, not an anchor scan (fixes spike breakage #2)."""
+        gh_url = "https://boards.greenhouse.io/acme/jobs/12345"
+        browser, _page = _mock_browser_with_page()
+        next_data = {
+            "title": "Marketing Ops Lead",
+            "company": "Acme",
+            "description": _JSON_JD,
+            "apply_url": gh_url,
+            "source": "greenhouse",
+            "board_token": "acme",
+        }
+        with patch.object(jd_fetcher, "_search_for_jd", return_value=None), \
+             patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
+             patch.object(jd_fetcher, "_resolve_if_sendgrid",
+                          return_value="https://hiring.cafe/job/marketing-ops-lead-acme-abc123"), \
+             patch.object(jd_fetcher, "_extract_next_data", return_value=next_data), \
+             patch.object(jd_fetcher, "_extract_best_text", return_value=_OLD_PATH_JD), \
+             patch.object(jd_fetcher, "_find_ats_link", return_value=None):
+            result = fetch_job_description(
+                url="https://hiring.cafe/job/marketing-ops-lead-acme-abc123",
+                timeout=5,
+                min_length=200,
+                job_title="",
+                company="",
+                browser=browser,
+            )
+        assert result is not None
+        assert "JSON_SOURCED_JD" in result.text  # JD text came from the JSON path
+        assert result.ats_apply_url == gh_url
+        assert result.ats == "Greenhouse"
+
+    def test_hiringcafe_job_page_non_ats_apply_url_drops_both(self):
+        """A JSON apply_url on a non-vendor host (workable.com) still yields the
+        JD text, but ats_apply_url/ats are None — mirrors the guard at
+        test_hiring_cafe_ats_fallback_with_non_ats_url_drops_both."""
+        workable_url = "https://acme-careers.workable.com/jobs/12345"
+        browser, _page = _mock_browser_with_page()
+        next_data = {
+            "title": "Marketing Ops Lead",
+            "company": "Acme",
+            "description": _JSON_JD,
+            "apply_url": workable_url,
+            "source": "workable",
+            "board_token": "acme",
+        }
+        with patch.object(jd_fetcher, "_search_for_jd", return_value=None), \
+             patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
+             patch.object(jd_fetcher, "_resolve_if_sendgrid",
+                          return_value="https://hiring.cafe/job/marketing-ops-lead-acme-abc123"), \
+             patch.object(jd_fetcher, "_extract_next_data", return_value=next_data), \
+             patch.object(jd_fetcher, "_extract_best_text", return_value=_OLD_PATH_JD), \
+             patch.object(jd_fetcher, "_find_ats_link", return_value=None):
+            result = fetch_job_description(
+                url="https://hiring.cafe/job/marketing-ops-lead-acme-abc123",
+                timeout=5,
+                min_length=200,
+                job_title="",
+                company="",
+                browser=browser,
+            )
+        assert result is not None
+        assert "JSON_SOURCED_JD" in result.text  # JD text came from the JSON path
+        assert result.ats_apply_url is None
+        assert result.ats is None
+
+    def test_next_data_absent_falls_back_to_class_selectors(self):
+        """When #__NEXT_DATA__ is absent (old page / non-hiring.cafe / drift),
+        the class-selector text path still produces a JD (regression guard)."""
+        browser, _page = _mock_browser_with_page()
+        with patch.object(jd_fetcher, "_search_for_jd", return_value=None), \
+             patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
+             patch.object(jd_fetcher, "_resolve_if_sendgrid",
+                          return_value="https://hiring.cafe/job/marketing-ops-lead-acme-abc123"), \
+             patch.object(jd_fetcher, "_extract_next_data", return_value=None), \
+             patch.object(jd_fetcher, "_extract_best_text", return_value=_OLD_PATH_JD), \
+             patch.object(jd_fetcher, "_find_ats_link", return_value=None):
+            result = fetch_job_description(
+                url="https://hiring.cafe/job/marketing-ops-lead-acme-abc123",
+                timeout=5,
+                min_length=200,
+                job_title="",
+                company="",
+                browser=browser,
+            )
+        assert result is not None
+        assert "OLD_PATH_JD" in result.text  # JD text came from the class-selector path
+        assert result.ats_apply_url is None
+
+
 # ── _find_ats_link unchanged-interface regression ─────────────────────────────
 
 class TestFindAtsLinkStillWorks:

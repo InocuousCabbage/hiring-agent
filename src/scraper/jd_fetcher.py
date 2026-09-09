@@ -505,6 +505,24 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
                     # will fall through to None + a downstream retry.
                     pass
 
+                # JSON-first (PRIMARY): modern hiring.cafe /job pages embed the
+                # JD body + apply URL in #__NEXT_DATA__. When present and it
+                # carries a JD description, use it — the apply_url then comes
+                # from JSON rather than an anchor scan (fixes the empty
+                # ats_apply_url regression on the new page shape). The caller
+                # applies the _infer_ats_name guard to the returned URL, so a
+                # non-vendor apply_url still degrades to ats_apply_url=None.
+                nd = _extract_next_data(page)
+                if nd and nd.get("description"):
+                    from bs4 import BeautifulSoup
+                    jd_text = BeautifulSoup(
+                        nd["description"], "lxml"
+                    ).get_text(separator="\n", strip=True)
+                    if jd_text:
+                        return jd_text, nd.get("apply_url")
+
+                # FALLBACK: class-selector text walk + anchor scan (old DOM,
+                # non-hiring.cafe pages, or a hiring.cafe schema drift).
                 text = _extract_best_text(page)
                 ats_url = _find_ats_link(page)
                 return text, ats_url
