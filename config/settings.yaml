@@ -12,6 +12,13 @@ gmail:
   # processed label, so the two paths never consume or mark each other's mail).
   link_submission_subject_contains: "[apply]"   # user includes this in the subject
   link_submission_processed_label: "hiring-agent-links-processed"
+  # FAIL-CLOSED sender allowlist (plan R3 / weemeemee GATE). Without it the
+  # link-in path is an open relay to Ben's Anthropic key. An entry may be a
+  # literal address or env:VARNAME. Defaults to Ben's alert-digest address via
+  # env:MY_EMAIL; if MY_EMAIL is unset this resolves to EMPTY => nobody allowed
+  # (never fail-open). Un-allowlisted senders are skipped with ZERO compute.
+  link_submission_allowed_senders:
+    - "env:MY_EMAIL"
 
 # ─── Job Processing ────────────────────────────────────────
 jobs:
