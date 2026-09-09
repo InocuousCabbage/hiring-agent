@@ -13,8 +13,17 @@ Actual Hiring.cafe email format (as of Feb 2026):
       <div> Brief description </div>
       <a href="sendgrid-tracking-url">Apply</a>
 
-  - Apply URLs are SendGrid tracking links that redirect to:
-      https://hiring.cafe/viewjob/{job_id}
+  - Apply URLs are SendGrid tracking links that redirect to the current
+    hiring.cafe posting shape:
+      https://hiringcafe.com/job/{slug}-{id}
+    where {slug} embeds the title + company + location and the JD, title,
+    company and apply URL all live in the embedded #__NEXT_DATA__ JSON
+    (parsed by scraper.jd_fetcher._parse_next_data).
+
+  - The legacy target https://hiring.cafe/viewjob/{job_id} is now 410 Gone;
+    scraper.jd_fetcher._fetch_ats_page short-circuits a 410 to a clean skip.
+    resolve_sendgrid_url() below is format-agnostic — it follows redirects to
+    whatever the final URL is and does not assume either shape.
 """
 
 import email as email_lib
@@ -340,8 +349,13 @@ def resolve_sendgrid_url(tracking_url: str, timeout: int = 10) -> str | None:
     """
     Follow SendGrid tracking URL redirects to get the actual hiring.cafe URL.
 
-    SendGrid URLs redirect like:
-      sendgrid.net/ls/click?... → hiring.cafe/viewjob/{id}
+    Format-agnostic: it follows redirects and returns whatever the final URL
+    is, so it works unchanged across hiring.cafe shape changes. The current
+    target is:
+      sendgrid.net/ls/click?... → hiringcafe.com/job/{slug}-{id}
+    The legacy target hiring.cafe/viewjob/{id} is now 410 Gone (the resolve
+    still succeeds and returns that URL; the 410 is handled downstream in
+    scraper.jd_fetcher._fetch_ats_page).
 
     Returns the final URL or None on failure.
     """

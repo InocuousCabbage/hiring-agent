@@ -801,6 +801,13 @@ def _fetch_ats_page(url: str, timeout: int, browser: Browser | None = None) -> s
         ) as client:
             resp = client.get(url)
 
+        # A legacy hiring.cafe /viewjob/{id} link is now 410 Gone. Treat it as
+        # a fast, legible skip rather than paying a browser launch to load the
+        # dead page only to fail _has_jd_sections downstream.
+        if resp.status_code == 410:
+            log.info("jd_fetcher.viewjob_gone", url=url)
+            return None
+
         if resp.status_code == 200:
             from readability import Document
             from bs4 import BeautifulSoup

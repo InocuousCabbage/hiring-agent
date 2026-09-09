@@ -28,9 +28,10 @@ from tests.apply._paths import (  # noqa: E402
     HIRINGCAFE_JOB_PAGE_HTML,
 )
 
-from scraper import jd_fetcher  # noqa: E402,F401
+from scraper import jd_fetcher  # noqa: E402
 from scraper.jd_fetcher import (  # noqa: E402
     _extract_next_data,
+    _fetch_ats_page,
     _parse_next_data,
 )
 
@@ -95,3 +96,31 @@ class TestParseNextData:
         page = MagicMock()
         page.query_selector.return_value = None
         assert _extract_next_data(page) is None
+
+
+class TestViewjob410:
+    def test_viewjob_410_is_handled(self):
+        """A legacy /viewjob/{id} link that now returns 410 Gone is a fast,
+        legible skip: _fetch_ats_page returns None and does NOT waste a browser
+        launch chasing the dead page (T4). A mock browser is supplied so the
+        fallback path, if reached, would return content (proving the early
+        410 return is what makes the result None)."""
+        resp = MagicMock()
+        resp.status_code = 410
+        resp.text = "<html><body>410 Gone</body></html>"
+        client_cm = MagicMock()
+        client_cm.__enter__.return_value.get.return_value = resp
+        client_cm.__exit__.return_value = False
+
+        # Mock browser so the Playwright fallback (reached only if the 410 is
+        # NOT short-circuited) returns real text rather than launching Chromium.
+        page = MagicMock()
+        page.inner_text.return_value = "This job posting is no longer available."
+        browser = MagicMock()
+        browser.new_context.return_value.new_page.return_value = page
+
+        with patch.object(jd_fetcher.httpx, "Client", return_value=client_cm):
+            result = _fetch_ats_page(
+                "https://hiring.cafe/viewjob/abc123", timeout=5, browser=browser
+            )
+        assert result is None
