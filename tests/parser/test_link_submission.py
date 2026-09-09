@@ -18,10 +18,13 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import yaml  # noqa: E402
+
 from parser.link_submission import (  # noqa: E402
     extract_job_links,
     build_jobs_from_links,
 )
+from parser.email_parser import parse_alert_email  # noqa: E402
 
 # The canonical pipeline-shaped key set, taken from email_parser output.
 _EXPECTED_KEYS = {
@@ -101,3 +104,39 @@ class TestBuildJobs:
             ["https://hiring.cafe/viewjob/legacy-410-id"], config={}
         )
         assert jobs == []
+
+
+class TestBatchCap:
+    def _links(self, n):
+        return [
+            f"https://hiring.cafe/job/role-{i}-acme-remote-id{i:04d}abcd"
+            for i in range(n)
+        ]
+
+    def test_build_jobs_respects_max_per_submission(self):
+        cfg = {"jobs": {"max_per_submission": 10}}
+        jobs = build_jobs_from_links(self._links(30), config=cfg)
+        assert len(jobs) == 10
+
+    def test_build_jobs_default_cap_is_10(self):
+        # Default cap (no config key) starts at 10 per plan R7.
+        jobs = build_jobs_from_links(self._links(30), config={})
+        assert len(jobs) == 10
+
+    def test_settings_yaml_defines_max_per_submission_at_10(self):
+        # Lock the shipped config value (plan R7).
+        cfg = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text())
+        assert cfg["jobs"]["max_per_submission"] == 10
+        # Alert path's own cap is left untouched.
+        assert cfg["jobs"]["max_per_run"] == 5
+
+    def test_alert_path_still_caps_at_5(self):
+        # Regression: the alert parser's own max_jobs is independent + unchanged.
+        html = "".join(
+            f"<table><tr><td><h3><span>Role Number {i} Here</span></h3>"
+            f"<div>Acme {i} — Remote</div>"
+            f'<a href="https://sg/{i}">Apply</a></td></tr></table>'
+            for i in range(8)
+        )
+        jobs = parse_alert_email(html_body=html, max_jobs=5)
+        assert len(jobs) == 5

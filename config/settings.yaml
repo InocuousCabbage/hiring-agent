@@ -15,7 +15,12 @@ gmail:
 
 # ─── Job Processing ────────────────────────────────────────
 jobs:
-  max_per_run: 5
+  max_per_run: 5              # alert path (ali@hiring.cafe) — unchanged
+  # HALF 2 — user link-submission batches are explicitly larger than an alert.
+  # Cost/latency scale LINEARLY: each job runs >=2 sonnet calls + QA + a haiku
+  # HM lookup + one page fetch. Start at 10 (plan R7); raise after a live cost
+  # read. Consumed only by parser.link_submission.build_jobs_from_links.
+  max_per_submission: 10
   sort_by: "newest"
 
 # ─── JD Fetching ───────────────────────────────────────────
