@@ -329,6 +329,59 @@ class TestHiringCafeNextDataWiring:
         assert result.ats_apply_url is None
 
 
+# ── T3: direct /job URLs short-circuit the Google search ──────────────────────
+
+class TestDirectJobUrlShortCircuit:
+    def test_direct_job_url_skips_google_search(self):
+        """A direct hiring.cafe /job URL whose #__NEXT_DATA__ yields a valid JD
+        must NOT trigger the Google search — _search_for_jd raising proves it
+        is never called."""
+        browser, _page = _mock_browser_with_page()
+        next_data = {
+            "title": "Marketing Ops Lead",
+            "company": "Acme",
+            "description": _JSON_JD,
+            "apply_url": None,
+            "source": "saashr",
+            "board_token": "7612",
+        }
+        with patch.object(jd_fetcher, "_search_for_jd",
+                          side_effect=AssertionError("Google search must not run for a direct /job URL")), \
+             patch.object(jd_fetcher, "_search_for_jd_broad",
+                          side_effect=AssertionError("Broad Google search must not run for a direct /job URL")), \
+             patch.object(jd_fetcher, "_extract_next_data", return_value=next_data), \
+             patch.object(jd_fetcher, "_extract_best_text", return_value=None), \
+             patch.object(jd_fetcher, "_find_ats_link", return_value=None):
+            result = fetch_job_description(
+                url="https://hiring.cafe/job/marketing-ops-lead-acme-abc123",
+                timeout=5,
+                min_length=200,
+                job_title="Marketing Ops Lead",  # present -> Google WOULD run absent the short-circuit
+                company="Acme",
+                browser=browser,
+            )
+        assert result is not None
+        assert "JSON_SOURCED_JD" in result.text
+
+    def test_non_hiringcafe_url_still_uses_google_first(self):
+        """A non-hiring.cafe URL still goes through the Google strategy first
+        (regression guard for the alert-era path)."""
+        gh_url = "https://boards.greenhouse.io/acme/jobs/12345"
+        with patch.object(jd_fetcher, "_search_for_jd", return_value=gh_url) as mock_search, \
+             patch.object(jd_fetcher, "_search_for_jd_broad", return_value=None), \
+             patch.object(jd_fetcher, "_fetch_ats_page", return_value=_GOOD_JD_TEXT):
+            result = fetch_job_description(
+                url="https://sendgrid.net/wf/click?abc",
+                timeout=5,
+                min_length=200,
+                job_title="Marketing Ops Lead",
+                company="Acme",
+            )
+        assert result is not None
+        mock_search.assert_called_once()
+        assert result.ats_apply_url == gh_url
+
+
 # ── _find_ats_link unchanged-interface regression ─────────────────────────────
 
 class TestFindAtsLinkStillWorks:

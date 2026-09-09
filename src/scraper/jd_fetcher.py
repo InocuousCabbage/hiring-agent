@@ -18,7 +18,7 @@ from typing import Iterator, Optional
 
 import httpx
 import structlog
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from playwright.sync_api import Browser, sync_playwright, TimeoutError as PlaywrightTimeout
 
 from parser.email_parser import resolve_sendgrid_url
@@ -105,6 +105,28 @@ def _infer_ats_name(url: str | None) -> str | None:
     return None
 
 
+def _is_hiringcafe_job_url(url: str | None) -> bool:
+    """
+    True when ``url`` is a direct hiring.cafe ``/job/...`` posting URL.
+
+    Used to gate the JSON-first short-circuit: for these URLs the authoritative
+    JD + apply_url are one page load away in ``#__NEXT_DATA__``, so the Google
+    search (which can surface the wrong posting and costs a rate-limited
+    round-trip) is skipped. Gated on the host so every other URL — including
+    the SendGrid-wrapped alert path — keeps its existing fetch ordering.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.netloc or "").split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host in _HIRINGCAFE_HOSTS and parsed.path.startswith("/job/")
+
+
 @contextmanager
 def _browser_or_launch(browser: Browser | None) -> Iterator[Browser]:
     """Yield a Browser: use ``browser`` if provided, else launch + tear down.
@@ -168,6 +190,28 @@ def fetch_job_description(
       - Extracted text is shorter than min_length
       - No recognizable JD section headers found
     """
+    # Step 0: A direct hiring.cafe /job URL carries the authoritative JD +
+    # apply_url in its #__NEXT_DATA__ JSON one page load away. Skip the Google
+    # search (which can surface the WRONG posting and pays a rate-limited
+    # round-trip) and go straight to the JSON fetch; fall through to the
+    # Google/legacy strategy only if it yields no usable JD. Host-gated so
+    # non-hiring.cafe URLs (and the SendGrid-wrapped alert path) are untouched.
+    if _is_hiringcafe_job_url(url):
+        text, hc_ats_url = _fetch_with_playwright(url, timeout, browser=browser)
+        if text and len(text) >= min_length and _has_jd_sections(text):
+            log.info("jd_fetcher.success", url=url, chars=len(text), source="hiring.cafe_direct")
+            inferred = _infer_ats_name(hc_ats_url)
+            return JDFetchResult(
+                text=_clean_text(text),
+                ats_apply_url=hc_ats_url if inferred else None,
+                ats=inferred,
+            )
+        log.debug(
+            "jd_fetcher.direct_job_insufficient",
+            url=url,
+            chars=len(text) if text else 0,
+        )
+
     # Step 1: Try Google search for direct ATS posting
     if job_title and company:
         ats_url = _search_for_jd(job_title, company, browser=browser)
