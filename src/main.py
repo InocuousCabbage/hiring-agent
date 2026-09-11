@@ -39,8 +39,11 @@ load_dotenv()
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 
+from email.utils import parseaddr
+
 from browser.session import shared_browser
 from parser.email_parser import parse_alert_from_eml, parse_alert_email
+from parser.link_submission import extract_job_links, build_jobs_from_links
 from scraper.jd_fetcher import fetch_job_description
 from classifier.lane_selector import classify_lane
 from tailor.resume_tailor import tailor_resume
@@ -757,6 +760,150 @@ def run_pipeline(
     return processed, skipped, apply_events
 
 
+def _parse_addr(from_header: str) -> str:
+    """Extract the bare email address from a ``From:`` header, lowercased.
+
+    ``email.utils.parseaddr`` handles both ``"Jane Doe <jane@example.com>"``
+    and a bare ``jane@example.com``. Lowercasing makes the allowlist check
+    case-insensitive.
+    """
+    return parseaddr(from_header or "")[1].strip().lower()
+
+
+def _resolve_allowed_senders(raw) -> set[str]:
+    """Resolve the configured link-submission allowlist to a set of lowercased
+    addresses.
+
+    Entries may be a literal address or an ``env:VARNAME`` reference (mirrors
+    ``apply.fast_path_recipient`` at main.py:244). An ``env:`` entry whose var
+    is unset contributes NOTHING — so an allowlist of only ``["env:MY_EMAIL"]``
+    with ``MY_EMAIL`` unset resolves to the EMPTY set, i.e. FAIL-CLOSED (nobody
+    allowed). This is the intended default per the weemeemee GATE (plan R3):
+    the feature must never fail open into an LLM-spend relay.
+    """
+    out: set[str] = set()
+    for entry in (raw or []):
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        entry = entry.strip()
+        if entry.startswith("env:"):
+            val = os.environ.get(entry[len("env:"):], "")
+            if val.strip():
+                out.add(val.strip().lower())
+        else:
+            out.add(entry.lower())
+    return out
+
+
+def run_link_submissions(gmail, config, project_bank, today, dry_run=False):
+    """HALF 2 orchestrator: process user-submitted hiring.cafe /job link emails
+    and reply the digest to the SENDER.
+
+    Reuses the existing pieces verbatim — ``run_pipeline`` (unchanged),
+    ``_build_attachments``, ``compose_digest`` — this is a sibling orchestration
+    entry, not a pipeline fork. Reply routing (the only multi-user piece) lives
+    here: the digest goes to the message sender via
+    ``gmail.send_email(to=sender)`` with a ``Re:`` subject (plan R5 — attachments
+    survive; NOT ``reply_to_thread``, which cannot attach; NOT ``MY_EMAIL``,
+    which stays the alert path). Each submission writes to its own per-message
+    output subdir so concurrent submissions never collide.
+    """
+    gmail_cfg = config["gmail"]
+    marker = gmail_cfg["link_submission_subject_contains"]
+    processed_label = gmail_cfg["link_submission_processed_label"]
+    max_per_submission = config.get("jobs", {}).get("max_per_submission", 10)
+
+    # FAIL-CLOSED sender allowlist (plan R3 / weemeemee GATE): an un-allowlisted
+    # sender is skipped with ZERO compute — no pipeline run, no reply — so the
+    # feature can never become an open relay to Ben's Anthropic key. An empty
+    # allowlist (e.g. env:MY_EMAIL with MY_EMAIL unset) allows NOBODY.
+    allowed_senders = _resolve_allowed_senders(
+        gmail_cfg.get("link_submission_allowed_senders", [])
+    )
+    if not allowed_senders:
+        log.warning(
+            "step.link_intake",
+            status="allowlist_empty_fail_closed",
+            reason="link_submission_allowed_senders resolved to empty; skipping all",
+        )
+
+    submissions = gmail.find_link_submissions(
+        subject_marker=marker,
+        processed_label=processed_label,
+        max_results=max_per_submission,
+    )
+    if not submissions:
+        log.info("step.link_intake", status="no_new_submissions")
+        return
+
+    apply_on = bool(config.get("apply", {}).get("enabled", False))
+
+    for msg in submissions:
+        sender = _parse_addr(msg.get("from", ""))
+
+        # Fail-closed gate: skip un-allowlisted senders with zero compute — no
+        # pipeline, no reply, no state change on untrusted mail.
+        if sender not in allowed_senders:
+            log.warning(
+                "step.link_intake",
+                status="sender_not_allowed",
+                message_id=msg.get("id"),
+            )
+            continue
+
+        links = extract_job_links(msg.get("body_text", ""), msg.get("html", ""))
+        jobs = build_jobs_from_links(links, config=config)
+        if not jobs:
+            log.warning(
+                "step.link_intake", status="no_jobs", message_id=msg.get("id")
+            )
+            if not dry_run:
+                gmail.mark_processed(msg["id"], processed_label)
+            continue
+
+        output_dir = ROOT / "output" / today / str(msg["id"])
+        processed, skipped, apply_events = run_pipeline(
+            jobs=jobs,
+            config=config,
+            project_bank=project_bank,
+            today=today,
+            output_dir=output_dir,
+            dry_run=dry_run,
+            gmail_client=gmail,
+        )
+
+        attachments = _build_attachments(processed)
+        digest_output = compose_digest(
+            processed=processed,
+            skipped=skipped,
+            attachments=attachments,
+            apply_events=apply_events if apply_on else None,
+        )
+        if isinstance(digest_output, str):
+            body = digest_output
+            extra_attachments: list = []
+        else:
+            body = digest_output.body
+            extra_attachments = list(digest_output.attachments or [])
+        attachments.extend(extra_attachments)
+
+        if not dry_run:
+            orig_subject = msg.get("subject", "") or "your hiring.cafe links"
+            reply_subject = (
+                orig_subject
+                if orig_subject.lower().startswith("re:")
+                else f"Re: {orig_subject}"
+            )
+            gmail.send_email(
+                to=sender,
+                subject=reply_subject,
+                body_text=body,
+                attachments=attachments,
+            )
+            log.info("step.link_reply", status="sent", message_id=msg["id"])
+            gmail.mark_processed(msg["id"], processed_label)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hiring.cafe job alert agent")
     parser.add_argument(
@@ -771,6 +918,15 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Run the full pipeline but skip sending digest and marking email processed.",
+    )
+    parser.add_argument(
+        "--links",
+        action="store_true",
+        help=(
+            "HALF 2 intake: process user-submitted hiring.cafe /job link emails "
+            "(subject marker gmail.link_submission_subject_contains) and reply "
+            "the digest to each SENDER. Mutually exclusive from the alert path."
+        ),
     )
     args = parser.parse_args()
 
@@ -877,6 +1033,23 @@ def main() -> None:
         log.error("gmail.auth_required", exc_type=type(exc).__name__)
         print(f"gmail auth required: {exc}", file=sys.stderr)
         sys.exit(2)
+
+    # ── HALF 2: link-submission intake (mutually exclusive from the alert
+    # path). Replies the digest to each SENDER, not MY_EMAIL. ──────────────
+    if args.links:
+        try:
+            run_link_submissions(
+                gmail=gmail,
+                config=config,
+                project_bank=project_bank,
+                today=today,
+                dry_run=args.dry_run,
+            )
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     log.info("step.gmail_intake", status="starting")
 
     alert = gmail.find_unprocessed_alert(

@@ -9,6 +9,7 @@ Flow:
   5. Clean and return the text, or None on failure
 """
 
+import json
 import re
 import time
 from contextlib import contextmanager
@@ -17,7 +18,7 @@ from typing import Iterator, Optional
 
 import httpx
 import structlog
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from playwright.sync_api import Browser, sync_playwright, TimeoutError as PlaywrightTimeout
 
 from parser.email_parser import resolve_sendgrid_url
@@ -82,6 +83,12 @@ _ATS_DOMAIN_TO_NAME: dict[str, str] = {
 # Preserved as a list for existing filter_domains callers.
 ATS_DOMAINS: list[str] = list(_ATS_DOMAIN_TO_NAME.keys())
 
+# hiring.cafe hosts. The modern posting shape is
+# ``hiring.cafe/job/{slug}-{id}`` (also served from hiringcafe.com), where the
+# JD, title, company, and apply URL all live in the embedded ``#__NEXT_DATA__``
+# JSON rather than in class-tagged DOM nodes. Used to gate the JSON-first fetch.
+_HIRINGCAFE_HOSTS: tuple[str, ...] = ("hiring.cafe", "hiringcafe.com")
+
 
 def _infer_ats_name(url: str | None) -> str | None:
     """
@@ -96,6 +103,28 @@ def _infer_ats_name(url: str | None) -> str | None:
         if domain in url:
             return name
     return None
+
+
+def _is_hiringcafe_job_url(url: str | None) -> bool:
+    """
+    True when ``url`` is a direct hiring.cafe ``/job/...`` posting URL.
+
+    Used to gate the JSON-first short-circuit: for these URLs the authoritative
+    JD + apply_url are one page load away in ``#__NEXT_DATA__``, so the Google
+    search (which can surface the wrong posting and costs a rate-limited
+    round-trip) is skipped. Gated on the host so every other URL — including
+    the SendGrid-wrapped alert path — keeps its existing fetch ordering.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.netloc or "").split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host in _HIRINGCAFE_HOSTS and parsed.path.startswith("/job/")
 
 
 @contextmanager
@@ -161,6 +190,32 @@ def fetch_job_description(
       - Extracted text is shorter than min_length
       - No recognizable JD section headers found
     """
+    # Step 0: A direct hiring.cafe /job URL carries the authoritative JD +
+    # apply_url in its #__NEXT_DATA__ JSON one page load away. Skip the Google
+    # search (which can surface the WRONG posting and pays a rate-limited
+    # round-trip) and go straight to the JSON fetch; fall through to the
+    # Google/legacy strategy only if it yields no usable JD. Gated on the
+    # RESOLVED url so the SendGrid-wrapped alert path — whose link is a /job
+    # posting only once resolved — also skips the wasted Google round-trip.
+    # _resolve_if_sendgrid passes non-sendgrid URLs straight through with no
+    # network, so a non-sendgrid, non-/job URL is untouched here.
+    resolved_url = _resolve_if_sendgrid(url, timeout) or url
+    if _is_hiringcafe_job_url(resolved_url):
+        text, hc_ats_url = _fetch_with_playwright(resolved_url, timeout, browser=browser)
+        if text and len(text) >= min_length and _has_jd_sections(text):
+            log.info("jd_fetcher.success", url=resolved_url, chars=len(text), source="hiring.cafe_direct")
+            inferred = _infer_ats_name(hc_ats_url)
+            return JDFetchResult(
+                text=_clean_text(text),
+                ats_apply_url=hc_ats_url if inferred else None,
+                ats=inferred,
+            )
+        log.debug(
+            "jd_fetcher.direct_job_insufficient",
+            url=resolved_url,
+            chars=len(text) if text else 0,
+        )
+
     # Step 1: Try Google search for direct ATS posting
     if job_title and company:
         ats_url = _search_for_jd(job_title, company, browser=browser)
@@ -498,6 +553,24 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
                     # will fall through to None + a downstream retry.
                     pass
 
+                # JSON-first (PRIMARY): modern hiring.cafe /job pages embed the
+                # JD body + apply URL in #__NEXT_DATA__. When present and it
+                # carries a JD description, use it — the apply_url then comes
+                # from JSON rather than an anchor scan (fixes the empty
+                # ats_apply_url regression on the new page shape). The caller
+                # applies the _infer_ats_name guard to the returned URL, so a
+                # non-vendor apply_url still degrades to ats_apply_url=None.
+                nd = _extract_next_data(page)
+                if nd and nd.get("description"):
+                    from bs4 import BeautifulSoup
+                    jd_text = BeautifulSoup(
+                        nd["description"], "lxml"
+                    ).get_text(separator="\n", strip=True)
+                    if jd_text:
+                        return jd_text, nd.get("apply_url")
+
+                # FALLBACK: class-selector text walk + anchor scan (old DOM,
+                # non-hiring.cafe pages, or a hiring.cafe schema drift).
                 text = _extract_best_text(page)
                 ats_url = _find_ats_link(page)
                 return text, ats_url
@@ -507,6 +580,98 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
     except Exception as e:
         log.warning("jd_fetcher.playwright_error", error=str(e), url=url)
         return None, None
+
+
+def _dig(obj, *keys):
+    """Descend ``obj`` through ``keys`` defensively.
+
+    Returns None the instant any intermediate value is not a dict (a None,
+    a list, a scalar) — so a hiring.cafe schema drift degrades to None rather
+    than raising AttributeError/TypeError on a ``.get`` against a non-dict.
+    """
+    cur = obj
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _parse_next_data(raw_json: str) -> dict | None:
+    """
+    Parse a hiring.cafe ``#__NEXT_DATA__`` JSON payload into a normalized job dict.
+
+    Confirmed key path (captured 2026-09-09, see tests/fixtures/hiringcafe):
+      props.pageProps.job.{
+        job_information.title,
+        job_information.description,   # JD *HTML*
+        apply_url,                     # direct ATS/careers URL
+        source, board_token,          # ATS vendor hints
+      }
+    with company from ``enriched_company_data.name`` falling back to
+    ``v5_processed_job_data.company_name``.
+
+    Returns None (never raises) on missing / non-JSON / wrong-shape input so
+    callers fall back cleanly to the class-selector text path. hiring.cafe's
+    schema is external and unversioned, so every access is a defensive
+    ``.get`` chain via ``_dig`` — no ``[]`` indexing.
+    """
+    if not raw_json or not isinstance(raw_json, str):
+        return None
+    try:
+        data = json.loads(raw_json)
+    except (ValueError, TypeError):
+        return None
+
+    job = _dig(data, "props", "pageProps", "job")
+    if not isinstance(job, dict) or not job:
+        return None
+
+    title = _dig(job, "job_information", "title") or _dig(
+        job, "job_information", "job_title_raw"
+    )
+    company = _dig(job, "enriched_company_data", "name") or _dig(
+        job, "v5_processed_job_data", "company_name"
+    )
+    description = _dig(job, "job_information", "description")
+    apply_url = job.get("apply_url")
+
+    # A usable parse needs at least the JD body or a title; a valid-JSON-but-
+    # wrong-shape payload yields none of these and returns None so the caller
+    # falls through to _extract_best_text.
+    if not (description or title):
+        return None
+
+    return {
+        "title": title,
+        "company": company,
+        "description": description,  # JD HTML — caller strips to text
+        "apply_url": apply_url,
+        "source": job.get("source"),
+        "board_token": job.get("board_token"),
+    }
+
+
+def _extract_next_data(page) -> dict | None:
+    """
+    Read and parse the ``#__NEXT_DATA__`` script from a rendered page.
+
+    ``#__NEXT_DATA__`` is server-rendered into the initial HTML, so it is
+    present right after ``domcontentloaded`` (no selector race needed).
+    Returns None (never raises) when the node is absent or unparseable so
+    callers fall back to the class-selector text path.
+    """
+    try:
+        el = page.query_selector("#__NEXT_DATA__")
+    except Exception:
+        return None
+    if not el:
+        return None
+    try:
+        raw = el.text_content()
+    except Exception:
+        return None
+    return _parse_next_data(raw)
 
 
 def _extract_best_text(page) -> str | None:
@@ -639,6 +804,13 @@ def _fetch_ats_page(url: str, timeout: int, browser: Browser | None = None) -> s
             timeout=timeout,
         ) as client:
             resp = client.get(url)
+
+        # A legacy hiring.cafe /viewjob/{id} link is now 410 Gone. Treat it as
+        # a fast, legible skip rather than paying a browser launch to load the
+        # dead page only to fail _has_jd_sections downstream.
+        if resp.status_code == 410:
+            log.info("jd_fetcher.viewjob_gone", url=url)
+            return None
 
         if resp.status_code == 200:
             from readability import Document
