@@ -177,7 +177,7 @@ class GmailClient:
                         "let the cron reuse it."
                     )
                 flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-                creds = flow.run_local_server(port=0)
+                creds = flow.run_local_server(port=8765)  # pinned 2026-08-26 for SSH -L tunnel re-auth from a remote machine (was port=0/random)
 
             # H12: parent dir must be 0o700 — tighten it even if it already
             # existed with a laxer mode from a prior run.
