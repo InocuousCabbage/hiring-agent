@@ -476,7 +476,7 @@ def test_gmail_client_retry_call_removed():
     assert not hasattr(GmailClient, "_retry_call"), "_retry_call still present — retrofit incomplete"
 
     for method_name in (
-        "find_unprocessed_alert",
+        "find_unprocessed_alerts",
         "get_unread_alerts",
         "mark_processed",
         "send_email",

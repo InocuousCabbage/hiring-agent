@@ -33,6 +33,7 @@ methods that need a mid-retry credential refresh use the factory form
 """
 
 import os
+import re
 import sys
 import base64
 from pathlib import Path
@@ -43,6 +44,7 @@ from email import encoders
 from typing import Any, Callable
 
 import structlog
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -137,6 +139,37 @@ def _sanitize_query(value: str) -> str:
     return value.replace('"', '').replace('\\', '').replace('\n', '').replace('\r', '')
 
 
+def _is_invalid_grant(exc: RefreshError) -> bool:
+    """True when Google rejected the refresh token itself (revoked, expired
+    after inactivity, or password change). Only re-consent fixes that;
+    any other RefreshError is left to propagate unchanged."""
+    for arg in exc.args:
+        if isinstance(arg, dict) and arg.get("error") == "invalid_grant":
+            return True
+    return "invalid_grant" in str(exc)
+
+
+def _alert_query(sender: str, subject_contains: str, processed_label: str,
+                 lookback_days: int) -> str:
+    """Gmail query for unprocessed Hiring.cafe alerts inside the window.
+
+    Matches the SENDER or the subject marker. Since ~June 2026 the digests
+    are titled "N new jobs for <search>", so "HiringCafe" survives only in
+    the sender display name and a subject-only match misses every current
+    digest. The subject clause is kept so forwarded copies (From: the user,
+    Subject: "Fwd: ... HiringCafe ...") are still picked up.
+
+    ``newer_than`` bounds the search: unprocessed digests older than the
+    window are ignored (never labelled), so an old backlog is not drained.
+    """
+    return (
+        f'(from:{re.sub(r"[\s()]", "", _sanitize_query(sender))} '
+        f'OR subject:"{_sanitize_query(subject_contains)}") '
+        f'-label:{_sanitize_query(processed_label)} '
+        f'newer_than:{int(lookback_days)}d'
+    )
+
+
 class GmailClient:
     """Authenticated Gmail client with helpers for the hiring agent pipeline."""
 
@@ -162,9 +195,26 @@ class GmailClient:
             creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
 
         if not creds or not creds.valid:
+            refreshed = False
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                    refreshed = True
+                except RefreshError as exc:
+                    if not _is_invalid_grant(exc):
+                        raise
+                    # The refresh token is dead; only re-consent fixes it.
+                    # The old token.json is left in place and is replaced
+                    # only by the atomic write below, once a new token exists.
+                    log.warning("gmail.refresh_invalid_grant")
+                    if _is_headless():
+                        raise AuthError(
+                            "Gmail refresh token rejected (invalid_grant: "
+                            "revoked or expired). Re-consent from an "
+                            "interactive session (e.g. `python -m "
+                            "src.gmail.client`) to regenerate token.json."
+                        ) from exc
+            if not refreshed:
                 # B4: refuse to launch the interactive browser flow under a
                 # headless cron — it would hang `run_local_server` forever.
                 if _is_headless():
@@ -200,45 +250,47 @@ class GmailClient:
     # ── Read ────────────────────────────────────────────────────
 
     @navigation_retry(before_sleep_extra=_refresh_gmail_client_before_retry)
-    def find_unprocessed_alert(
+    def find_unprocessed_alerts(
         self,
         sender: str,
         subject_contains: str,
         processed_label: str,
-    ) -> dict | None:
+        lookback_days: int = 14,
+        max_results: int = 10,
+    ) -> list[dict]:
         """
-        Find the newest Hiring.cafe alert that hasn't been labeled as processed.
-        Matches by subject only so forwarded copies (From: user's own email,
-        Subject: "Fwd: ... HiringCafe") are picked up alongside direct alerts.
-        Returns {"id": str, "html": str, "text": str} or None.
+        Return the unprocessed Hiring.cafe alerts inside the lookback window,
+        OLDEST first, at most ``max_results`` of them.
+
+        Gmail lists newest first, so every in-window id is listed (ids only,
+        paged) and the oldest ``max_results`` are fetched in full. Oldest
+        first means a capped run leaves the newest for the next run instead
+        of skipping past older ones forever.
+        Each dict: {"id": str, "html": str, "text": str}.
         """
-        # subject-only match — catches both direct (ali@hiring.cafe) and forwarded
-        query = f'subject:"{_sanitize_query(subject_contains)}" -label:{_sanitize_query(processed_label)}'
+        query = _alert_query(sender, subject_contains, processed_label, lookback_days)
+        messages = self.service.users().messages()
+        ids: list[str] = []
+        page_token = None
+        while True:
+            kwargs = {"userId": "me", "q": query, "maxResults": 100}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            results = messages.list(**kwargs).execute()
+            ids.extend(m["id"] for m in results.get("messages", []))
+            page_token = results.get("nextPageToken")
+            if not page_token:
+                break
 
-        results = (
-            self.service.users()
-            .messages()
-            .list(userId="me", q=query, maxResults=1)
-            .execute()
-        )
-
-        messages = results.get("messages", [])
-        if not messages:
-            return None
-
-        msg_id = messages[0]["id"]
-        msg = (
-            self.service.users()
-            .messages()
-            .get(userId="me", id=msg_id, format="full")
-            .execute()
-        )
-
-        return {
-            "id": msg_id,
-            "html": self._extract_body(msg, "text/html"),
-            "text": self._extract_body(msg, "text/plain"),
-        }
+        out = []
+        for msg_id in list(reversed(ids))[:max(0, int(max_results))]:
+            msg = messages.get(userId="me", id=msg_id, format="full").execute()
+            out.append({
+                "id": msg_id,
+                "html": self._extract_body(msg, "text/html"),
+                "text": self._extract_body(msg, "text/plain"),
+            })
+        return out
 
     def _extract_body(self, message: dict, mime_type: str) -> str:
         """Extract body content of a given MIME type from a Gmail message."""
@@ -347,14 +399,14 @@ class GmailClient:
         subject_contains: str,
         processed_label: str,
         max_results: int = 10,
+        lookback_days: int = 14,
     ) -> list[dict]:
         """
-        Return all unprocessed alert messages, newest first.
-        Matches by subject only so forwarded copies are included alongside
-        direct alerts.
+        Return unprocessed in-window alert messages, newest first.
+        Same match as ``find_unprocessed_alerts`` (sender OR subject marker).
         Each dict: {"id": str, "html": str, "text": str}.
         """
-        query = f'subject:"{_sanitize_query(subject_contains)}" -label:{_sanitize_query(processed_label)}'
+        query = _alert_query(sender, subject_contains, processed_label, lookback_days)
         results = (
             self.service.users()
             .messages()

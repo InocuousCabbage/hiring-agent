@@ -55,6 +55,12 @@ from contacts.hm_finder import find_hiring_manager
 
 log = structlog.get_logger()
 
+# Alert intake bounds (gmail.alert_lookback_days / gmail.max_alerts_per_run).
+# The window keeps an old unprocessed backlog from being drained; the cap
+# bounds one run's model cost and outbound digest emails if many alerts land.
+DEFAULT_ALERT_LOOKBACK_DAYS = 14
+DEFAULT_MAX_ALERTS_PER_RUN = 10
+
 # ── Config-gate (Phase 3 auto-apply) ────────────────────────────────────────
 # See .agent/one-big-feature/auto-apply-2026-07-06/03-specs/03-s3-config-gate.md
 # `_validate_apply_config` runs at pipeline entry BEFORE the S17 seam. When
@@ -1052,18 +1058,56 @@ def main() -> None:
 
     log.info("step.gmail_intake", status="starting")
 
-    alert = gmail.find_unprocessed_alert(
-        sender=config["gmail"]["alert_sender"],
-        subject_contains=config["gmail"]["alert_subject_contains"],
-        processed_label=config["gmail"]["processed_label"],
+    gmail_cfg = config["gmail"]
+    alerts = gmail.find_unprocessed_alerts(
+        sender=gmail_cfg["alert_sender"],
+        subject_contains=gmail_cfg["alert_subject_contains"],
+        processed_label=gmail_cfg["processed_label"],
+        lookback_days=int(gmail_cfg.get("alert_lookback_days", DEFAULT_ALERT_LOOKBACK_DAYS)),
+        max_results=int(gmail_cfg.get("max_alerts_per_run", DEFAULT_MAX_ALERTS_PER_RUN)),
     )
 
-    if alert is None:
+    if not alerts:
         log.info("step.gmail_intake", status="no_new_alerts")
         return
 
-    log.info("step.gmail_intake", status="found_alert", message_id=alert["id"])
+    log.info("step.gmail_intake", status="found_alerts", count=len(alerts))
 
+    # Oldest first. Each alert is labelled only after its digest is sent; the
+    # first failure stops the run so it and every later alert stay unlabelled
+    # and are retried next run, in order.
+    total_processed = total_skipped = 0
+    for alert in alerts:
+        log.info("step.gmail_intake", status="processing_alert", message_id=alert["id"])
+        ok, n_processed, n_skipped = _process_alert(
+            gmail=gmail,
+            alert=alert,
+            config=config,
+            project_bank=project_bank,
+            today=today,
+            dry_run=args.dry_run,
+        )
+        total_processed += n_processed
+        total_skipped += n_skipped
+        if not ok:
+            log.warning("step.gmail_intake", status="stopped_on_failure", message_id=alert["id"])
+            break
+
+    log.info(
+        "pipeline.complete",
+        processed=total_processed,
+        skipped=total_skipped,
+        dry_run=args.dry_run,
+    )
+
+
+def _process_alert(*, gmail, alert, config, project_bank, today, dry_run) -> tuple[bool, int, int]:
+    """Run one alert end to end. Returns (ok, processed_count, skipped_count).
+
+    ``ok`` is True when the alert is finished (digest sent and labelled, no
+    jobs and labelled, or a dry run) and False when it must be retried, so
+    the caller stops before touching later alerts.
+    """
     jobs = parse_alert_email(
         html_body=alert["html"],
         text_body=alert.get("text", ""),
@@ -1073,9 +1117,9 @@ def main() -> None:
 
     if not jobs:
         log.warning("step.parse_jobs", status="no_jobs_found")
-        if not args.dry_run:
+        if not dry_run:
             gmail.mark_processed(alert["id"], config["gmail"]["processed_label"])
-        return
+        return True, 0, 0
 
     output_dir = ROOT / "output" / today
     try:
@@ -1085,67 +1129,65 @@ def main() -> None:
             project_bank=project_bank,
             today=today,
             output_dir=output_dir,
-            dry_run=args.dry_run,
+            dry_run=dry_run,
             gmail_client=gmail,
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if not args.dry_run:
-        recipient = os.getenv("MY_EMAIL")
-        if not recipient:
-            log.error("step.send_digest", status="aborted", reason="MY_EMAIL not set")
-        else:
-            subject = config["gmail"]["digest_subject_template"].format(date=today)
-            # S17 seam: when apply.enabled=true, compose_digest gets the
-            # S12 review-poller output via apply_events kwarg (S14 rollup).
-            # S14's contract: apply_events=None -> legacy str; any list
-            # (even []) -> DigestPayload. We MUST pass the list (even empty)
-            # when apply is enabled so the S14 extension surface stays live.
-            # AUDIT: use _build_attachments() to filter None (docx-only lane)
-            # + dedup, then hand the same list to compose_digest for the
-            # PDF/DOCX detection note AND to gmail.send_digest for real send.
-            attachments = _build_attachments(processed)
+    if dry_run:
+        return True, len(processed), len(skipped)
 
-            _apply_on = bool(config.get("apply", {}).get("enabled", False))
-            digest_output = compose_digest(
-                processed=processed,
-                skipped=skipped,
-                attachments=attachments,
-                apply_events=apply_events if _apply_on else None,
-            )
-            # S14 returns DigestPayload (namedtuple: body, attachments) when
-            # apply_events is a list; a plain str otherwise. Normalize to
-            # (body, extra_attachments).
-            if isinstance(digest_output, str):
-                body = digest_output
-                extra_attachments: list = []
-            else:
-                body = digest_output.body
-                extra_attachments = list(digest_output.attachments or [])
-            # S14 review-required rows attach a confirmation screenshot;
-            # append those AFTER the resume/cover-letter pairs so digest
-            # ordering stays predictable.
-            attachments.extend(extra_attachments)
-            try:
-                gmail.send_digest(
-                    to=recipient,
-                    subject=subject,
-                    body_text=body,
-                    attachments=attachments,
-                )
-                log.info("step.send_digest", status="sent", to=recipient)
-                gmail.mark_processed(alert["id"], config["gmail"]["processed_label"])
-            except Exception as exc:
-                log.error("step.send_digest", status="failed", error=str(exc))
+    recipient = os.getenv("MY_EMAIL")
+    if not recipient:
+        log.error("step.send_digest", status="aborted", reason="MY_EMAIL not set")
+        return False, len(processed), len(skipped)
 
-    log.info(
-        "pipeline.complete",
-        processed=len(processed),
-        skipped=len(skipped),
-        dry_run=args.dry_run,
+    subject = config["gmail"]["digest_subject_template"].format(date=today)
+    # S17 seam: when apply.enabled=true, compose_digest gets the
+    # S12 review-poller output via apply_events kwarg (S14 rollup).
+    # S14's contract: apply_events=None -> legacy str; any list
+    # (even []) -> DigestPayload. We MUST pass the list (even empty)
+    # when apply is enabled so the S14 extension surface stays live.
+    # AUDIT: use _build_attachments() to filter None (docx-only lane)
+    # + dedup, then hand the same list to compose_digest for the
+    # PDF/DOCX detection note AND to gmail.send_digest for real send.
+    attachments = _build_attachments(processed)
+
+    _apply_on = bool(config.get("apply", {}).get("enabled", False))
+    digest_output = compose_digest(
+        processed=processed,
+        skipped=skipped,
+        attachments=attachments,
+        apply_events=apply_events if _apply_on else None,
     )
+    # S14 returns DigestPayload (namedtuple: body, attachments) when
+    # apply_events is a list; a plain str otherwise. Normalize to
+    # (body, extra_attachments).
+    if isinstance(digest_output, str):
+        body = digest_output
+        extra_attachments: list = []
+    else:
+        body = digest_output.body
+        extra_attachments = list(digest_output.attachments or [])
+    # S14 review-required rows attach a confirmation screenshot;
+    # append those AFTER the resume/cover-letter pairs so digest
+    # ordering stays predictable.
+    attachments.extend(extra_attachments)
+    try:
+        gmail.send_digest(
+            to=recipient,
+            subject=subject,
+            body_text=body,
+            attachments=attachments,
+        )
+        log.info("step.send_digest", status="sent", to=recipient)
+        gmail.mark_processed(alert["id"], config["gmail"]["processed_label"])
+    except Exception as exc:
+        log.error("step.send_digest", status="failed", error=str(exc))
+        return False, len(processed), len(skipped)
+    return True, len(processed), len(skipped)
 
 
 if __name__ == "__main__":

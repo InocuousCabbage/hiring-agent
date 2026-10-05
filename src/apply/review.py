@@ -833,7 +833,7 @@ def _load_profile_or_none(config: dict) -> Any:
 def _extract_thread_body(msg: dict) -> str:
     """Pull the human body out of the message dict shape returned by
     ``GmailClient.search``. Tolerant of two field names: ``body_text`` (S12's
-    contract) and ``text`` (existing ``find_unprocessed_alert`` shape)."""
+    contract) and ``text`` (existing ``find_unprocessed_alerts`` item shape)."""
     return msg.get("body_text") or msg.get("text") or msg.get("body") or ""
 
 

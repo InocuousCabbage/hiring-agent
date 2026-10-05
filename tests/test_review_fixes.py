@@ -63,7 +63,7 @@ def _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config,
 
     Every I/O boundary the digest-send branch depends on is patched:
       - main.GmailClient        — no real Gmail auth
-      - gmail.find_unprocessed_alert — returns a fake alert dict
+      - gmail.find_unprocessed_alerts — returns one fake alert
       - main.parse_alert_email  — returns a single fake job
       - main.run_pipeline       — returns 1 processed job, 0 skipped
       - main.ROOT / "output"    — redirected to tmp_path so no repo write
@@ -85,11 +85,11 @@ def _drive_main_with_gmail_stub(monkeypatch, tmp_path, main_root_with_config,
     gmail = MagicMock()
     if send_raises:
         gmail.send_digest.side_effect = Exception("SMTP timeout")
-    gmail.find_unprocessed_alert.return_value = {
+    gmail.find_unprocessed_alerts.return_value = [{
         "id": "msg_123",
         "html": "<html></html>",
         "text": "",
-    }
+    }]
 
     # main() does `from gmail.client import AuthError, GmailClient` at call time,
     # so we patch the source module (main.py has no module-scope GmailClient).
@@ -265,11 +265,13 @@ class TestSendDigestMarkProcessedStructurallyPaired:
     def test_send_and_mark_share_try_body_with_correct_order(self):
         source = (ROOT / "src" / "main.py").read_text()
         tree = ast.parse(source)
+        # The per-alert send+mark pair lives in _process_alert(), which
+        # main() calls once per alert in the drain loop.
         main_func = next(
             (n for n in ast.walk(tree)
-             if isinstance(n, ast.FunctionDef) and n.name == "main"), None,
+             if isinstance(n, ast.FunctionDef) and n.name == "_process_alert"), None,
         )
-        assert main_func is not None, "main() function not found"
+        assert main_func is not None, "_process_alert() function not found"
 
         paired = 0
         for node in ast.walk(main_func):
