@@ -122,7 +122,7 @@ class TestFetchJobDescriptionSurfacesAts:
              patch.object(
                  jd_fetcher,
                  "_fetch_with_playwright",
-                 return_value=("too short and no section headers", lever_url),
+                 return_value=("too short and no section headers", lever_url, None),
              ), \
              patch.object(jd_fetcher, "_fetch_ats_page", return_value=_GOOD_JD_TEXT):
             result = fetch_job_description(
@@ -148,7 +148,7 @@ class TestFetchJobDescriptionSurfacesAts:
              patch.object(
                  jd_fetcher,
                  "_fetch_with_playwright",
-                 return_value=(_GOOD_JD_TEXT, None),
+                 return_value=(_GOOD_JD_TEXT, None, None),
              ):
             result = fetch_job_description(
                 url="https://sendgrid.net/wf/click?abc",
@@ -180,7 +180,7 @@ class TestFetchJobDescriptionSurfacesAts:
              patch.object(
                  jd_fetcher,
                  "_fetch_with_playwright",
-                 return_value=("too short and no section headers", non_ats_apply_url),
+                 return_value=("too short and no section headers", non_ats_apply_url, None),
              ), \
              patch.object(jd_fetcher, "_fetch_ats_page", return_value=_GOOD_JD_TEXT):
             result = fetch_job_description(

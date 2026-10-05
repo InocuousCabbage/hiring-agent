@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from email.utils import parseaddr
 
 from browser.session import shared_browser
-from parser.email_parser import parse_alert_from_eml, parse_alert_email
+from parser.email_parser import is_cta_text, parse_alert_from_eml, parse_alert_email
 from parser.link_submission import extract_job_links, build_jobs_from_links
 from scraper.jd_fetcher import fetch_job_description
 from classifier.lane_selector import classify_lane
@@ -465,6 +465,20 @@ def _build_attachments(processed: list[dict]) -> list[Path]:
     return attachments
 
 
+def _adopt_jd_company(job: dict, jd_result, job_log) -> None:
+    """When the alert email yielded no real company, use the one the JD fetch
+    read from the posting page. Never overrides a parsed company and never
+    accepts a call-to-action label. Runs before tailoring and rendering, so
+    file names, prompts and the digest all see the adopted name."""
+    if job.get("company") not in ("Unknown", "", None):
+        return
+    jd_company = (getattr(jd_result, "company", None) or "").strip()
+    if not jd_company or is_cta_text(jd_company):
+        return
+    job["company"] = jd_company
+    job_log.info("step.fetch_jd", company_source="jd_page", company=jd_company)
+
+
 def run_pipeline(
     jobs: list[dict],
     config: dict,
@@ -560,6 +574,7 @@ def run_pipeline(
                 # (e.g. pure hiring.cafe or a company careers page).
                 job["ats_apply_url"] = jd_result.ats_apply_url
                 job["ats"] = jd_result.ats
+                _adopt_jd_company(job, jd_result, job_log)
                 job_log.info(
                     "step.fetch_jd",
                     status="success",
