@@ -132,9 +132,9 @@ def test_send_digest_called_with_pdf_and_docx_attachments(monkeypatch, tmp_path,
     import gmail.client as gmail_client_mod
 
     gmail = MagicMock()
-    gmail.find_unprocessed_alert.return_value = {
+    gmail.find_unprocessed_alerts.return_value = [{
         "id": "msg_pipeline", "html": "<html></html>", "text": "",
-    }
+    }]
     monkeypatch.setattr(gmail_client_mod, "GmailClient", lambda: gmail)
     monkeypatch.setattr(
         main_mod, "parse_alert_email",
