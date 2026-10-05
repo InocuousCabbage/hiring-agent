@@ -36,6 +36,9 @@ class JDFetchResult:
                     Workday, iCIMS, SmartRecruiters, etc.) or None if the JD
                     came from a non-ATS source (e.g. pure hiring.cafe).
     ats           — canonical ATS name matching ats_apply_url, or None.
+    company       — employer name read from the hiring.cafe page's
+                    #__NEXT_DATA__ JSON, or None. Used by run_pipeline as the
+                    fallback when the alert email yielded no real company.
 
     Consumed by Phase 3 auto-apply to route submissions to the correct ATS
     endpoint instead of the SendGrid tracking URL in job['url'].
@@ -43,6 +46,7 @@ class JDFetchResult:
     text: str
     ats_apply_url: str | None = None
     ats: str | None = None
+    company: str | None = None
 
 HEADERS = {
     "User-Agent": (
@@ -201,7 +205,7 @@ def fetch_job_description(
     # network, so a non-sendgrid, non-/job URL is untouched here.
     resolved_url = _resolve_if_sendgrid(url, timeout) or url
     if _is_hiringcafe_job_url(resolved_url):
-        text, hc_ats_url = _fetch_with_playwright(resolved_url, timeout, browser=browser)
+        text, hc_ats_url, hc_company = _fetch_with_playwright(resolved_url, timeout, browser=browser)
         if text and len(text) >= min_length and _has_jd_sections(text):
             log.info("jd_fetcher.success", url=resolved_url, chars=len(text), source="hiring.cafe_direct")
             inferred = _infer_ats_name(hc_ats_url)
@@ -209,6 +213,7 @@ def fetch_job_description(
                 text=_clean_text(text),
                 ats_apply_url=hc_ats_url if inferred else None,
                 ats=inferred,
+                company=hc_company,
             )
         log.debug(
             "jd_fetcher.direct_job_insufficient",
@@ -253,7 +258,7 @@ def fetch_job_description(
     resolved = _resolve_if_sendgrid(url, timeout)
     if resolved:
         log.debug("jd_fetcher.trying_hiring_cafe", url=resolved)
-        text, hiring_cafe_ats_url = _fetch_with_playwright(resolved, timeout, browser=browser)
+        text, hiring_cafe_ats_url, hc_company = _fetch_with_playwright(resolved, timeout, browser=browser)
 
         # Check if hiring.cafe rendered valid content
         if text and len(text) >= min_length and _has_jd_sections(text):
@@ -266,6 +271,7 @@ def fetch_job_description(
                 text=_clean_text(text),
                 ats_apply_url=hiring_cafe_ats_url if inferred else None,
                 ats=inferred,
+                company=hc_company,
             )
 
         log.debug(
@@ -290,6 +296,7 @@ def fetch_job_description(
                     text=_clean_text(ats_text),
                     ats_apply_url=hiring_cafe_ats_url if inferred else None,
                     ats=inferred,
+                    company=hc_company,
                 )
     else:
         log.warning("jd_fetcher.resolve_failed", url=url[:80])
@@ -488,11 +495,12 @@ def _resolve_if_sendgrid(url: str, timeout: int) -> str | None:
     return url
 
 
-def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = None) -> tuple[str | None, str | None]:
+def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = None) -> tuple[str | None, str | None, str | None]:
     """
     Load a hiring.cafe job page with headless Chromium.
 
-    Returns (jd_text, ats_apply_url).  Both can be None.
+    Returns (jd_text, ats_apply_url, company).  Any can be None; company
+    comes from #__NEXT_DATA__ when the page carries it.
 
     H15 (Phase 6 audit): when ``browser`` is provided, we reuse it and
     only allocate a per-fetch ``BrowserContext`` — that skips the ~2-4s
@@ -567,19 +575,19 @@ def _fetch_with_playwright(url: str, timeout: int, browser: Browser | None = Non
                         nd["description"], "lxml"
                     ).get_text(separator="\n", strip=True)
                     if jd_text:
-                        return jd_text, nd.get("apply_url")
+                        return jd_text, nd.get("apply_url"), nd.get("company")
 
                 # FALLBACK: class-selector text walk + anchor scan (old DOM,
                 # non-hiring.cafe pages, or a hiring.cafe schema drift).
                 text = _extract_best_text(page)
                 ats_url = _find_ats_link(page)
-                return text, ats_url
+                return text, ats_url, (nd or {}).get("company")
             finally:
                 context.close()
 
     except Exception as e:
         log.warning("jd_fetcher.playwright_error", error=str(e), url=url)
-        return None, None
+        return None, None, None
 
 
 def _dig(obj, *keys):

@@ -155,6 +155,26 @@ def _split_company_location(raw: str, delim: str) -> tuple[str, str]:
     return company, location
 
 
+# Button / link labels that must never be taken as a company name. The
+# ~June 2026 digest format wrapped the company <div> in an <a>, and the
+# sibling lookup then landed on the button row, so every job parsed
+# company="Apply". Exact match after normalisation, so real names that merely
+# start with one of these words ("Applied Materials", "Viewpoint") are kept.
+_CTA_LABELS = frozenset({
+    "apply", "apply now", "apply here", "apply today", "quick apply",
+    "view", "view job", "view jobs", "view details", "view posting",
+    "see job", "see more", "see details", "learn more", "details", "more",
+})
+
+
+def is_cta_text(s: str | None) -> bool:
+    """True iff `s` is a call-to-action label rather than a name."""
+    if not s:
+        return False
+    norm = " ".join("".join(ch if ch.isalnum() else " " for ch in s.lower()).split())
+    return norm in _CTA_LABELS
+
+
 def parse_alert_from_eml(eml_path: str | Path, max_jobs: int = 5) -> list[dict]:
     """
     Parse job entries directly from a .eml file.
@@ -270,7 +290,12 @@ def parse_alert_email(
         #      output.
         company = "Unknown"
         location = None
-        company_div = h3.find_next_sibling("div")
+        # First <div> after the title in DOCUMENT order, bounded to this card.
+        # Feb 2026 format: a sibling of the <h3>. ~June 2026 format: nested in
+        # the <a> that wraps the card body, which a sibling lookup skips.
+        company_div = next(iter(h3.find_all_next("div", limit=1)), None)
+        if company_div is not None and card not in company_div.parents:
+            company_div = None
         if company_div:
             raw = _strip_format_chars(company_div.get_text(strip=True))
             if "—" in raw:
@@ -281,6 +306,8 @@ def parse_alert_email(
                 raw_stripped = raw.strip()
                 if _has_meaningful_content(raw_stripped):
                     company = raw_stripped
+        if is_cta_text(company):
+            company = "Unknown"
 
         # Extract date posted (second div — has lighter color styling)
         date_posted = None
