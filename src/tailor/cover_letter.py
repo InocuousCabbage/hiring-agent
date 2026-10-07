@@ -31,15 +31,28 @@ RULES (all non-negotiable):
      Instead: open with an observation about the company, the market, a challenge
      the role addresses, or a direct statement about your relevant work.
   3. PROJECTS — reference exactly 1–2 projects from the available project bank,
-     using real metrics. No links or URLs ever.
+     using real metrics. No links or URLs ever. Choose them for THIS posting:
+     pick whichever projects answer its main responsibility best, and lead with
+     the strongest match. No project is a default or belongs in a fixed slot.
+     Report a project's result in a sentence or two; do not paste its full
+     asset or metric list.
   4. TRUTH ONLY — only reference real experience from the project bank.
      Never fabricate outcomes, titles, tools, or numbers.
   5. TONE — neutral and confident. No buzzwords ("synergy", "passionate", "leverage"),
      no filler phrases ("I would bring value"), no overselling.
-  6. MIRROR THE JD — use the job description's language and priorities; don't ignore
-     the role's core responsibilities.
-  7. CLOSING — brief, direct. One sentence. No "I look forward to hearing from you
-     at your earliest convenience."
+  6. USE THE JD ONCE: borrow the posting's language in the opener, then let the
+     evidence speak. Address the role's core responsibilities through what you
+     did, not by saying your work matches them. At most one sentence in the
+     whole letter may state that your experience fits the role, and no
+     paragraph should end on that claim; end evidence paragraphs on the result.
+     Write a list as long as the facts make it (two items, four items, or a
+     plain sentence), not a habitual three. Describe the work directly; set it
+     against something it was not only when you are admitting a real gap.
+  7. CLOSING: brief and direct, one sentence, written for this role. Base it on
+     something specific from this letter or posting (a question you would bring,
+     the first problem you would take on) rather than a stock request for a
+     conversation or a reply. If a letter could end the same way for any
+     company, rewrite the ending.
 
 CRITICAL — YOU MUST ALWAYS RETURN VALID JSON:
   Never write prose, explanations, or commentary instead of JSON — not even to flag a
@@ -50,10 +63,9 @@ CRITICAL — YOU MUST ALWAYS RETURN VALID JSON:
 OUTPUT — return ONLY valid JSON, no markdown fences:
 {
   "paragraphs": [
-    "First paragraph — specific hook...",
-    "Second paragraph — relevant experience + project/metrics...",
-    "Third paragraph — additional value or second project...",
-    "Fourth paragraph — direct closing (optional, include only if it adds substance)"
+    "paragraph text",
+    "paragraph text",
+    "paragraph text (3 or 4 paragraphs in total; their order and focus follow this posting)"
   ],
   "projects_referenced": ["proj_id_1", "proj_id_2"]
 }"""

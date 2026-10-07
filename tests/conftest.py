@@ -820,7 +820,12 @@ def _testco_user_company_canary(tmp_path_factory):
     already_existed = settings_path.is_file()
     original_content = settings_path.read_text() if already_existed else None
 
-    settings_path.write_text('user:\n  company: "TESTCO-DO-NOT-SHIP"\n')
+    # employers: invented names only. qa.checker.run_qa now reads this list
+    # (src/utils/employers.py) and fails loud when it is missing.
+    settings_path.write_text(
+        'user:\n  company: "TESTCO-DO-NOT-SHIP"\n'
+        'employers:\n  - "Northwind Analytics"\n'
+    )
     try:
         yield "TESTCO-DO-NOT-SHIP"
     finally:
