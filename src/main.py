@@ -681,10 +681,26 @@ def run_pipeline(
                             project_bank=project_bank,
                         )
     
+                # Copy-gate errors that survive every auto_fix attempt do NOT
+                # drop the job: the documents are still rendered and the digest
+                # says "copy check failed: <rule>" so a human fixes the wording.
+                # Any other QA error (alone or mixed with copy errors) keeps
+                # the original skip behaviour.
+                copy_check_failed: list[str] = []
                 if not qa_passed:
-                    job_log.error("step.qa", status="failed_after_retries")
-                    skipped.append({**job, "reason": "QA failed after retries"})
-                    continue
+                    copy_errors = qa_result.get("copy_errors") or []
+                    copy_messages = {c["message"] for c in copy_errors}
+                    other_errors = [e for e in qa_result["errors"] if e not in copy_messages]
+                    if other_errors or not copy_errors:
+                        job_log.error("step.qa", status="failed_after_retries")
+                        skipped.append({**job, "reason": "QA failed after retries"})
+                        continue
+                    copy_check_failed = sorted({c["rule_id"] for c in copy_errors})
+                    job_log.warning(
+                        "step.qa",
+                        status="copy_check_failed_rendering_anyway",
+                        rules=copy_check_failed,
+                    )
     
                 # ── Render DOCX + PDF ─────────────────────────────────────────────
                 # DOCX is always produced; PDF is Optional (None when no
@@ -754,7 +770,7 @@ def run_pipeline(
                     dry_run=dry_run,
                 )
     
-                processed.append({
+                processed_job = {
                     **job,
                     "lane": lane["label"],
                     "resume_pdf": resume_pdf,
@@ -763,7 +779,10 @@ def run_pipeline(
                     "cover_letter_docx": cl_docx,
                     "hiring_manager": hm_info,
                     "apply_result": apply_result,
-                })
+                }
+                if copy_check_failed:
+                    processed_job["copy_check_failed"] = copy_check_failed
+                processed.append(processed_job)
     
             except Exception as exc:
                 job_log.error("step.process_job", status="error", error=str(exc), exc_info=True)
@@ -953,6 +972,10 @@ def main() -> None:
 
     config = load_config()
     project_bank = load_project_bank()
+    # Fail loud at startup (not mid-run inside a per-job try/except) when the
+    # allowed-employer list in config/settings.local.yaml is missing or empty.
+    from src.utils.employers import get_allowed_employers
+    get_allowed_employers()
     today = date.today().isoformat()
 
     # ── Test mode ─────────────────────────────────────────────────────────────

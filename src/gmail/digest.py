@@ -135,6 +135,11 @@ def _render_legacy_body(
         # suspenders defense against the empty-string branch.
         lines.append(f"  Lane: {job.get('lane') or 'N/A'}")
         lines.append(f"  URL: {job['url']}")
+        # Set by run_pipeline only when copy-gate errors survived every
+        # auto_fix attempt; the documents were rendered anyway. Absent key
+        # means no line, so the golden output for clean jobs is unchanged.
+        for rule_id in job.get("copy_check_failed") or []:
+            lines.append(f"  copy check failed: {rule_id}")
         hm = job.get("hiring_manager")
         if hm:
             # PR #12 L2-class sweep: `.get(k, default)` returns `""` when

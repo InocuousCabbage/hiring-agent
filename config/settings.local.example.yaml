@@ -16,3 +16,14 @@
 
 user:
   company: "YOUR_COMPANY_NAME_HERE"
+
+# ─── Allowed employers (QA fabricated-company check) ─────────────────────
+#
+# Every employer you have actually worked at. The resume QA check flags any
+# other company named in a bullet as a possible fabrication. user.company
+# above is added automatically. Missing key, empty list, or a leftover
+# YOUR_EMPLOYER placeholder = FAIL LOUD at startup.
+
+employers:
+  - "YOUR_EMPLOYER_1"
+  - "YOUR_EMPLOYER_2"

@@ -206,7 +206,9 @@ All six pass before flipping `apply.dry_run` to `false`.
 Locked out of Phase 3 and 3.5:
 
 - LinkedIn Easy Apply.
-- The `_ALLOWED_COMPANIES` placeholder — kept as-is by design.
+- The old `_ALLOWED_COMPANIES` placeholder in `src/qa/checker.py`. It has since
+  been replaced by the runtime `employers:` list in `config/settings.local.yaml`
+  (see `src/utils/employers.py`); the apply flow does not read it.
 - Verified Browser / Cloudflare Signed Agents wiring — Q_BB2 locked on
   the solveCaptchas API only.
 - No multi-user support beyond the keyring service-name pattern.
