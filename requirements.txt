@@ -1,7 +1,7 @@
 # Core
 pyyaml>=6.0
 python-dotenv>=1.0
-anthropic>=0.39.0  # optional: only needed if using ANTHROPIC_API_KEY instead of Claude CLI
+anthropic>=0.39.0,<1.0  # optional: only needed if using ANTHROPIC_API_KEY instead of Claude CLI
 
 # Gmail API
 google-api-python-client>=2.100.0
